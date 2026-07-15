@@ -41,12 +41,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Linux GUI build deps
+      - name: Install Linux GUI / smoke deps
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            xvfb \
             libgl1 \
+            libglib2.0-0 \
             libxkbcommon0 \
             libxkbcommon-x11-0 \
             libdbus-1-3 \
@@ -58,7 +60,9 @@ jobs:
             libxcb-render-util0 \
             libxcb-shape0 \
             libxcb-xinerama0 \
-            libxcb-xfixes0
+            libxcb-xfixes0 \
+            libfontconfig1 \
+            libfreetype6
 
       - name: Install Python deps
         run: |
@@ -88,6 +92,12 @@ jobs:
       - name: PyInstaller (onefile, Windows only)
         if: matrix.platform == 'windows'
         run: python -m PyInstaller --noconfirm --clean PiManagerOneFile.spec
+
+      - name: Smoke test packaged binary
+        shell: bash
+        run: |
+          export QT_QPA_PLATFORM=offscreen
+          python scripts/smoke_test_dist.py --platform "${{ matrix.platform }}" --dist dist
 
       - name: Package release archives
         shell: bash
@@ -121,6 +131,7 @@ jobs:
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --title "PiManager ${TAG}" --generate-notes
           fi
+          # Upload archives only (skip plain text notes if desired, but notes are helpful)
           gh release upload "$TAG" release-assets/* --clobber
 
   package-vsix:

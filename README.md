@@ -32,24 +32,37 @@
 
 ## 快速开始
 
-### 方式一：下载发布包
+### 方式一：下载发布包（对应系统独立运行）
 
-从 [Releases](https://github.com/suimi8/PiManager/releases) 下载对应平台：
+从 [Releases](https://github.com/suimi8/PiManager/releases) 下载**与本机系统匹配**的包，解压后即可运行（无需安装 Python）：
 
-| 平台 | 附件示例 |
-|------|----------|
-| Windows | `PiManager-vX.Y.Z-windows-x64-dir.zip`（推荐）/ `...-onefile.zip` |
-| macOS | `PiManager-vX.Y.Z-macos-arm64.zip`（`.app`） |
-| Linux | `PiManager-vX.Y.Z-linux-x64.tar.gz` |
-| Cursor | `pi-manager-pi-cursor-*.vsix` |
+| 平台 | 附件示例 | 如何运行 |
+|------|----------|----------|
+| Windows x64 | `...-windows-x64-dir.zip`（推荐） | 解压后运行 `PiManager\PiManager.exe` |
+| macOS arm64 | `...-macos-arm64.zip` | 打开 `PiManager.app` |
+| Linux x64 | `...-linux-x64.tar.gz` | `./PiManager/PiManager` |
+| Cursor | `pi-manager-pi-cursor-*.vsix` | 在 Cursor 安装 VSIX |
 
-运行前请确保已安装官方 Pi：
+请保持解压目录完整（Windows/Linux 的 `_internal`、macOS 的 `.app` 不要拆散）。
+
+完整 Pi 会话仍需官方 CLI：
 
 ```bash
 npm install -g @earendil-works/pi-coding-agent
 ```
 
-macOS 若提示无法打开未签名应用：系统设置 → 隐私与安全性 → 仍要打开。
+可选自检：
+
+```bash
+# Windows
+PiManager\PiManager.exe --self-check
+# macOS
+PiManager.app/Contents/MacOS/PiManager --self-check
+# Linux
+./PiManager/PiManager --self-check
+```
+
+macOS 若提示无法打开未签名应用：右键打开，或到系统设置 → 隐私与安全性 → 仍要打开。
 
 ### 方式二：从源码运行
 
@@ -90,16 +103,17 @@ pi.providerEnvCommand = python /path/to/PiManager/main.py --print-provider-env
 
 ## 打包
 
-详见 [BUILD.md](BUILD.md)。本地：
+详见 [BUILD.md](BUILD.md)。本地（当前操作系统）：
 
 ```bash
 python -m pip install -r requirements.txt pyinstaller
 python -m PyInstaller --noconfirm --clean PiManager.spec
+python scripts/smoke_test_dist.py
 python scripts/package_release.py --version 1.6.0
 ```
 
 跨平台（Windows / macOS / Linux）推荐用 GitHub Actions：
-Actions → **Build** → **Run workflow**，可将产物上传到 Release。
+Actions → **Build** → **Run workflow**。CI 会在三端分别构建并做 `--self-check` 冒烟测试，再上传 Release。
 
 二进制产物请通过 GitHub Releases 分发，不纳入本仓库源码树。
 

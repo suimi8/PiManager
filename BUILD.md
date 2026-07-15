@@ -1,100 +1,103 @@
-# PiManager — 跨平台构建说明
+# PiManager — 跨平台构建与独立运行说明
+
+目标：Windows / macOS / Linux 的发布包在**对应系统上解压后即可独立运行**（无需本机 Python）。
+
+> 完整 Pi 会话仍依赖官方 `pi` CLI（Node）。PiManager GUI 本身是独立二进制。
 
 ## 从源码运行
 
 ```bash
 python -m pip install -r requirements.txt
 python main.py
+python main.py --self-check
 ```
 
 依赖：
 - Python 3.10+
-- Node.js + `npm install -g @earendil-works/pi-coding-agent`
+- 可选：`npm install -g @earendil-works/pi-coding-agent`
 
-## 平台差异
-
-| OS | 终端启动 | 密钥存储 |
-|----|----------|----------|
-| Windows | Windows Terminal / PowerShell / cmd | OS keyring + DPAPI/AES-GCM 文件库回退 |
-| macOS | Terminal.app / iTerm2 | Keychain（keyring）+ 文件库 |
-| Linux | gnome-terminal / konsole / xterm / x-terminal-emulator | Secret Service（keyring）+ 文件库 |
-
-## 本地 PyInstaller
-
-先安装：
+## 本地打包（当前 OS）
 
 ```bash
 python -m pip install -r requirements.txt pyinstaller
+# macOS 额外：
+# bash scripts/make_icns.sh
+python -m PyInstaller --noconfirm --clean PiManager.spec
+python scripts/smoke_test_dist.py
+python scripts/package_release.py --version 1.6.0
 ```
 
-### Windows
+Windows 还可打单文件：
 
 ```bat
-python -m PyInstaller --noconfirm --clean PiManager.spec
 python -m PyInstaller --noconfirm --clean PiManagerOneFile.spec
-python scripts/package_release.py --platform windows --version 1.6.0
 ```
 
-产物：
-- `dist/PiManager/` 目录版
-- `dist/PiManager.exe` 单文件版
-- `release-assets/PiManager-v1.6.0-windows-*.zip`
+## 各平台独立运行要求
+
+| 平台 | 推荐产物 | 用户操作 | 保持完整的目录 |
+|------|----------|----------|----------------|
+| Windows x64 | `...-windows-x64-dir.zip` | 解压后运行 `PiManager\PiManager.exe` | `PiManager.exe` + `_internal\` |
+| macOS arm64 | `...-macos-arm64.zip` | 解压后打开 `PiManager.app` | 整个 `.app` bundle |
+| Linux x64 | `...-linux-x64.tar.gz` | `./PiManager/PiManager` | 整个 `PiManager/` 目录 |
+
+### Windows
+- 目录版启动更快、更稳；单文件首次解压较慢
+- 不要只拷贝 `PiManager.exe` 而丢掉 `_internal`
+- 自检：`PiManager.exe --self-check`
 
 ### macOS
-
-```bash
-bash scripts/make_icns.sh   # 生成 assets/pi-manager.icns
-python -m PyInstaller --noconfirm --clean PiManager.spec
-python scripts/package_release.py --platform macos --version 1.6.0
-```
-
-产物：
-- `dist/PiManager.app`
-- `release-assets/PiManager-v1.6.0-macos-arm64.zip`（或 `macos-x64`）
-
-说明：
-- 未签名未公证的 `.app`，首次打开可能需在「系统设置 → 隐私与安全性」中允许
-- Apple Silicon 与 Intel 需在对应架构机器上分别打包（CI 的 `macos-latest` 当前为 arm64）
+- 当前 CI 使用 `macos-latest`（通常 arm64 / Apple Silicon）
+- 未使用 Apple Developer ID 签名时，首次需「右键打开」或在隐私设置中允许
+- 打包脚本会对 `.app` 做 **ad-hoc** 签名（`codesign -s -`），便于同机校验；**不是**可分发的 Developer ID 签名
+- 自检：`PiManager.app/Contents/MacOS/PiManager --self-check`
 
 ### Linux
+- 基于 Ubuntu 22.04 构建；glibc 过旧的发行版可能无法运行
+- 若缺 GUI 库，安装例如：
+  ```bash
+  sudo apt-get install -y libgl1 libxkbcommon0 libxcb-cursor0 libdbus-1-3 libfontconfig1
+  ```
+- 也可用 `./PiManager/run-PiManager.sh`
+- 自检：`./PiManager/PiManager --self-check`
 
-```bash
-# Debian/Ubuntu 示例依赖
-sudo apt-get install -y libgl1 libxkbcommon0 libxcb-cursor0 libdbus-1-3
-python -m PyInstaller --noconfirm --clean PiManager.spec
-python scripts/package_release.py --platform linux --version 1.6.0
-```
+## GitHub Actions（推荐）
 
-产物：
-- `dist/PiManager/`
-- `release-assets/PiManager-v1.6.0-linux-x64.tar.gz`
+[`.github/workflows/build.yml`](.github/workflows/build.yml) 会：
 
-运行目录版：
+1. 在 Windows / macOS / Linux 各自构建
+2. 运行 `scripts/smoke_test_dist.py`（`--self-check` + 资源/可执行位检查）
+3. 打包 zip/tar.gz 与 `RUN-*.txt`
+4. 可选上传到 GitHub Release
 
-```bash
-./PiManager/PiManager
-```
+手动触发：Actions → **Build** → **Run workflow**  
+- `version`：`1.6.0`  
+- `upload_to_release`：`v1.6.0`（可选）
 
-若缺少系统库，按报错安装对应 `libxcb-*` / OpenGL 包。
-
-## GitHub Actions 跨平台打包（推荐）
-
-仓库已包含 [`.github/workflows/build.yml`](.github/workflows/build.yml)，会在 **Windows / macOS / Linux** 上分别构建：
-
-1. 打开 Actions → **Build** → **Run workflow**
-2. `version` 填 `1.6.0`
-3. 若要直接挂到已有 Release，`upload_to_release` 填 `v1.6.0`
-4. 构建完成后可在 Artifacts 下载，或到 Release 页查看附件
-
-也可打 tag 触发：
+打 tag 也会触发：
 
 ```bash
 git tag v1.6.1
 git push origin v1.6.1
 ```
 
+## 平台能力表
+
+| OS | 终端启动 | 密钥存储 |
+|----|----------|----------|
+| Windows | Windows Terminal / PowerShell / cmd | OS keyring + 文件库回退 |
+| macOS | Terminal.app / iTerm2 | Keychain + 文件库 |
+| Linux | gnome-terminal / konsole / xterm 等 | Secret Service + 文件库 |
+
+## 打包实现要点
+
+- `PiManager.spec`：按平台收集 keyring 后端、certifi、assets；禁用 UPX
+- `scripts/pyi_rth_pimanager.py`：冻结环境下设置 `QT_PLUGIN_PATH`
+- `pi_manager/resources.py`：兼容 onedir / onefile / macOS `.app` 资源路径
+- `main.py --self-check`：验证 PySide6 / cryptography / keyring / assets / 离屏 Qt
+
 ## 注意
 
-- GUI 可在三平台打包；完整 Pi 会话仍需本机 PATH 上有官方 `pi` CLI
-- 二进制与 VSIX 走 GitHub Releases，不进入源码树
 - 不要把本机 `~/.pi/agent` 配置、密钥库打进安装包
+- 二进制与 VSIX 走 GitHub Releases，不进入源码树
+- Apple 正式签名/公证需额外 Developer ID 证书（可选增强，不是独立运行的硬性条件）
