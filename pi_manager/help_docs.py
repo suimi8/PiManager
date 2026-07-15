@@ -251,15 +251,20 @@ def markdown_to_html(md: str) -> str:
         nonlocal in_table, table_rows
         if not table_rows:
             return
-        out.append('<table border="0" cellspacing="0" cellpadding="6" style="border-collapse:collapse;margin:8px 0;">')
+        out.append(
+            '<table border="0" cellspacing="0" cellpadding="6" '
+            'style="border-collapse:collapse;margin:10px 0;width:100%;">'
+        )
         for i, row in enumerate(table_rows):
             # skip separator row
             if all(re.fullmatch(r":?-{3,}:?", c.strip() or "") for c in row):
                 continue
             tag = "th" if i == 0 else "td"
-            style = "border:1px solid #ccc;padding:6px 10px;"
+            style = "border:1px solid #2a3545;padding:8px 12px;color:#e8eef7;"
             if i == 0:
-                style += "background:#f0f4f8;font-weight:700;"
+                style += "background:#161d27;font-weight:700;color:#93c5fd;"
+            else:
+                style += "background:transparent;"
             cells = "".join(f'<{tag} style="{style}">{_inline(c)}</{tag}>' for c in row)
             out.append(f"<tr>{cells}</tr>")
         out.append("</table>")
@@ -268,10 +273,19 @@ def markdown_to_html(md: str) -> str:
 
     def _inline(text: str) -> str:
         t = html.escape(text)
-        t = re.sub(r"`([^`]+)`", r"<code style='background:#eef2f7;padding:1px 4px;border-radius:3px;'>\1</code>", t)
+        t = re.sub(
+            r"`([^`]+)`",
+            r"<code style='background:#1a222d;color:#93c5fd;padding:2px 6px;"
+            r"border-radius:6px;font-family:Consolas,monospace;'>\1</code>",
+            t,
+        )
         t = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", t)
         t = re.sub(r"\*([^*]+)\*", r"<i>\1</i>", t)
-        t = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', t)
+        t = re.sub(
+            r"\[([^\]]+)\]\(([^)]+)\)",
+            r'<a href="\2" style="color:#60a5fa;text-decoration:none;">\1</a>',
+            t,
+        )
         return t
 
     for raw in lines:
@@ -281,7 +295,11 @@ def markdown_to_html(md: str) -> str:
             flush_table()
             if not in_code:
                 in_code = True
-                out.append("<pre style='background:#1e1e1e;color:#d4d4d4;padding:10px;border-radius:8px;overflow:auto;'>")
+                out.append(
+                    "<pre style=\"background:#0f141b;color:#d4d4d4;padding:12px 14px;"
+                    "border-radius:10px;overflow:auto;border:1px solid #243041;"
+                    "font-family:Consolas,monospace;font-size:12.5px;line-height:1.45;\">"
+                )
             else:
                 in_code = False
                 out.append("</pre>")
@@ -306,33 +324,40 @@ def markdown_to_html(md: str) -> str:
             continue
         if line.startswith("### "):
             close_ul()
-            out.append(f"<h3 style='margin:14px 0 6px;color:#1a5f8a;'>{_inline(line[4:])}</h3>")
+            out.append(
+                f"<h3 style='margin:16px 0 8px;color:#93c5fd;font-size:14px;'>{_inline(line[4:])}</h3>"
+            )
         elif line.startswith("## "):
             close_ul()
-            out.append(f"<h2 style='margin:18px 0 8px;border-bottom:1px solid #ddd;padding-bottom:4px;'>{_inline(line[3:])}</h2>")
+            out.append(
+                f"<h2 style='margin:20px 0 10px;border-bottom:1px solid #243041;"
+                f"padding-bottom:6px;color:#f4f7fb;font-size:16px;'>{_inline(line[3:])}</h2>"
+            )
         elif line.startswith("# "):
             close_ul()
-            out.append(f"<h1 style='margin:8px 0 12px;'>{_inline(line[2:])}</h1>")
+            out.append(
+                f"<h1 style='margin:8px 0 14px;color:#f4f7fb;font-size:20px;'>{_inline(line[2:])}</h1>"
+            )
         elif line.startswith("> "):
             close_ul()
             out.append(
-                f"<blockquote style='margin:8px 0;padding:8px 12px;border-left:4px solid #3d8bfd;"
-                f"background:#f5f9ff;'>{_inline(line[2:])}</blockquote>"
+                f"<blockquote style='margin:10px 0;padding:10px 14px;border-left:4px solid #3b82f6;"
+                f"background:#132033;color:#c5d0e0;border-radius:0 8px 8px 0;'>{_inline(line[2:])}</blockquote>"
             )
         elif line.startswith("---"):
             close_ul()
-            out.append("<hr style='border:none;border-top:1px solid #ddd;margin:16px 0;'/>")
+            out.append("<hr style='border:none;border-top:1px solid #243041;margin:18px 0;'/>")
         elif re.match(r"^[-*] ", line):
             if not in_ul:
-                out.append("<ul style='margin:6px 0 6px 1.2em;'>")
+                out.append("<ul style='margin:8px 0 8px 1.2em;color:#e8eef7;'>")
                 in_ul = True
-            out.append(f"<li style='margin:3px 0;'>{_inline(line[2:])}</li>")
+            out.append(f"<li style='margin:4px 0;line-height:1.5;'>{_inline(line[2:])}</li>")
         elif re.match(r"^\d+\. ", line):
             close_ul()
-            out.append(f"<p style='margin:4px 0 4px 0.5em;'>{_inline(line)}</p>")
+            out.append(f"<p style='margin:4px 0 4px 0.5em;color:#e8eef7;'>{_inline(line)}</p>")
         else:
             close_ul()
-            out.append(f"<p style='margin:6px 0;line-height:1.55;'>{_inline(line)}</p>")
+            out.append(f"<p style='margin:8px 0;line-height:1.6;color:#e8eef7;'>{_inline(line)}</p>")
 
     close_ul()
     flush_table()
@@ -342,8 +367,8 @@ def markdown_to_html(md: str) -> str:
     body = "\n".join(out)
     return (
         "<html><head><meta charset='utf-8'></head>"
-        "<body style='font-family:Segoe UI,Microsoft YaHei,sans-serif;font-size:13px;"
-        "color:#222;background:transparent;padding:8px 12px;'>"
+        "<body style=\"font-family:'Segoe UI','Microsoft YaHei UI','PingFang SC',sans-serif;"
+        "font-size:13px;color:#e8eef7;background:transparent;padding:10px 14px;line-height:1.55;\">"
         f"{body}</body></html>"
     )
 

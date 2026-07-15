@@ -505,6 +505,11 @@ NAV_PAGES = [
     ("help", "使用教程", "教程与常见问题"),
 ]
 
+# 侧栏展示用（图标 + 标题），图标来自 ui_theme.NAV_ICONS
+def _nav_label(key: str, title: str) -> str:
+    icon = ui_theme.NAV_ICONS.get(key, "·")
+    return f"{icon}  {title}"
+
 
 class InstallPiDialog(QDialog):
     """Install or upgrade official pi via npm."""
@@ -674,8 +679,8 @@ class MainWindow(FeatureMixin, QMainWindow):
             self.setWindowIcon(app_icon())
         except Exception:
             pass
-        self.resize(1280, 840)
-        self.setMinimumSize(1040, 700)
+        self.resize(1320, 880)
+        self.setMinimumSize(1080, 720)
         self.models: list[core.ModelInfo] = []
         self.workers: list[Worker] = []
         self.test_results: dict[str, dict[str, Any]] = {}
@@ -704,16 +709,16 @@ class MainWindow(FeatureMixin, QMainWindow):
         # ---- left sidebar ----
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(228)
+        sidebar.setFixedWidth(236)
         sb = QVBoxLayout(sidebar)
-        sb.setContentsMargins(14, 16, 14, 14)
-        sb.setSpacing(8)
+        sb.setContentsMargins(16, 18, 16, 16)
+        sb.setSpacing(10)
 
         brand_row = QHBoxLayout()
-        brand_row.setSpacing(10)
+        brand_row.setSpacing(12)
         self.brand_icon = QLabel()
         self.brand_icon.setObjectName("brandIcon")
-        self.brand_icon.setFixedSize(40, 40)
+        self.brand_icon.setFixedSize(42, 42)
         self.brand_icon.setScaledContents(True)
         try:
             from . import resources as res
@@ -722,12 +727,12 @@ class MainWindow(FeatureMixin, QMainWindow):
                 pm = QPixmap(str(p))
                 if not pm.isNull():
                     self.brand_icon.setPixmap(
-                        pm.scaled(40, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        pm.scaled(42, 42, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                     )
         except Exception:
             pass
         brand_text = QVBoxLayout()
-        brand_text.setSpacing(0)
+        brand_text.setSpacing(1)
         brand = QLabel("Pi Manager")
         brand.setObjectName("navBrand")
         tag = QLabel("简化配置 · 官方 Pi")
@@ -735,19 +740,29 @@ class MainWindow(FeatureMixin, QMainWindow):
         tag.setWordWrap(True)
         brand_text.addWidget(brand)
         brand_text.addWidget(tag)
-        brand_row.addWidget(self.brand_icon, 0, Qt.AlignTop)
+        brand_row.addWidget(self.brand_icon, 0, Qt.AlignVCenter)
         brand_row.addLayout(brand_text, 1)
         sb.addLayout(brand_row)
 
+        # subtle divider under brand
+        brand_rule = QFrame()
+        brand_rule.setObjectName("headerRule")
+        brand_rule.setFrameShape(QFrame.HLine)
+        brand_rule.setFixedHeight(1)
+        sb.addWidget(brand_rule)
+
         self.nav = QListWidget()
         self.nav.setObjectName("sideNav")
-        self.nav.setSpacing(2)
+        self.nav.setSpacing(3)
         self.nav.setFocusPolicy(Qt.NoFocus)
+        self.nav.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._page_keys: list[str] = []
         for key, title, _desc in NAV_PAGES:
-            item = QListWidgetItem(title)
+            item = QListWidgetItem(_nav_label(key, title))
             item.setData(Qt.UserRole, key)
             item.setToolTip(_desc)
+            item.setSizeHint(QSize(0, 40))
             self.nav.addItem(item)
             self._page_keys.append(key)
         self.nav.currentRowChanged.connect(self._on_nav_changed)
@@ -755,15 +770,17 @@ class MainWindow(FeatureMixin, QMainWindow):
 
         # compact sidebar quick actions (replaces top toolbar)
         side_actions = QVBoxLayout()
-        side_actions.setSpacing(6)
-        side_actions.addWidget(self._btn("启动完整 Pi", self.launch_default, success=True))
+        side_actions.setSpacing(8)
+        launch_side = self._btn("▶  启动完整 Pi", self.launch_default, success=True)
+        launch_side.setMinimumHeight(38)
+        side_actions.addWidget(launch_side)
         row_sa = QHBoxLayout()
         row_sa.setSpacing(6)
         b_ref = self._btn("刷新", self.refresh_all, secondary=True)
         b_theme = self._btn("昼夜", self.toggle_ui_mode, secondary=True)
         b_cfg = self._btn("配置", self.open_config_dir, secondary=True)
         for b in (b_ref, b_theme, b_cfg):
-            b.setMinimumHeight(32)
+            b.setMinimumHeight(34)
             row_sa.addWidget(b)
         side_actions.addLayout(row_sa)
         sb.addLayout(side_actions)
@@ -771,6 +788,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.version_pill = QLabel("pi: ...")
         self.version_pill.setObjectName("pill")
         self.version_pill.setAlignment(Qt.AlignCenter)
+        self.version_pill.setWordWrap(True)
         sb.addWidget(self.version_pill)
         shell.addWidget(sidebar)
 
@@ -778,16 +796,16 @@ class MainWindow(FeatureMixin, QMainWindow):
         content = QFrame()
         content.setObjectName("contentShell")
         cr = QVBoxLayout(content)
-        cr.setContentsMargins(22, 18, 22, 12)
-        cr.setSpacing(12)
+        cr.setContentsMargins(28, 22, 28, 14)
+        cr.setSpacing(14)
 
         header = QFrame()
         header.setObjectName("pageHeader")
         header_l = QHBoxLayout(header)
-        header_l.setContentsMargins(0, 0, 0, 0)
-        header_l.setSpacing(12)
+        header_l.setContentsMargins(0, 0, 0, 4)
+        header_l.setSpacing(16)
         title_box = QVBoxLayout()
-        title_box.setSpacing(2)
+        title_box.setSpacing(4)
         self.page_heading = QLabel("简化配置")
         self.page_heading.setObjectName("pageTitle")
         self.page_subheading = QLabel("用最少步骤接入 Provider、切换默认模型并启动官方 Pi")
@@ -799,7 +817,7 @@ class MainWindow(FeatureMixin, QMainWindow):
 
         header_btns = QHBoxLayout()
         header_btns.setSpacing(8)
-        self.header_launch_btn = self._btn("启动完整 Pi", self.launch_default, success=True)
+        self.header_launch_btn = self._btn("▶  启动完整 Pi", self.launch_default, success=True)
         self.header_launch_btn.setProperty("large", True)
         header_btns.addWidget(self.header_launch_btn)
         header_btns.addWidget(self._btn("自检", self.self_check_run, secondary=True))
@@ -867,22 +885,40 @@ class MainWindow(FeatureMixin, QMainWindow):
         elif key in getattr(self, "_page_index", {}):
             self.pages.setCurrentIndex(self._page_index[key])
 
-    def _card(self) -> QFrame:
-
+    def _card(self, *, elevated: bool = False) -> QFrame:
         f = QFrame()
         f.setObjectName("card")
+        if elevated:
+            f.setProperty("elevated", True)
         return f
 
-    def _btn(self, text: str, slot, *, secondary=False, danger=False, success=False) -> QPushButton:
+    def _btn(self, text: str, slot, *, secondary=False, danger=False, success=False, ghost=False) -> QPushButton:
         b = QPushButton(text)
+        b.setCursor(Qt.PointingHandCursor)
         if secondary:
             b.setProperty("secondary", True)
         if danger:
             b.setProperty("danger", True)
         if success:
             b.setProperty("success", True)
+        if ghost:
+            b.setProperty("ghost", True)
         b.clicked.connect(slot)
         return b
+
+    def _polish_table(self, table: QTableWidget) -> None:
+        """统一表格观感（跨平台）。"""
+        table.setShowGrid(False)
+        table.setAlternatingRowColors(True)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setWordWrap(False)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(36)
+        table.setFocusPolicy(Qt.StrongFocus)
+        table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
 
     def _build_dashboard_tab(self) -> QWidget:
         """简化配置主页（CC Switch 风格：配置优先）。"""
@@ -894,8 +930,8 @@ class MainWindow(FeatureMixin, QMainWindow):
         scroll.setFrameShape(QFrame.NoFrame)
         body = QWidget()
         layout = QVBoxLayout(body)
-        layout.setContentsMargins(2, 2, 8, 8)
-        layout.setSpacing(12)
+        layout.setContentsMargins(4, 4, 10, 12)
+        layout.setSpacing(14)
 
         guide = QLabel(
             "推荐流程：① Base URL + API Key 拉取模型 → ② 设为默认 / 加入收藏 → ③ 选择工作目录并启动完整 Pi"
@@ -905,9 +941,11 @@ class MainWindow(FeatureMixin, QMainWindow):
         layout.addWidget(guide)
 
         top = QHBoxLayout()
-        cur = self._card()
+        top.setSpacing(14)
+        cur = self._card(elevated=True)
         cur_l = QVBoxLayout(cur)
-        cur_l.setSpacing(8)
+        cur_l.setContentsMargins(16, 16, 16, 16)
+        cur_l.setSpacing(10)
         t1 = QLabel("当前默认模型")
         t1.setObjectName("sectionTitle")
         cur_l.addWidget(t1)
@@ -918,7 +956,9 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.lbl_thinking = QLabel("Thinking: -")
         self.lbl_thinking.setObjectName("subtitle")
         cur_l.addWidget(self.lbl_thinking)
+        cur_l.addStretch(1)
         cur_btns = QHBoxLayout()
+        cur_btns.setSpacing(8)
         cur_btns.addWidget(self._btn("启动完整 Pi 会话", self.launch_default, success=True))
         cur_btns.addWidget(self._btn("去模型列表", lambda: self._goto_page("models"), secondary=True))
         cur_btns.addWidget(self._btn("刷新状态", self.refresh_dashboard, secondary=True))
@@ -926,9 +966,10 @@ class MainWindow(FeatureMixin, QMainWindow):
         cur_l.addLayout(cur_btns)
         top.addWidget(cur, 1)
 
-        quick = self._card()
+        quick = self._card(elevated=True)
         ql = QVBoxLayout(quick)
-        ql.setSpacing(8)
+        ql.setContentsMargins(16, 16, 16, 16)
+        ql.setSpacing(10)
         t2 = QLabel("快速接入 Provider")
         t2.setObjectName("sectionTitle")
         ql.addWidget(t2)
@@ -937,7 +978,9 @@ class MainWindow(FeatureMixin, QMainWindow):
         tipq.setWordWrap(True)
         ql.addWidget(tipq)
         form = QFormLayout()
-        form.setSpacing(8)
+        form.setSpacing(10)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
         self.quick_name = QLineEdit("custom")
         self.quick_base = QLineEdit("https://api.openai.com/v1")
         self.quick_base.setPlaceholderText("https://你的中转/v1")
@@ -961,6 +1004,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.quick_status.setWordWrap(True)
         ql.addWidget(self.quick_status)
         qrow = QHBoxLayout()
+        qrow.setSpacing(8)
         qrow.addWidget(self._btn("拉取并保存", self.quick_fetch_and_save, success=True))
         qrow.addWidget(self._btn("高级拉取对话框", self.provider_fetch_api, secondary=True))
         qrow.addWidget(self._btn("管理 Provider", lambda: self._goto_page("providers"), secondary=True))
@@ -971,17 +1015,25 @@ class MainWindow(FeatureMixin, QMainWindow):
 
         work = self._card()
         work_l = QVBoxLayout(work)
+        work_l.setContentsMargins(16, 16, 16, 16)
+        work_l.setSpacing(10)
         t3 = QLabel("工作目录与启动")
         t3.setObjectName("sectionTitle")
         work_l.addWidget(t3)
         row = QHBoxLayout()
+        row.setSpacing(8)
         self.workdir_edit = QLineEdit(self.mgr.get("last_workdir") or str(core.user_home()))
+        self.workdir_edit.setMinimumHeight(34)
         row.addWidget(self.workdir_edit, 1)
         row.addWidget(self._btn("浏览…", self.browse_workdir, secondary=True))
         work_l.addLayout(row)
         term_row = QHBoxLayout()
-        term_row.addWidget(QLabel("终端"))
+        term_row.setSpacing(8)
+        term_lbl = QLabel("终端")
+        term_lbl.setObjectName("muted")
+        term_row.addWidget(term_lbl)
         self.terminal_combo = QComboBox()
+        self.terminal_combo.setMinimumHeight(34)
         for value, label in core.list_terminal_options():
             self.terminal_combo.addItem(label, value)
         term = self.mgr.get("terminal", "auto")
@@ -996,8 +1048,10 @@ class MainWindow(FeatureMixin, QMainWindow):
 
         self.drop_zone = QFrame()
         self.drop_zone.setObjectName("dropZone")
-        self.drop_zone.setMinimumHeight(88)
+        self.drop_zone.setMinimumHeight(100)
         dz = QVBoxLayout(self.drop_zone)
+        dz.setContentsMargins(16, 14, 16, 14)
+        dz.setSpacing(6)
         self.drop_title = QLabel("拖拽项目文件夹到这里")
         self.drop_title.setObjectName("sectionTitle")
         self.drop_title.setAlignment(Qt.AlignCenter)
@@ -1016,14 +1070,17 @@ class MainWindow(FeatureMixin, QMainWindow):
 
         fav_box = QGroupBox("收藏模型 · 一键切换")
         fav_l = QVBoxLayout(fav_box)
+        fav_l.setSpacing(10)
         fav_tip = QLabel("双击设为默认；可批量测试收藏。完整会话请点「启动」。")
         fav_tip.setObjectName("subtitle")
         fav_l.addWidget(fav_tip)
         self.fav_list = QListWidget()
-        self.fav_list.setMinimumHeight(140)
+        self.fav_list.setMinimumHeight(150)
+        self.fav_list.setSpacing(2)
         self.fav_list.itemDoubleClicked.connect(self.on_fav_double)
         fav_l.addWidget(self.fav_list)
         fav_btns = QHBoxLayout()
+        fav_btns.setSpacing(8)
         fav_btns.addWidget(self._btn("设为默认", self.fav_set_default, success=True))
         fav_btns.addWidget(self._btn("启动 Pi（此模型）", self.fav_launch))
         fav_btns.addWidget(self._btn("测试此收藏", self.fav_test, success=True))
@@ -1035,11 +1092,12 @@ class MainWindow(FeatureMixin, QMainWindow):
 
         auth_box = QGroupBox("已认证 Provider（OAuth / 登录态）")
         auth_l = QVBoxLayout(auth_box)
+        auth_l.setSpacing(10)
         self.auth_table = QTableWidget(0, 2)
         self.auth_table.setHorizontalHeaderLabels(["Provider", "状态"])
         self.auth_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.auth_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.auth_table.setMaximumHeight(150)
+        self._polish_table(self.auth_table)
+        self.auth_table.setMaximumHeight(160)
         auth_l.addWidget(self.auth_table)
         layout.addWidget(auth_box)
         layout.addStretch(1)
@@ -1128,16 +1186,23 @@ class MainWindow(FeatureMixin, QMainWindow):
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
 
         # 过滤 + Provider 筛选 + 刷新
         filt = QHBoxLayout()
+        filt.setSpacing(8)
         self.model_provider_filter = QComboBox()
-        self.model_provider_filter.setMinimumWidth(140)
+        self.model_provider_filter.setMinimumWidth(160)
+        self.model_provider_filter.setMinimumHeight(34)
         self.model_provider_filter.addItem("全部 Provider", "")
         self.model_provider_filter.currentIndexChanged.connect(self.fill_models_table)
         self.model_filter = QLineEdit()
         self.model_filter.setPlaceholderText("搜索模型名…")
+        self.model_filter.setMinimumHeight(34)
+        try:
+            self.model_filter.setClearButtonEnabled(True)
+        except Exception:
+            pass
         self.model_filter.textChanged.connect(self.fill_models_table)
         filt.addWidget(self.model_provider_filter)
         filt.addWidget(self.model_filter, 1)
@@ -1156,13 +1221,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.models_table.verticalHeader().setVisible(False)
-        self.models_table.setShowGrid(False)
-        self.models_table.setAlternatingRowColors(True)
-        self.models_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.models_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.models_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.models_table.setWordWrap(False)
+        self._polish_table(self.models_table)
         self.models_table.doubleClicked.connect(self.model_set_default)
         layout.addWidget(self.models_table, 1)
 
@@ -1249,70 +1308,115 @@ class MainWindow(FeatureMixin, QMainWindow):
     def _build_providers_tab(self) -> QWidget:
         w = QWidget()
         layout = QHBoxLayout(w)
-        left = QVBoxLayout()
-        left.addWidget(QLabel("自定义 Providers（models.json）"))
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+
+        left_card = self._card()
+        left = QVBoxLayout(left_card)
+        left.setContentsMargins(14, 14, 14, 14)
+        left.setSpacing(10)
+        left_title = QLabel("自定义 Providers")
+        left_title.setObjectName("sectionTitle")
+        left.addWidget(left_title)
+        left_tip = QLabel("来自 models.json · 选中后右侧预览")
+        left_tip.setObjectName("subtitle")
+        left.addWidget(left_tip)
         self.provider_list = QListWidget()
+        self.provider_list.setSpacing(2)
         self.provider_list.currentItemChanged.connect(self.on_provider_selected)
         left.addWidget(self.provider_list, 1)
         pb = QHBoxLayout()
+        pb.setSpacing(8)
         pb.addWidget(self._btn("添加", self.provider_add))
         pb.addWidget(self._btn("从 API 拉取模型", self.provider_fetch_api, success=True))
         pb.addWidget(self._btn("编辑", self.provider_edit, secondary=True))
         pb.addWidget(self._btn("删除", self.provider_delete, danger=True))
         left.addLayout(pb)
-        layout.addLayout(left, 1)
+        layout.addWidget(left_card, 1)
 
-        right = QVBoxLayout()
-        right.addWidget(QLabel("详情 / 原始 JSON 预览"))
+        right_card = self._card()
+        right = QVBoxLayout(right_card)
+        right.setContentsMargins(14, 14, 14, 14)
+        right.setSpacing(10)
+        right_title = QLabel("详情 / 原始 JSON 预览")
+        right_title.setObjectName("sectionTitle")
+        right.addWidget(right_title)
         self.provider_detail = QPlainTextEdit()
         self.provider_detail.setReadOnly(True)
         right.addWidget(self.provider_detail, 1)
         rb = QHBoxLayout()
+        rb.setSpacing(8)
         rb.addWidget(self._btn("打开 models.json", self.open_models_json, secondary=True))
         rb.addWidget(self._btn("添加模型到当前 Provider", self.provider_add_model))
         rb.addStretch(1)
         right.addLayout(rb)
-        layout.addLayout(right, 2)
+        layout.addWidget(right_card, 2)
         return w
 
     def _build_chat_tab(self) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
         tip = QLabel("内嵌短问答（pi -p，带近期上下文）。完整 agent/改代码请「启动完整 Pi 会话」。")
         tip.setObjectName("subtitle")
+        tip.setWordWrap(True)
         layout.addWidget(tip)
+
+        ctrl = self._card()
+        ctrl_l = QVBoxLayout(ctrl)
+        ctrl_l.setContentsMargins(14, 14, 14, 14)
+        ctrl_l.setSpacing(10)
         row = QHBoxLayout()
+        row.setSpacing(8)
         self.chat_provider = QLineEdit()
+        self.chat_provider.setPlaceholderText("provider")
         self.chat_model = QLineEdit()
+        self.chat_model.setPlaceholderText("model")
         row.addWidget(QLabel("Provider"))
-        row.addWidget(self.chat_provider)
+        row.addWidget(self.chat_provider, 1)
         row.addWidget(QLabel("Model"))
-        row.addWidget(self.chat_model)
+        row.addWidget(self.chat_model, 1)
         row.addWidget(self._btn("填入当前默认", self.chat_fill_default, secondary=True))
         row.addWidget(self._btn("清空对话", self.chat_clear_history, secondary=True))
-        layout.addLayout(row)
+        ctrl_l.addLayout(row)
         self.chat_input = QPlainTextEdit()
         self.chat_input.setPlaceholderText("输入问题…（支持多轮上下文，最近 6 轮）")
         self.chat_input.setFixedHeight(120)
-        layout.addWidget(self.chat_input)
+        ctrl_l.addWidget(self.chat_input)
         brow = QHBoxLayout()
+        brow.setSpacing(8)
         brow.addWidget(self._btn("发送到 Pi", self.chat_send_enhanced, success=True))
         brow.addWidget(self._btn("单次发送(无历史)", self.chat_send, secondary=True))
         brow.addStretch(1)
-        layout.addLayout(brow)
+        ctrl_l.addLayout(brow)
+        layout.addWidget(ctrl)
+
+        out_card = self._card()
+        out_l = QVBoxLayout(out_card)
+        out_l.setContentsMargins(14, 14, 14, 14)
+        out_title = QLabel("回复")
+        out_title.setObjectName("sectionTitle")
+        out_l.addWidget(out_title)
         self.chat_output = QPlainTextEdit()
         self.chat_output.setReadOnly(True)
-        layout.addWidget(self.chat_output, 1)
+        out_l.addWidget(self.chat_output, 1)
+        layout.addWidget(out_card, 1)
         return w
 
     def _build_sessions_tab(self) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
         filt = QHBoxLayout()
+        filt.setSpacing(8)
         self.session_filter_wd = QLineEdit()
         self.session_filter_wd.setPlaceholderText("按工作目录/路径过滤…")
+        self.session_filter_wd.setMinimumHeight(34)
         self.session_filter_name = QLineEdit()
         self.session_filter_name.setPlaceholderText("按名称过滤…")
+        self.session_filter_name.setMinimumHeight(34)
         self.session_filter_wd.textChanged.connect(self.sessions_apply_filter)
         self.session_filter_name.textChanged.connect(self.sessions_apply_filter)
         filt.addWidget(self.session_filter_wd, 1)
@@ -1322,11 +1426,10 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.sessions_table = QTableWidget(0, 3)
         self.sessions_table.setHorizontalHeaderLabels(["名称", "目录", "路径"])
         self.sessions_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.sessions_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.sessions_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.sessions_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._polish_table(self.sessions_table)
         layout.addWidget(self.sessions_table, 1)
         row = QHBoxLayout()
+        row.setSpacing(8)
         row.addWidget(self._btn("继续会话", self.session_continue, success=True))
         row.addWidget(self._btn("资源管理器", self.session_reveal, secondary=True))
         row.addWidget(self._btn("重命名", self.session_rename, secondary=True))
@@ -1338,12 +1441,28 @@ class MainWindow(FeatureMixin, QMainWindow):
 
     def _build_settings_tab(self) -> QWidget:
         w = QWidget()
-        layout = QVBoxLayout(w)
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(12)
         guide = QLabel("流程：语言/主题 → 代理并发 → 托盘与安全 → 保存设置。默认模型也可在「模型列表」或「简化配置」收藏区设置。")
         guide.setObjectName("subtitle")
         guide.setWordWrap(True)
-        layout.addWidget(guide)
+        outer.addWidget(guide)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(2, 2, 8, 8)
+        layout.setSpacing(12)
+
+        form_card = self._card()
+        form_wrap = QVBoxLayout(form_card)
+        form_wrap.setContentsMargins(16, 16, 16, 16)
         form = QFormLayout()
+        form.setSpacing(10)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.set_provider = QLineEdit()
         self.set_model = QLineEdit()
         self.set_thinking = QComboBox()
@@ -1399,28 +1518,47 @@ class MainWindow(FeatureMixin, QMainWindow):
         form.addRow("", self.minimize_to_tray)
         form.addRow("", self.start_minimized)
         form.addRow("", self.secure_keys_chk)
-        layout.addLayout(form)
+        form_wrap.addLayout(form)
+        layout.addWidget(form_card)
 
+        actions = self._card()
+        actions_l = QVBoxLayout(actions)
+        actions_l.setContentsMargins(14, 14, 14, 14)
+        actions_l.setSpacing(10)
         row = QHBoxLayout()
+        row.setSpacing(8)
         row.addWidget(self._btn("从文件加载", self.settings_load, secondary=True))
         row.addWidget(self._btn("保存设置", self.settings_save, success=True))
         row.addWidget(self._btn("打开 settings.json", self.open_settings_json, secondary=True))
         row.addStretch(1)
-        layout.addLayout(row)
+        actions_l.addLayout(row)
 
         row2 = QHBoxLayout()
+        row2.setSpacing(8)
         row2.addWidget(self._btn("应用界面主题", self.apply_ui_theme_from_settings, success=True))
         row2.addWidget(self._btn("切换昼夜", self.toggle_ui_mode, secondary=True))
         row2.addWidget(self._btn("检查 Pi 更新", self.check_pi_update, secondary=True))
         row2.addWidget(self._btn("安装/升级 Pi", self.open_install_dialog))
         row2.addWidget(self._btn("打开配置向导", self.open_setup_wizard, secondary=True))
         row2.addStretch(1)
-        layout.addLayout(row2)
+        actions_l.addLayout(row2)
+        layout.addWidget(actions)
 
+        raw_card = self._card()
+        raw_l = QVBoxLayout(raw_card)
+        raw_l.setContentsMargins(14, 14, 14, 14)
+        raw_l.setSpacing(8)
+        raw_title = QLabel("settings.json 预览")
+        raw_title.setObjectName("sectionTitle")
+        raw_l.addWidget(raw_title)
         self.settings_raw = QPlainTextEdit()
         self.settings_raw.setReadOnly(True)
-        layout.addWidget(QLabel("settings.json 预览"))
-        layout.addWidget(self.settings_raw, 1)
+        self.settings_raw.setMinimumHeight(180)
+        raw_l.addWidget(self.settings_raw, 1)
+        layout.addWidget(raw_card, 1)
+
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
         return w
 
 
@@ -2281,11 +2419,16 @@ class MainWindow(FeatureMixin, QMainWindow):
         pal.setColor(QPalette.Highlight, QColor(cols["highlight"]))
         pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
         self.setPalette(pal)
-        a = ui_theme.ACCENTS[accent]["accent_text"]
-        if hasattr(self, "lbl_current"):
-            self.lbl_current.setStyleSheet(f"font-size:20px;font-weight:800;color:{a};")
-        if hasattr(self, "drop_title"):
-            self.drop_title.setStyleSheet(f"font-size:14px;font-weight:700;color:{a};")
+        # hero / drop titles use objectName styles from stylesheet; force polish after theme switch
+        for name in ("lbl_current", "drop_title", "version_pill", "page_heading", "page_subheading"):
+            w = getattr(self, name, None)
+            if w is not None:
+                try:
+                    w.style().unpolish(w)
+                    w.style().polish(w)
+                    w.update()
+                except Exception:
+                    pass
         if hasattr(self, "set_ui_mode"):
             for i in range(self.set_ui_mode.count()):
                 if self.set_ui_mode.itemData(i) == mode:
@@ -2466,10 +2609,22 @@ class MainWindow(FeatureMixin, QMainWindow):
 
 def run_app():
     import sys
+    # Better text/DPI rendering on Windows & high-DPI screens.
+    try:
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
+    except Exception:
+        pass
     app = QApplication(sys.argv)
     app.setApplicationName("Pi Manager")
     app.setOrganizationName("PiManager")
     app.setQuitOnLastWindowClosed(False)
+    try:
+        app.setStyle("Fusion")
+    except Exception:
+        pass
+    ui_theme.apply_app_font(app)
     try:
         from .ui_features import app_icon
         app.setWindowIcon(app_icon())
@@ -2486,6 +2641,9 @@ def run_app():
     pal.setColor(QPalette.ButtonText, QColor(cols["button_text"]))
     pal.setColor(QPalette.Highlight, QColor(cols["highlight"]))
     pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+    pal.setColor(QPalette.AlternateBase, QColor(cols["base"]))
+    pal.setColor(QPalette.ToolTipBase, QColor(cols["window"]))
+    pal.setColor(QPalette.ToolTipText, QColor(cols["text"]))
     app.setPalette(pal)
     app.setStyleSheet(ui_theme.build_stylesheet(ut.get("mode"), ut.get("accent")))
     win = MainWindow()
