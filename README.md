@@ -32,19 +32,24 @@
 
 ## 快速开始
 
-### 方式一：下载发布包（Windows）
+### 方式一：下载发布包
 
-从 [Releases](https://github.com/suimi8/PiManager/releases) 下载：
+从 [Releases](https://github.com/suimi8/PiManager/releases) 下载对应平台：
 
-- **目录版（推荐）**：`PiManager-vX.Y.Z` — 启动更快
-- **单文件版**：`PiManager-vX.Y.Z-onefile` — 单 EXE，首次启动略慢
-- **Cursor 扩展**：`pi-manager-pi-cursor-*.vsix`
+| 平台 | 附件示例 |
+|------|----------|
+| Windows | `PiManager-vX.Y.Z-windows-x64-dir.zip`（推荐）/ `...-onefile.zip` |
+| macOS | `PiManager-vX.Y.Z-macos-arm64.zip`（`.app`） |
+| Linux | `PiManager-vX.Y.Z-linux-x64.tar.gz` |
+| Cursor | `pi-manager-pi-cursor-*.vsix` |
 
 运行前请确保已安装官方 Pi：
 
 ```bash
 npm install -g @earendil-works/pi-coding-agent
 ```
+
+macOS 若提示无法打开未签名应用：系统设置 → 隐私与安全性 → 仍要打开。
 
 ### 方式二：从源码运行
 
@@ -85,15 +90,16 @@ pi.providerEnvCommand = python /path/to/PiManager/main.py --print-provider-env
 
 ## 打包
 
-详见 [BUILD.md](BUILD.md)。
+详见 [BUILD.md](BUILD.md)。本地：
 
 ```bash
-# Windows 目录版
+python -m pip install -r requirements.txt pyinstaller
 python -m PyInstaller --noconfirm --clean PiManager.spec
-
-# Windows 单文件版
-python -m PyInstaller --noconfirm --clean PiManagerOneFile.spec
+python scripts/package_release.py --version 1.6.0
 ```
+
+跨平台（Windows / macOS / Linux）推荐用 GitHub Actions：
+Actions → **Build** → **Run workflow**，可将产物上传到 Release。
 
 二进制产物请通过 GitHub Releases 分发，不纳入本仓库源码树。
 

@@ -1,4 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
+"""Cross-platform onefile build (slower first launch)."""
+from __future__ import annotations
+
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files
@@ -7,27 +11,38 @@ project_root = Path(SPECPATH)
 datas = [(str(project_root / "assets"), "assets")]
 datas += collect_data_files("certifi")
 
+hiddenimports = [
+    "keyring.backends",
+    "cryptography",
+    "pi_manager.platform_util",
+    "pi_manager.resources",
+    "pi_manager.extras",
+    "pi_manager.secrets",
+    "pi_manager.storage",
+    "pi_manager.provider_env",
+    "pi_manager.ui_features",
+    "pi_manager.help_docs",
+    "pi_manager.ui_theme",
+    "pi_manager.builtin_themes",
+]
+
+if sys.platform == "win32":
+    hiddenimports += ["keyring.backends.Windows"]
+    icon = str(project_root / "assets" / "pi-manager.ico")
+elif sys.platform == "darwin":
+    hiddenimports += ["keyring.backends.macOS", "keyring.backends.chainer"]
+    icns = project_root / "assets" / "pi-manager.icns"
+    icon = str(icns if icns.exists() else project_root / "assets" / "icon.png")
+else:
+    hiddenimports += ["keyring.backends.SecretService", "keyring.backends.chainer"]
+    icon = None
 
 a = Analysis(
     ["main.py"],
     pathex=["."],
     binaries=[],
     datas=datas,
-    hiddenimports=[
-        "keyring.backends",
-        "keyring.backends.Windows",
-        "cryptography",
-        "pi_manager.platform_util",
-        "pi_manager.resources",
-        "pi_manager.extras",
-        "pi_manager.secrets",
-        "pi_manager.storage",
-        "pi_manager.provider_env",
-        "pi_manager.ui_features",
-        "pi_manager.help_docs",
-        "pi_manager.ui_theme",
-        "pi_manager.builtin_themes",
-    ],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -47,12 +62,12 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
-    argv_emulation=False,
+    argv_emulation=sys.platform == "darwin",
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=str(project_root / "assets" / "pi-manager.ico"),
+    icon=icon,
 )
