@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-OUT = Path(r"C:\Users\suimi\Documents\Codex\2026-07-11\new-chat\work\pi-manager\assets")
+OUT = Path(__file__).resolve().parent
 OUT.mkdir(parents=True, exist_ok=True)
 
 # Brand colors (aligned with UI night + blue accent)
