@@ -56,7 +56,7 @@ python -m PyInstaller --noconfirm --clean PiManagerOneFile.spec
 - 基于 Ubuntu 22.04 构建；glibc 过旧的发行版可能无法运行
 - 若缺 GUI 库，安装例如：
   ```bash
-  sudo apt-get install -y libgl1 libxkbcommon0 libxcb-cursor0 libdbus-1-3 libfontconfig1
+  sudo apt-get install -y libgl1 libegl1 libxkbcommon0 libxcb-cursor0 libdbus-1-3 libfontconfig1
   ```
 - 也可用 `./PiManager/run-PiManager.sh`
 - 自检：`./PiManager/PiManager --self-check`

@@ -48,6 +48,7 @@ jobs:
           sudo apt-get install -y \
             xvfb \
             libgl1 \
+            libegl1 \
             libglib2.0-0 \
             libxkbcommon0 \
             libxkbcommon-x11-0 \
@@ -62,7 +63,12 @@ jobs:
             libxcb-xinerama0 \
             libxcb-xfixes0 \
             libfontconfig1 \
-            libfreetype6
+            libfreetype6 \
+            libnss3 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxrandr2 \
+            libxi6
 
       - name: Install Python deps
         run: |

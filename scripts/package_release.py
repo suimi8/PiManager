@@ -114,7 +114,7 @@ def write_run_notes(out_dir: Path, plat: str, version: str) -> Path:
 3. 保持目录完整（可执行文件与 _internal 等同级依赖不要拆开）
 
 若启动报缺库，按发行版安装常见 GUI 依赖，例如 Debian/Ubuntu：
-  sudo apt-get install -y libgl1 libxkbcommon0 libxcb-cursor0 libdbus-1-3
+  sudo apt-get install -y libgl1 libegl1 libxkbcommon0 libxcb-cursor0 libdbus-1-3 libfontconfig1
 
 完整 Pi 会话仍需本机安装官方 pi CLI：
   npm install -g @earendil-works/pi-coding-agent

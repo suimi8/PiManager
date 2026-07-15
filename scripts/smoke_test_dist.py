@@ -63,14 +63,21 @@ def main() -> int:
     env = os.environ.copy()
     # Headless-friendly Qt backend for CI / servers.
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    env.setdefault("QT_OPENGL", "software")
     # Avoid picking up a developer venv accidentally.
     env.pop("PYTHONPATH", None)
+
+    # Ensure onedir shared libraries are found first on Linux.
+    if plat == "linux":
+        lib_dirs = [str(binary.parent), str(binary.parent / "_internal")]
+        existing = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = ":".join([d for d in lib_dirs if Path(d).is_dir()] + ([existing] if existing else []))
 
     cmd = [str(binary), "--self-check"]
     if plat == "linux":
         # Prefer xvfb when available for extra realism, still keep offscreen fallback.
         if subprocess.call(["bash", "-lc", "command -v xvfb-run >/dev/null"], stdout=subprocess.DEVNULL) == 0:
-            cmd = ["xvfb-run", "-a", str(binary), "--self-check"]
+            cmd = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24", str(binary), "--self-check"]
 
     started = time.time()
     proc = subprocess.run(
