@@ -290,21 +290,47 @@ class FeatureMixin:
 
         self.help_tabs = QTabWidget()
         self.help_browsers: list[QTextBrowser] = []
+        self._help_section_mds: list[str] = []
         sections = help_docs.help_sections()
+        mode = "night"
+        try:
+            mode = str(core.get_ui_theme().get("mode") or "night")
+        except Exception:
+            pass
         for title, md in sections:
             page = QWidget()
             pl = QVBoxLayout(page)
             pl.setContentsMargins(4, 8, 4, 4)
             browser = QTextBrowser()
             browser.setOpenExternalLinks(True)
-            browser.setHtml(help_docs.help_section_html(md))
+            browser.setHtml(help_docs.help_section_html(md, mode=mode))
             pl.addWidget(browser, 1)
             self.help_browsers.append(browser)
+            self._help_section_mds.append(md)
             self.help_tabs.addTab(page, title)
         # keep first browser as help_browser for any legacy refs
         self.help_browser = self.help_browsers[0] if self.help_browsers else QTextBrowser()
         layout.addWidget(self.help_tabs, 1)
         return w
+
+    def refresh_help_theme(self, mode: str | None = None) -> None:
+        """昼夜切换后重渲帮助 HTML，避免白天模式浅底深色字看不清。"""
+        if not getattr(self, "help_browsers", None):
+            return
+        if mode is None:
+            try:
+                mode = str(core.get_ui_theme().get("mode") or "night")
+            except Exception:
+                mode = "night"
+        mds = getattr(self, "_help_section_mds", None) or []
+        if not mds:
+            mds = [md for _, md in help_docs.help_sections()]
+            self._help_section_mds = mds
+        for browser, md in zip(self.help_browsers, mds):
+            try:
+                browser.setHtml(help_docs.help_section_html(md, mode=mode))
+            except Exception:
+                pass
 
     def help_copy_md(self):
         from PySide6.QtWidgets import QApplication

@@ -232,8 +232,55 @@ A：写进 `models.json` 的 `compat` 字段，告诉官方 Pi 这个接口支�
 '''
 
 
-def markdown_to_html(md: str) -> str:
+def _help_theme_colors(mode: str = "night") -> dict[str, str]:
+    """HTML 内联色：随昼夜模式切换，保证 QTextBrowser 可读。"""
+    m = (mode or "night").lower().strip()
+    if m in {"day", "light", "白天"}:
+        return {
+            "text": "#1f2937",
+            "muted": "#4b5563",
+            "title": "#111827",
+            "heading": "#1d4ed8",
+            "border": "#d1d5db",
+            "code_bg": "#f3f4f6",
+            "code_fg": "#1d4ed8",
+            "pre_bg": "#f8fafc",
+            "pre_fg": "#1f2937",
+            "pre_border": "#e5e7eb",
+            "quote_bg": "#eff6ff",
+            "quote_fg": "#1e3a5f",
+            "quote_border": "#3b82f6",
+            "th_bg": "#eef2ff",
+            "th_fg": "#1e40af",
+            "td_fg": "#1f2937",
+            "link": "#2563eb",
+            "hr": "#d1d5db",
+        }
+    return {
+        "text": "#e8eef7",
+        "muted": "#c5d0e0",
+        "title": "#f4f7fb",
+        "heading": "#93c5fd",
+        "border": "#2a3545",
+        "code_bg": "#1a222d",
+        "code_fg": "#93c5fd",
+        "pre_bg": "#0f141b",
+        "pre_fg": "#d4d4d4",
+        "pre_border": "#243041",
+        "quote_bg": "#132033",
+        "quote_fg": "#c5d0e0",
+        "quote_border": "#3b82f6",
+        "th_bg": "#161d27",
+        "th_fg": "#93c5fd",
+        "td_fg": "#e8eef7",
+        "link": "#60a5fa",
+        "hr": "#243041",
+    }
+
+
+def markdown_to_html(md: str, mode: str = "night") -> str:
     """Lightweight Markdown -> HTML for QTextBrowser (no external deps)."""
+    c = _help_theme_colors(mode)
     lines = md.replace("\r\n", "\n").split("\n")
     out: list[str] = []
     in_code = False
@@ -257,15 +304,15 @@ def markdown_to_html(md: str) -> str:
         )
         for i, row in enumerate(table_rows):
             # skip separator row
-            if all(re.fullmatch(r":?-{3,}:?", c.strip() or "") for c in row):
+            if all(re.fullmatch(r":?-{3,}:?", c_cell.strip() or "") for c_cell in row):
                 continue
             tag = "th" if i == 0 else "td"
-            style = "border:1px solid #2a3545;padding:8px 12px;color:#e8eef7;"
+            style = f"border:1px solid {c['border']};padding:8px 12px;color:{c['td_fg']};"
             if i == 0:
-                style += "background:#161d27;font-weight:700;color:#93c5fd;"
+                style += f"background:{c['th_bg']};font-weight:700;color:{c['th_fg']};"
             else:
                 style += "background:transparent;"
-            cells = "".join(f'<{tag} style="{style}">{_inline(c)}</{tag}>' for c in row)
+            cells = "".join(f'<{tag} style="{style}">{_inline(cell)}</{tag}>' for cell in row)
             out.append(f"<tr>{cells}</tr>")
         out.append("</table>")
         table_rows = []
@@ -273,17 +320,17 @@ def markdown_to_html(md: str) -> str:
 
     def _inline(text: str) -> str:
         t = html.escape(text)
-        t = re.sub(
-            r"`([^`]+)`",
-            r"<code style='background:#1a222d;color:#93c5fd;padding:2px 6px;"
-            r"border-radius:6px;font-family:Consolas,monospace;'>\1</code>",
-            t,
+        code_open = (
+            f"<code style='background:{c['code_bg']};color:{c['code_fg']};padding:2px 6px;"
+            f"border-radius:6px;font-family:Consolas,monospace;'>"
         )
+        t = re.sub(r"`([^`]+)`", lambda m: f"{code_open}{m.group(1)}</code>", t)
         t = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", t)
         t = re.sub(r"\*([^*]+)\*", r"<i>\1</i>", t)
+        link_style = f'color:{c["link"]};text-decoration:none;'
         t = re.sub(
             r"\[([^\]]+)\]\(([^)]+)\)",
-            r'<a href="\2" style="color:#60a5fa;text-decoration:none;">\1</a>',
+            lambda m: f'<a href="{m.group(2)}" style="{link_style}">{m.group(1)}</a>',
             t,
         )
         return t
@@ -296,9 +343,9 @@ def markdown_to_html(md: str) -> str:
             if not in_code:
                 in_code = True
                 out.append(
-                    "<pre style=\"background:#0f141b;color:#d4d4d4;padding:12px 14px;"
-                    "border-radius:10px;overflow:auto;border:1px solid #243041;"
-                    "font-family:Consolas,monospace;font-size:12.5px;line-height:1.45;\">"
+                    f"<pre style=\"background:{c['pre_bg']};color:{c['pre_fg']};padding:12px 14px;"
+                    f"border-radius:10px;overflow:auto;border:1px solid {c['pre_border']};"
+                    f"font-family:Consolas,monospace;font-size:12.5px;line-height:1.45;\">"
                 )
             else:
                 in_code = False
@@ -325,39 +372,39 @@ def markdown_to_html(md: str) -> str:
         if line.startswith("### "):
             close_ul()
             out.append(
-                f"<h3 style='margin:16px 0 8px;color:#93c5fd;font-size:14px;'>{_inline(line[4:])}</h3>"
+                f"<h3 style='margin:16px 0 8px;color:{c['heading']};font-size:14px;'>{_inline(line[4:])}</h3>"
             )
         elif line.startswith("## "):
             close_ul()
             out.append(
-                f"<h2 style='margin:20px 0 10px;border-bottom:1px solid #243041;"
-                f"padding-bottom:6px;color:#f4f7fb;font-size:16px;'>{_inline(line[3:])}</h2>"
+                f"<h2 style='margin:20px 0 10px;border-bottom:1px solid {c['border']};"
+                f"padding-bottom:6px;color:{c['title']};font-size:16px;'>{_inline(line[3:])}</h2>"
             )
         elif line.startswith("# "):
             close_ul()
             out.append(
-                f"<h1 style='margin:8px 0 14px;color:#f4f7fb;font-size:20px;'>{_inline(line[2:])}</h1>"
+                f"<h1 style='margin:8px 0 14px;color:{c['title']};font-size:20px;'>{_inline(line[2:])}</h1>"
             )
         elif line.startswith("> "):
             close_ul()
             out.append(
-                f"<blockquote style='margin:10px 0;padding:10px 14px;border-left:4px solid #3b82f6;"
-                f"background:#132033;color:#c5d0e0;border-radius:0 8px 8px 0;'>{_inline(line[2:])}</blockquote>"
+                f"<blockquote style='margin:10px 0;padding:10px 14px;border-left:4px solid {c['quote_border']};"
+                f"background:{c['quote_bg']};color:{c['quote_fg']};border-radius:0 8px 8px 0;'>{_inline(line[2:])}</blockquote>"
             )
         elif line.startswith("---"):
             close_ul()
-            out.append("<hr style='border:none;border-top:1px solid #243041;margin:18px 0;'/>")
+            out.append(f"<hr style='border:none;border-top:1px solid {c['hr']};margin:18px 0;'/>")
         elif re.match(r"^[-*] ", line):
             if not in_ul:
-                out.append("<ul style='margin:8px 0 8px 1.2em;color:#e8eef7;'>")
+                out.append(f"<ul style='margin:8px 0 8px 1.2em;color:{c['text']};'>")
                 in_ul = True
             out.append(f"<li style='margin:4px 0;line-height:1.5;'>{_inline(line[2:])}</li>")
         elif re.match(r"^\d+\. ", line):
             close_ul()
-            out.append(f"<p style='margin:4px 0 4px 0.5em;color:#e8eef7;'>{_inline(line)}</p>")
+            out.append(f"<p style='margin:4px 0 4px 0.5em;color:{c['text']};'>{_inline(line)}</p>")
         else:
             close_ul()
-            out.append(f"<p style='margin:8px 0;line-height:1.6;color:#e8eef7;'>{_inline(line)}</p>")
+            out.append(f"<p style='margin:8px 0;line-height:1.6;color:{c['text']};'>{_inline(line)}</p>")
 
     close_ul()
     flush_table()
@@ -368,13 +415,9 @@ def markdown_to_html(md: str) -> str:
     return (
         "<html><head><meta charset='utf-8'></head>"
         "<body style=\"font-family:'Segoe UI','Microsoft YaHei UI','PingFang SC',sans-serif;"
-        "font-size:13px;color:#e8eef7;background:transparent;padding:10px 14px;line-height:1.55;\">"
+        f"font-size:13px;color:{c['text']};background:transparent;padding:10px 14px;line-height:1.55;\">"
         f"{body}</body></html>"
     )
-
-
-def help_html() -> str:
-    return markdown_to_html(HELP_MARKDOWN)
 
 
 def help_sections() -> list[tuple[str, str]]:
@@ -435,9 +478,9 @@ def help_sections() -> list[tuple[str, str]]:
     return out
 
 
-def help_section_html(section_md: str) -> str:
-    return markdown_to_html(section_md)
+def help_section_html(section_md: str, mode: str = "night") -> str:
+    return markdown_to_html(section_md, mode=mode)
 
 
-def help_html() -> str:
-    return markdown_to_html(HELP_MARKDOWN)
+def help_html(mode: str = "night") -> str:
+    return markdown_to_html(HELP_MARKDOWN, mode=mode)

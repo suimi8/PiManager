@@ -2770,6 +2770,11 @@ class MainWindow(FeatureMixin, QMainWindow):
                 if self.set_ui_accent.itemData(i) == accent:
                     self.set_ui_accent.setCurrentIndex(i)
                     break
+        # 帮助页 HTML 内联色需跟随昼夜，否则白天模式会浅底浅字
+        try:
+            self.refresh_help_theme(mode)
+        except Exception:
+            pass
         if hasattr(self, "status") and self.status is not None:
             self.status.showMessage(
                 f"界面主题：{ui_theme.MODE_LABELS.get(mode, mode)} / {ui_theme.ACCENT_LABELS.get(accent, accent)}"
