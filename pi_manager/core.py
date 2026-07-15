@@ -335,6 +335,11 @@ def load_manager_config() -> dict[str, Any]:
             "health_interval_min": 0,
             "update_manifest_url": "",
             "last_manager_update_check": "",
+            # 快速提问：模型连续失败后自动切换下一个收藏模型
+            "failover_enabled": True,
+            "failover_fail_threshold": 3,
+            "failover_fail_counts": {},
+            "failover_silent": True,
         },
     )
     # merge missing keys for upgrades
@@ -353,6 +358,10 @@ def load_manager_config() -> dict[str, Any]:
         "ui_mode": "night",
         "ui_accent": "blue",
         "auto_check_update": True,
+        "failover_enabled": True,
+        "failover_fail_threshold": 3,
+        "failover_fail_counts": {},
+        "failover_silent": True,
     }
     if not isinstance(data, dict):
         data = {}

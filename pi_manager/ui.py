@@ -1604,6 +1604,20 @@ class MainWindow(FeatureMixin, QMainWindow):
         form.addRow("全局代理", self.proxy_enabled)
         form.addRow("代理地址", self.proxy_url)
         form.addRow("批量测试并发", self.test_concurrency)
+
+        self.failover_enabled = QCheckBox("快速提问失败自动切换模型（按收藏/启用列表）")
+        self.failover_enabled.setChecked(True)
+        self.failover_enabled.setToolTip("同一模型累计失败达到阈值后，自动换下一个模型重试当前问题")
+        self.failover_threshold = QSpinBox()
+        self.failover_threshold.setRange(1, 10)
+        self.failover_threshold.setValue(3)
+        self.failover_threshold.setToolTip("连续失败次数阈值，默认 3")
+        self.failover_silent = QCheckBox("无感切换（不在对话区刷切换提示，仅状态栏轻提示）")
+        self.failover_silent.setChecked(True)
+        form.addRow("故障切换", self.failover_enabled)
+        form.addRow("失败阈值", self.failover_threshold)
+        form.addRow("", self.failover_silent)
+
         form.addRow("", self.minimize_to_tray)
         form.addRow("", self.start_minimized)
         form.addRow("", self.secure_keys_chk)
@@ -2710,11 +2724,11 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.status.showMessage("Pi 快速提问运行中…")
 
         def job():
-            return core.run_pi_print(
+            return extras.chat_with_failover(
                 prompt,
-                workdir=workdir,
                 provider=provider,
                 model=model,
+                workdir=workdir,
                 thinking=self.thinking_combo.currentText(),
             )
 
@@ -2726,6 +2740,32 @@ class MainWindow(FeatureMixin, QMainWindow):
 
     def _on_basic_chat_done(self, result):
         self.chat_input.setEnabled(True)
+        if isinstance(result, dict):
+            p = result.get("provider") or ""
+            m = result.get("model") or ""
+            if result.get("switched") and p and m:
+                try:
+                    self._set_chat_combo_text(self.chat_provider, str(p))
+                    self._reload_chat_models_for_provider(str(p), prefer_model=str(m))
+                    self._set_chat_combo_text(self.chat_model, str(m))
+                    self.refresh_dashboard()
+                except Exception:
+                    pass
+                if result.get("notice"):
+                    self.chat_output.appendPlainText(f"[{result.get('notice')}]")
+                else:
+                    self.status.showMessage(f"已自动切换模型 → {p}/{m}", 5000)
+            out = (result.get("stdout") or "").strip()
+            err = (result.get("stderr") or "").strip()
+            code = result.get("returncode")
+            if out:
+                self.chat_output.appendPlainText(out)
+            if err and not result.get("ok"):
+                self.chat_output.appendPlainText(f"[stderr]\n{err}")
+            self.chat_output.appendPlainText(f"\n[exit {code} · {p}/{m}]")
+            self.status.showMessage("快速提问完成" if result.get("ok") else "快速提问失败")
+            return
+        # 兼容旧 tuple 返回
         code, out, err = result
         if out.strip():
             self.chat_output.appendPlainText(out.strip())

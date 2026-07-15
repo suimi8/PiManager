@@ -18,7 +18,7 @@ from . import core
 from . import secrets as secretstore
 from . import storage
 
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.6.4"
 APP_NAME = "Pi Manager"
 # Optional remote version manifest (JSON: {"version":"x.y.z","notes":"...","url":"..."})
 # 未配置时自动回退 GitHub Releases API
@@ -779,7 +779,7 @@ def check_manager_update() -> dict[str, Any]:
 
 
 def download_manager_update(download_url: str, dest_dir: str | Path | None = None) -> dict[str, Any]:
-    """下载更新包到目录（默认 ~/Downloads/PiManager-updates）。不自动覆盖正在运行的程序。"""
+    """下载更新包到目录（默认 ~/Downloads/PiManager-updates）。"""
     import urllib.request
 
     download_url = (download_url or "").strip()
@@ -806,6 +806,251 @@ def download_manager_update(download_url: str, dest_dir: str | Path | None = Non
         "path": str(target),
         "dir": str(dest_root),
         "message": f"已下载到 {target}",
+    }
+
+
+def _install_root() -> Path:
+    """当前安装根目录（frozen）或源码根。"""
+    import sys
+
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).resolve()
+        # macOS: .../PiManager.app/Contents/MacOS/PiManager
+        if exe.parent.name == "MacOS" and exe.parent.parent.name == "Contents":
+            return exe.parents[2]  # *.app
+        return exe.parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _extract_update_archive(archive: Path, dest: Path) -> Path:
+    """解压更新包，返回解压内容中最可能的应用根目录。"""
+    import shutil
+    import tarfile
+
+    dest.mkdir(parents=True, exist_ok=True)
+    # 清空旧解压
+    for child in dest.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            try:
+                child.unlink()
+            except Exception:
+                pass
+
+    name = archive.name.lower()
+    if name.endswith(".zip"):
+        with zipfile.ZipFile(archive, "r") as zf:
+            zf.extractall(dest)
+    elif name.endswith(".tar.gz") or name.endswith(".tgz"):
+        with tarfile.open(archive, "r:gz") as tf:
+            tf.extractall(dest)
+    else:
+        # 单文件可执行：直接复制
+        target = dest / archive.name
+        shutil.copy2(archive, target)
+        return target
+
+    # 优先找 .app / PiManager.exe / PiManager 目录
+    apps = list(dest.rglob("*.app"))
+    if apps:
+        return apps[0]
+    exes = [p for p in dest.rglob("PiManager.exe")]
+    if exes:
+        return exes[0].parent
+    bins = [p for p in dest.rglob("PiManager") if p.is_file() and os.access(p, os.X_OK)]
+    if bins:
+        # 排除 .app 内的二进制已处理
+        for b in bins:
+            if ".app/" in str(b).replace("\\", "/") or str(b).endswith(".app"):
+                continue
+            return b.parent
+    # 单层子目录
+    subs = [p for p in dest.iterdir() if p.is_dir()]
+    if len(subs) == 1:
+        return subs[0]
+    return dest
+
+
+def _write_inplace_updater(
+    *,
+    pid: int,
+    source_root: Path,
+    install_root: Path,
+    relaunch: Path,
+    work_dir: Path,
+) -> Path:
+    """写入平台更新脚本，返回脚本路径。"""
+    import sys
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    src = str(source_root)
+    dst = str(install_root)
+    exe = str(relaunch)
+
+    if sys.platform == "win32":
+        script = work_dir / "apply_update.ps1"
+        # 等待进程退出后 robocopy 覆盖，再启动
+        ps = f"""$ErrorActionPreference = 'Continue'
+$pidWait = {pid}
+$src = '{src.replace("'", "''")}'
+$dst = '{dst.replace("'", "''")}'
+$exe = '{exe.replace("'", "''")}'
+$log = Join-Path $env:TEMP 'pimanager-update.log'
+Function Log($m) {{ Add-Content -Path $log -Value ("[{{0}}] {{1}}" -f (Get-Date -Format o), $m) }}
+Log "waiting for pid $pidWait"
+for ($i=0; $i -lt 120; $i++) {{
+  $p = Get-Process -Id $pidWait -ErrorAction SilentlyContinue
+  if (-not $p) {{ break }}
+  Start-Sleep -Seconds 1
+}}
+Start-Sleep -Seconds 1
+Log "copy $src -> $dst"
+if (Test-Path $src -PathType Leaf) {{
+  New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
+  Copy-Item -Force -Path $src -Destination $dst
+}} else {{
+  New-Item -ItemType Directory -Force -Path $dst | Out-Null
+  & robocopy $src $dst /E /R:2 /W:1 /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
+}}
+Log "relaunch $exe"
+if (Test-Path $exe) {{
+  Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)
+}} else {{
+  Log "exe missing: $exe"
+}}
+Log "done"
+"""
+        script.write_text(ps, encoding="utf-8")
+        return script
+
+    script = work_dir / "apply_update.sh"
+    sh = f"""#!/usr/bin/env bash
+set -euo pipefail
+PID={pid}
+SRC={repr(src)}
+DST={repr(dst)}
+EXE={repr(exe)}
+LOG="${{TMPDIR:-/tmp}}/pimanager-update.log"
+log() {{ echo "[$(date -Iseconds)] $*" >> "$LOG"; }}
+log "waiting for pid $PID"
+for i in $(seq 1 120); do
+  if ! kill -0 "$PID" 2>/dev/null; then break; fi
+  sleep 1
+done
+sleep 1
+log "copy $SRC -> $DST"
+if [[ -f "$SRC" ]]; then
+  mkdir -p "$(dirname "$DST")"
+  cp -f "$SRC" "$DST"
+elif [[ "$SRC" == *.app || -d "$SRC" ]]; then
+  # macOS .app or directory
+  if [[ "$SRC" == *.app ]]; then
+    rm -rf "$DST"
+    cp -R "$SRC" "$DST"
+  else
+    mkdir -p "$DST"
+    rsync -a --delete "$SRC"/ "$DST"/ 2>/dev/null || cp -R "$SRC"/. "$DST"/
+  fi
+fi
+log "relaunch $EXE"
+if [[ -x "$EXE" ]]; then
+  (cd "$(dirname "$EXE")" && nohup "$EXE" >/dev/null 2>&1 &)
+elif [[ -d "$EXE" && "$EXE" == *.app ]]; then
+  open "$EXE"
+fi
+log done
+"""
+    script.write_text(sh, encoding="utf-8")
+    os.chmod(script, 0o755)
+    return script
+
+
+def apply_manager_update_inplace(archive_path: str | Path) -> dict[str, Any]:
+    """下载包已就绪时：解压并启动外部更新器，调用方应随后退出进程。
+
+    真正的 in-place：等待当前 PID 退出后覆盖安装目录并重启。
+    """
+    import sys
+    import shutil
+    import subprocess
+
+    archive = Path(archive_path).resolve()
+    if not archive.exists():
+        raise FileNotFoundError(str(archive))
+
+    work = Path.home() / "Downloads" / "PiManager-updates" / f"stage-{int(time.time())}"
+    extract_dir = work / "extracted"
+    source_root = _extract_update_archive(archive, extract_dir)
+    install_root = _install_root()
+
+    # 启动路径
+    if getattr(sys, "frozen", False):
+        relaunch = Path(sys.executable).resolve()
+        if sys.platform == "darwin" and install_root.suffix == ".app":
+            relaunch = install_root  # open .app
+    else:
+        # 源码模式：不覆盖，仅提示
+        return {
+            "ok": False,
+            "need_exit": False,
+            "message": "当前为源码运行，请 git pull / 重新打包，不支持 in-place 覆盖。",
+            "source": str(source_root),
+            "install_root": str(install_root),
+        }
+
+    # onefile：source 可能是单文件
+    if source_root.is_file() and relaunch.is_file():
+        copy_src = source_root
+        copy_dst = relaunch
+    else:
+        copy_src = source_root
+        copy_dst = install_root
+
+    script = _write_inplace_updater(
+        pid=os.getpid(),
+        source_root=copy_src,
+        install_root=copy_dst,
+        relaunch=relaunch if relaunch.suffix == ".app" or relaunch.is_file() else install_root,
+        work_dir=work,
+    )
+
+    if sys.platform == "win32":
+        # 独立 PowerShell 进程，不随父进程结束
+        creationflags = 0
+        if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+            creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+        if hasattr(subprocess, "DETACHED_PROCESS"):
+            creationflags |= subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        subprocess.Popen(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script),
+            ],
+            close_fds=True,
+            creationflags=creationflags,
+            cwd=str(work),
+        )
+    else:
+        subprocess.Popen(
+            ["/bin/bash", str(script)],
+            start_new_session=True,
+            cwd=str(work),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    return {
+        "ok": True,
+        "need_exit": True,
+        "script": str(script),
+        "source": str(source_root),
+        "install_root": str(install_root),
+        "message": "更新器已启动，程序将退出并自动替换后重启。",
     }
 
 
@@ -997,6 +1242,7 @@ def chat_once(
     model: str | None = None,
     workdir: str | None = None,
     timeout: float = 180,
+    thinking: str | None = "off",
 ) -> dict[str, Any]:
     apply_proxy_env()
     t0 = time.perf_counter()
@@ -1005,16 +1251,262 @@ def chat_once(
         workdir=workdir or str(core.user_home()),
         provider=provider,
         model=model,
-        thinking="off",
+        thinking=thinking or "off",
         timeout=timeout,
     )
     ms = round((time.perf_counter() - t0) * 1000, 1)
+    text = (out or "").strip()
+    err_text = (err or "").strip()
+    ok = code == 0 and bool(text)
+    if code == 0 and not text and err_text and "error" not in err_text.lower():
+        text = err_text
+        ok = True
     return {
-        "ok": code == 0,
+        "ok": ok,
         "returncode": code,
         "stdout": out,
         "stderr": err,
         "latency_ms": ms,
         "provider": provider,
         "model": model,
+        "error": "" if ok else (err_text or text or f"退出码 {code}"),
+    }
+
+
+def _parse_pm_key(key: str) -> tuple[str, str] | None:
+    key = (key or "").strip()
+    if "/" not in key:
+        return None
+    p, m = key.split("/", 1)
+    p, m = p.strip(), m.strip()
+    if not p or not m:
+        return None
+    return p, m
+
+
+def failover_chain(start_provider: str | None = None, start_model: str | None = None) -> list[tuple[str, str]]:
+    """故障切换候选链：当前模型 → 收藏 → enabledModels → 默认，去重保序。"""
+    chain: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(p: str | None, m: str | None):
+        p = (p or "").strip()
+        m = (m or "").strip()
+        if not p or not m:
+            return
+        k = f"{p}/{m}"
+        if k in seen:
+            return
+        seen.add(k)
+        chain.append((p, m))
+
+    add(start_provider, start_model)
+    mgr = core.load_manager_config()
+    for key in mgr.get("favorites") or []:
+        parsed = _parse_pm_key(str(key))
+        if parsed:
+            add(parsed[0], parsed[1])
+    try:
+        settings = core.load_settings()
+        for key in settings.get("enabledModels") or []:
+            parsed = _parse_pm_key(str(key))
+            if parsed:
+                add(parsed[0], parsed[1])
+        dp = str(settings.get("defaultProvider") or "")
+        dm = str(settings.get("defaultModel") or "")
+        add(dp, dm)
+    except Exception:
+        pass
+    return chain
+
+
+def _fail_counts() -> dict[str, int]:
+    mgr = core.load_manager_config()
+    raw = mgr.get("failover_fail_counts") or {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for k, v in raw.items():
+        try:
+            out[str(k)] = int(v)
+        except Exception:
+            out[str(k)] = 0
+    return out
+
+
+def _save_fail_counts(counts: dict[str, int]) -> None:
+    mgr = core.load_manager_config()
+    mgr["failover_fail_counts"] = counts
+    core.save_manager_config(mgr)
+
+
+def record_model_success(provider: str, model: str) -> None:
+    key = f"{(provider or '').strip()}/{(model or '').strip()}"
+    if key == "/":
+        return
+    counts = _fail_counts()
+    if key in counts:
+        counts[key] = 0
+        _save_fail_counts(counts)
+
+
+def record_model_failure(provider: str, model: str) -> int:
+    """累计失败次数并返回当前计数。"""
+    key = f"{(provider or '').strip()}/{(model or '').strip()}"
+    if key == "/":
+        return 0
+    counts = _fail_counts()
+    counts[key] = int(counts.get(key) or 0) + 1
+    _save_fail_counts(counts)
+    return counts[key]
+
+
+def should_failover(provider: str, model: str) -> bool:
+    mgr = core.load_manager_config()
+    if not bool(mgr.get("failover_enabled", True)):
+        return False
+    thr = int(mgr.get("failover_fail_threshold") or 3)
+    thr = max(1, thr)
+    key = f"{(provider or '').strip()}/{(model or '').strip()}"
+    return int(_fail_counts().get(key) or 0) >= thr
+
+
+def chat_with_failover(
+    prompt: str,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    workdir: str | None = None,
+    timeout: float = 180,
+    thinking: str | None = "off",
+    set_as_default_on_switch: bool = True,
+) -> dict[str, Any]:
+    """快速提问 + 连续失败自动切换下一个模型。
+
+    规则：同一模型累计失败达到 failover_fail_threshold（默认 3）后，
+    自动跳到候选链下一个模型重试同一 prompt，尽量无感继续对话。
+    """
+    mgr = core.load_manager_config()
+    enabled = bool(mgr.get("failover_enabled", True))
+    thr = max(1, int(mgr.get("failover_fail_threshold") or 3))
+    silent = bool(mgr.get("failover_silent", True))
+
+    if not provider or not model:
+        try:
+            dp, dm, _ = core.get_default_model()
+            provider = provider or dp
+            model = model or dm
+        except Exception:
+            pass
+
+    chain = failover_chain(provider, model)
+    if not chain:
+        return {
+            "ok": False,
+            "returncode": -1,
+            "stdout": "",
+            "stderr": "无可用模型（请配置默认或收藏）",
+            "latency_ms": 0,
+            "provider": provider,
+            "model": model,
+            "switched": False,
+            "attempts": [],
+            "error": "无可用模型",
+        }
+
+    # 从当前模型在链中的位置开始；若已达失败阈值，则直接从下一个开始
+    start_idx = 0
+    for i, (p, m) in enumerate(chain):
+        if p == (provider or "") and m == (model or ""):
+            start_idx = i
+            break
+    if enabled and should_failover(chain[start_idx][0], chain[start_idx][1]):
+        start_idx = min(start_idx + 1, len(chain) - 1)
+
+    attempts: list[dict[str, Any]] = []
+    last: dict[str, Any] = {}
+    switched_from: str | None = None
+
+    for idx in range(start_idx, len(chain)):
+        p, m = chain[idx]
+        # 若该模型已达阈值且不是链尾唯一选择，跳过
+        if enabled and idx > start_idx and should_failover(p, m) and idx < len(chain) - 1:
+            attempts.append({"provider": p, "model": m, "skipped": True, "reason": f"已连续失败≥{thr}"})
+            continue
+
+        result = chat_once(
+            prompt,
+            provider=p,
+            model=m,
+            workdir=workdir,
+            timeout=timeout,
+            thinking=thinking,
+        )
+        result = dict(result)
+        result["attempt_index"] = idx
+        attempts.append(
+            {
+                "provider": p,
+                "model": m,
+                "ok": result.get("ok"),
+                "returncode": result.get("returncode"),
+                "latency_ms": result.get("latency_ms"),
+                "error": result.get("error") or "",
+            }
+        )
+        last = result
+
+        if result.get("ok"):
+            record_model_success(p, m)
+            switched = bool(switched_from) or (p != (provider or "") or m != (model or ""))
+            if switched and set_as_default_on_switch:
+                try:
+                    core.set_default_model(p, m)
+                except Exception:
+                    pass
+            last["switched"] = switched
+            last["switched_from"] = switched_from
+            last["attempts"] = attempts
+            last["silent"] = silent
+            last["failover_enabled"] = enabled
+            if switched and not silent:
+                last["notice"] = f"已自动切换：{switched_from or f'{provider}/{model}'} → {p}/{m}"
+            elif switched and silent:
+                last["notice"] = ""  # 无感：不在正文强调
+            else:
+                last["notice"] = ""
+            return last
+
+        # 失败：累计
+        count = record_model_failure(p, m)
+        attempts[-1]["fail_count"] = count
+        if not enabled:
+            break
+        if count < thr:
+            # 未达阈值：本轮返回失败，下次继续累计
+            break
+        # 达阈值：本轮内立刻切下一个模型重试同一问题（无感继续）
+        if switched_from is None:
+            switched_from = f"{p}/{m}"
+        continue
+
+    if last:
+        last["switched"] = bool(switched_from)
+        last["switched_from"] = switched_from
+        last["attempts"] = attempts
+        last["silent"] = silent
+        last["failover_enabled"] = enabled
+        last["notice"] = "" if silent else (f"尝试切换失败，已用尽候选（自 {switched_from}）" if switched_from else "")
+        return last
+    return {
+        "ok": False,
+        "returncode": -1,
+        "stdout": "",
+        "stderr": "全部候选模型失败",
+        "latency_ms": 0,
+        "provider": provider,
+        "model": model,
+        "switched": False,
+        "attempts": attempts,
+        "error": "全部候选模型失败",
     }

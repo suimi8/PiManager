@@ -810,13 +810,16 @@ class FeatureMixin:
         box.setWindowTitle("发现 Pi Manager 新版本")
         box.setIcon(QMessageBox.Information)
         box.setText(body)
-        btn_dl = box.addButton("下载安装包", QMessageBox.AcceptRole)
+        btn_apply = box.addButton("立即更新并重启", QMessageBox.AcceptRole)
+        btn_dl = box.addButton("仅下载", QMessageBox.ActionRole)
         btn_open = box.addButton("打开 Release 页", QMessageBox.ActionRole)
         box.addButton("稍后", QMessageBox.RejectRole)
         box.exec()
         clicked = box.clickedButton()
-        if clicked == btn_dl:
-            self._download_manager_update(res)
+        if clicked == btn_apply:
+            self._download_manager_update(res, apply_inplace=True)
+        elif clicked == btn_dl:
+            self._download_manager_update(res, apply_inplace=False)
         elif clicked == btn_open:
             page = str(res.get("url") or extras.GITHUB_RELEASES_PAGE)
             try:
@@ -827,7 +830,7 @@ class FeatureMixin:
             except Exception:
                 core.open_path(page)
 
-    def _download_manager_update(self, res: dict | None = None):
+    def _download_manager_update(self, res: dict | None = None, apply_inplace: bool = False):
         res = res or getattr(self, "_last_manager_update", {}) or {}
         url = str(res.get("download") or res.get("url") or "").strip()
         if not url:
@@ -843,11 +846,14 @@ class FeatureMixin:
         def _done(r: dict):
             path = str((r or {}).get("path") or "")
             self.status.showMessage((r or {}).get("message") or "下载完成")
+            if apply_inplace and path:
+                self._apply_manager_update_inplace(path)
+                return
             ret = QMessageBox.question(
                 self,
                 "下载完成",
                 f"{(r or {}).get('message') or path}\n\n"
-                "请退出 Pi Manager 后解压/替换为新版本。\n是否打开所在文件夹？",
+                "可「立即更新并重启」（推荐打包版），或打开文件夹手动替换。\n是否打开所在文件夹？",
             )
             if ret == QMessageBox.Yes and path:
                 core.open_in_explorer(path)
@@ -855,6 +861,35 @@ class FeatureMixin:
         w.done.connect(_done)
         w.failed.connect(lambda e: QMessageBox.warning(self, "下载失败", e))
         w.start()
+
+    def _apply_manager_update_inplace(self, archive_path: str):
+        try:
+            out = extras.apply_manager_update_inplace(archive_path)
+        except Exception as e:
+            QMessageBox.warning(self, "更新失败", str(e))
+            return
+        if not out.get("ok"):
+            QMessageBox.information(self, "无法自动更新", out.get("message") or "请手动替换安装包")
+            if out.get("source"):
+                try:
+                    core.open_in_explorer(str(out.get("source")))
+                except Exception:
+                    pass
+            return
+        QMessageBox.information(
+            self,
+            "即将重启更新",
+            out.get("message") or "程序将退出，更新器会覆盖安装目录并重新启动。",
+        )
+        # 退出，让外部脚本完成覆盖
+        try:
+            from PySide6.QtWidgets import QApplication
+
+            QApplication.instance().quit()
+        except Exception:
+            import sys
+
+            sys.exit(0)
 
     # ---- sessions extras ----
     def session_selected_path(self) -> str | None:
@@ -942,9 +977,21 @@ class FeatureMixin:
         self.chat_output.appendPlainText(f"\n你: {prompt}\n…思考中…")
         self.chat_input.setEnabled(False)
         workdir = self.workdir_edit.text().strip() or str(core.user_home())
+        thinking = "off"
+        try:
+            thinking = self.thinking_combo.currentText() or "off"
+        except Exception:
+            pass
 
         def job():
-            return extras.chat_once(full, provider=provider, model=model, workdir=workdir)
+            # 连续失败达阈值后自动切换下一个收藏/启用模型并重试（无感）
+            return extras.chat_with_failover(
+                full,
+                provider=provider,
+                model=model,
+                workdir=workdir,
+                thinking=thinking,
+            )
 
         w = self._track(self._worker_fn(job))
         w.done.connect(lambda r, u=prompt: self._on_enhanced_chat_done(r, u))
@@ -954,12 +1001,33 @@ class FeatureMixin:
     def _on_enhanced_chat_done(self, result: dict, user_prompt: str):
         self.chat_input.setEnabled(True)
         text = (result.get("stdout") or "").strip() or (result.get("stderr") or "").strip()
+        p = result.get("provider") or ""
+        m = result.get("model") or ""
+        # 若发生故障切换，同步 UI 下拉与默认，但不刷屏打扰
+        if result.get("switched") and p and m:
+            try:
+                if hasattr(self, "_set_chat_combo_text"):
+                    self._set_chat_combo_text(self.chat_provider, str(p))
+                    self._reload_chat_models_for_provider(str(p), prefer_model=str(m))
+                    self._set_chat_combo_text(self.chat_model, str(m))
+                self.refresh_dashboard()
+                self.settings_load()
+            except Exception:
+                pass
+            notice = (result.get("notice") or "").strip()
+            if notice:
+                self.chat_output.appendPlainText(f"[{notice}]")
+            else:
+                # 无感：仅状态栏轻提示
+                self.status.showMessage(f"已自动切换模型 → {p}/{m}", 5000)
         if not result.get("ok"):
-            self.chat_output.appendPlainText(f"失败({result.get('returncode')}): {text[:500]}")
+            err = (result.get("error") or text or "未知错误")[:500]
+            self.chat_output.appendPlainText(f"失败({result.get('returncode')}): {err}")
             return
         self.chat_history.append({"user": user_prompt, "assistant": text})
         lat = result.get("latency_ms")
-        self.chat_output.appendPlainText(f"Pi ({lat} ms):\n{text}\n")
+        tag = f"{p}/{m} · {lat} ms" if p and m else f"{lat} ms"
+        self.chat_output.appendPlainText(f"Pi ({tag}):\n{text}\n")
 
     def _on_enhanced_chat_fail(self, err: str):
         self.chat_input.setEnabled(True)
@@ -975,6 +1043,12 @@ class FeatureMixin:
             self.proxy_url.setText(str(mgr.get("proxy_url") or ""))
         if hasattr(self, "test_concurrency"):
             self.test_concurrency.setValue(int(mgr.get("test_concurrency") or 3))
+        if hasattr(self, "failover_enabled"):
+            self.failover_enabled.setChecked(bool(mgr.get("failover_enabled", True)))
+        if hasattr(self, "failover_threshold"):
+            self.failover_threshold.setValue(int(mgr.get("failover_fail_threshold") or 3))
+        if hasattr(self, "failover_silent"):
+            self.failover_silent.setChecked(bool(mgr.get("failover_silent", True)))
         if hasattr(self, "minimize_to_tray"):
             self.minimize_to_tray.setChecked(bool(mgr.get("minimize_to_tray", True)))
         if hasattr(self, "start_minimized"):
@@ -993,6 +1067,12 @@ class FeatureMixin:
             self.mgr["proxy_url"] = self.proxy_url.text().strip()
         if hasattr(self, "test_concurrency"):
             self.mgr["test_concurrency"] = int(self.test_concurrency.value())
+        if hasattr(self, "failover_enabled"):
+            self.mgr["failover_enabled"] = self.failover_enabled.isChecked()
+        if hasattr(self, "failover_threshold"):
+            self.mgr["failover_fail_threshold"] = int(self.failover_threshold.value())
+        if hasattr(self, "failover_silent"):
+            self.mgr["failover_silent"] = self.failover_silent.isChecked()
         if hasattr(self, "minimize_to_tray"):
             self.mgr["minimize_to_tray"] = self.minimize_to_tray.isChecked()
         if hasattr(self, "start_minimized"):
