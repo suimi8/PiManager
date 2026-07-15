@@ -65,7 +65,9 @@ xref-*.html
 # Node / VSIX packaging
 node_modules/
 *.vsix
-extensions/**/media/
+# 扩展构建产物（保留 media 图标与源码）
+extensions/**/out/
+extensions/**/dist/
 extensions/**/src/
 
 # OS / sync noise
