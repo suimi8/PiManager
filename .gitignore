@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local agent / secrets (never commit)
+.agents/
+.tmp-home/
+.tmp-home-old/
+**/.pi/
+**/secrets.vault
+**/secrets.dpapi
+**/auth.json
+**/.secrets.*
+**/*.lock
+
+# Local workbench & build artifacts (not part of the open-source tree)
+work/
+outputs/
+build-*/
+*.pid
+*.log
+
+# Root-level one-off patch/test scripts (not product source)
+/test_*.txt
+/_patch_*.py
+/_fix*.py
+/_gen_*.py
+/_test_*.py
+
+# PyInstaller
+*.manifest
+*.spec.bak
+warn-*.txt
+xref-*.html
+
+# Node / VSIX packaging
+node_modules/
+*.vsix
+extensions/**/media/
+extensions/**/src/
+
+# OS / sync noise
+BaiduSyncdisk/
+.SynologyWorkingDirectory/
+~$*

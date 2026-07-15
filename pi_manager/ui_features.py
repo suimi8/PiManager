@@ -1,0 +1,842 @@
+# -*- coding: utf-8 -*-
+"""UI feature mixins: tray, health, history, proxy, export, self-check, sessions, chat."""
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from typing import Any
+
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QIcon, QPixmap, QPainter, QColor
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QTabWidget,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMenu,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QSpinBox,
+    QSystemTrayIcon,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextBrowser,
+    QVBoxLayout,
+    QWidget,
+    QGroupBox,
+)
+
+from . import core
+from . import extras
+from . import help_docs
+
+
+def _make_tray_icon(color: str = "#3d8bfd") -> QIcon:
+    # Prefer branded assets; fall back to painted glyph.
+    try:
+        from . import resources as res
+        for path in res.icon_candidates():
+            if path.suffix.lower() in {".png", ".ico", ".svg"}:
+                icon = QIcon(str(path))
+                if not icon.isNull():
+                    return icon
+    except Exception:
+        pass
+    pm = QPixmap(64, 64)
+    pm.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setBrush(QColor(color))
+    p.setPen(Qt.NoPen)
+    p.drawEllipse(4, 4, 56, 56)
+    p.setPen(QColor("#ffffff"))
+    font = p.font()
+    font.setBold(True)
+    font.setPointSize(22)
+    p.setFont(font)
+    p.drawText(pm.rect(), Qt.AlignCenter, "Pi")
+    p.end()
+    return QIcon(pm)
+
+
+def app_icon() -> QIcon:
+    return _make_tray_icon()
+
+
+class FeatureMixin:
+    """Mixed into MainWindow."""
+
+    chat_history: list[dict[str, str]]
+    tray: QSystemTrayIcon | None
+    health_timer: QTimer | None
+
+    def init_feature_state(self):
+        self.chat_history = []
+        self.tray = None
+        self.health_timer = None
+        try:
+            extras.apply_proxy_env()
+        except Exception:
+            pass
+
+    def setup_system_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(self)
+        self.tray.setIcon(_make_tray_icon())
+        self.tray.setToolTip("Pi Manager")
+        menu = QMenu()
+        act_show = QAction("显示主窗口", self)
+        act_show.triggered.connect(self.show_from_tray)
+        menu.addAction(act_show)
+        act_launch = QAction("启动完整 Pi（默认模型）", self)
+        act_launch.triggered.connect(self.launch_default)
+        menu.addAction(act_launch)
+        menu.addSeparator()
+        self.tray_fav_menu = menu.addMenu("切换默认模型")
+        self.rebuild_tray_favorites()
+        menu.addSeparator()
+        act_health = QAction("运行健康检查", self)
+        act_health.triggered.connect(self.health_run_now)
+        menu.addAction(act_health)
+        act_quit = QAction("退出", self)
+        act_quit.triggered.connect(self.quit_app)
+        menu.addAction(act_quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+        self._setup_health_timer()
+
+    def rebuild_tray_favorites(self):
+        if not hasattr(self, "tray_fav_menu") or self.tray_fav_menu is None:
+            return
+        self.tray_fav_menu.clear()
+        favs = list((self.mgr or {}).get("favorites") or [])
+        if not favs:
+            a = QAction("（无收藏，请先在模型页收藏）", self)
+            a.setEnabled(False)
+            self.tray_fav_menu.addAction(a)
+            return
+        for key in favs:
+            act = QAction(key, self)
+            act.triggered.connect(lambda checked=False, k=key: self._tray_switch_model(k))
+            self.tray_fav_menu.addAction(act)
+
+    def _tray_switch_model(self, key: str):
+        if "/" not in key:
+            return
+        provider, model = key.split("/", 1)
+        core.set_default_model(provider.strip(), model.strip())
+        try:
+            self.refresh_dashboard()
+            self.settings_load()
+        except Exception:
+            pass
+        if self.tray:
+            self.tray.showMessage("Pi Manager", f"已切换默认：{key}", QSystemTrayIcon.Information, 2500)
+        self.status.showMessage(f"托盘切换默认模型：{key}")
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self.show_from_tray()
+
+    def show_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self):
+        if self.tray:
+            self.tray.hide()
+        self._shutdown_background_tasks()
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.instance().quit()
+
+    def _shutdown_background_tasks(self):
+        if getattr(self, "_background_shutdown", False):
+            return
+        self._background_shutdown = True
+        if self.health_timer:
+            self.health_timer.stop()
+        workers = list(getattr(self, "workers", []))
+        for worker in workers:
+            if worker.isRunning():
+                worker.requestInterruption()
+        deadline = time.monotonic() + 2.5
+        for worker in workers:
+            remaining = max(0, int((deadline - time.monotonic()) * 1000))
+            if worker.isRunning() and remaining:
+                worker.wait(remaining)
+        for worker in workers:
+            if worker.isRunning():
+                worker.terminate()
+                worker.wait(500)
+
+    def closeEvent(self, event):
+        # minimize to tray if enabled
+        if bool((self.mgr or {}).get("minimize_to_tray", True)) and self.tray and self.tray.isVisible():
+            event.ignore()
+            self.hide()
+            self.tray.showMessage("Pi Manager", "已最小化到托盘。右键可切换模型/启动 Pi。", QSystemTrayIcon.Information, 2000)
+            return
+        if self.tray:
+            self.tray.hide()
+        self._shutdown_background_tasks()
+        event.accept()
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance().quit()
+
+    def _setup_health_timer(self):
+        mins = 0
+        try:
+            mins = int((self.mgr or {}).get("health_interval_min") or 0)
+        except Exception:
+            mins = 0
+        if self.health_timer:
+            self.health_timer.stop()
+            self.health_timer = None
+        if mins > 0:
+            self.health_timer = QTimer(self)
+            self.health_timer.setInterval(mins * 60 * 1000)
+            self.health_timer.timeout.connect(self.health_run_silent)
+            self.health_timer.start()
+
+    # ---- tabs ----
+    def _build_health_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        tip = QLabel("批量巡检可用性/延迟。启动时会自动加载上次结果；点「立即健康检查」才会重新探测。范围若选「收藏」，只会测收藏里的模型（OAuth 未登录会失败）。")
+        tip.setObjectName("subtitle")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+        row = QHBoxLayout()
+        self.health_scope = QComboBox()
+        self.health_scope.addItem("收藏列表", "favorites")
+        self.health_scope.addItem("默认模型", "default")
+        self.health_scope.addItem("自定义 Provider", "custom")
+        self.health_scope.addItem("全部已加载模型", "all_listed")
+        self.health_scope.addItem("模型页当前选中", "selected")
+        # default to custom if user mostly uses custom providers
+        self.health_scope.setCurrentIndex(2)
+        row.addWidget(QLabel("检查范围"))
+        row.addWidget(self.health_scope)
+        row.addWidget(self._btn("立即健康检查", self.health_run_now, success=True))
+        row.addWidget(self._btn("刷新显示", self.health_refresh_table, secondary=True))
+        self.health_interval = QSpinBox()
+        self.health_interval.setRange(0, 1440)
+        self.health_interval.setSuffix(" 分钟（0=关）")
+        self.health_interval.setValue(int((self.mgr or {}).get("health_interval_min") or 0))
+        row.addWidget(QLabel("定时"))
+        row.addWidget(self.health_interval)
+        row.addWidget(self._btn("保存定时", self.health_save_interval, secondary=True))
+        row.addStretch(1)
+        layout.addLayout(row)
+        self.health_table = QTableWidget(0, 6)
+        self.health_table.setHorizontalHeaderLabels(["模型", "状态", "延迟", "方式", "检查时间", "错误/预览"])
+        self.health_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.health_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.health_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.health_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        layout.addWidget(self.health_table, 1)
+        brow = QHBoxLayout()
+        brow.addWidget(self._btn("将可用项加入收藏", self.health_add_ok_to_favorites, success=True))
+        brow.addWidget(self._btn("重测表格选中", self.health_retest_selected, secondary=True))
+        brow.addStretch(1)
+        layout.addLayout(brow)
+        self.health_status = QLabel("尚未检查 — 建议范围选「自定义 Provider」或「默认模型」")
+        self.health_status.setObjectName("subtitle")
+        self.health_status.setWordWrap(True)
+        layout.addWidget(self.health_status)
+        return w
+
+    def _build_help_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(4, 4, 4, 4)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("使用教程（分类 Tab）· 内置 Markdown"))
+        top.addStretch(1)
+        top.addWidget(self._btn("复制全部 Markdown", self.help_copy_md, secondary=True))
+        top.addWidget(self._btn("导出为 .md 文件", self.help_export_md, secondary=True))
+        layout.addLayout(top)
+
+        self.help_tabs = QTabWidget()
+        self.help_browsers: list[QTextBrowser] = []
+        sections = help_docs.help_sections()
+        for title, md in sections:
+            page = QWidget()
+            pl = QVBoxLayout(page)
+            pl.setContentsMargins(4, 8, 4, 4)
+            browser = QTextBrowser()
+            browser.setOpenExternalLinks(True)
+            browser.setHtml(help_docs.help_section_html(md))
+            pl.addWidget(browser, 1)
+            self.help_browsers.append(browser)
+            self.help_tabs.addTab(page, title)
+        # keep first browser as help_browser for any legacy refs
+        self.help_browser = self.help_browsers[0] if self.help_browsers else QTextBrowser()
+        layout.addWidget(self.help_tabs, 1)
+        return w
+
+    def help_copy_md(self):
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(help_docs.HELP_MARKDOWN)
+        self.status.showMessage("已复制教程 Markdown 到剪贴板")
+
+    def help_export_md(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出使用教程", str(Path.home() / "PiManager-使用教程.md"), "Markdown (*.md)"
+        )
+        if not path:
+            return
+        Path(path).write_text(help_docs.HELP_MARKDOWN, encoding="utf-8")
+        QMessageBox.information(self, "已导出", path)
+
+    def _build_history_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.addWidget(QLabel("模型测试历史（启动时自动加载本地记录，也可手动刷新）"))
+        filt = QHBoxLayout()
+        self.history_filter = QLineEdit()
+        self.history_filter.setPlaceholderText("过滤 provider/model…")
+        self.history_filter.textChanged.connect(self.history_refresh)
+        filt.addWidget(self.history_filter, 1)
+        filt.addWidget(self._btn("刷新", self.history_refresh, secondary=True))
+        filt.addWidget(self._btn("清空历史", self.history_clear, danger=True))
+        layout.addLayout(filt)
+        self.history_table = QTableWidget(0, 6)
+        self.history_table.setHorizontalHeaderLabels(["时间", "模型", "可用", "延迟", "方式", "错误/预览"])
+        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.history_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.history_table, 1)
+        return w
+
+    def _build_tools_tab(self) -> QWidget:
+        """Self-check + export/import + secure keys."""
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        box1 = QGroupBox("启动自检")
+        l1 = QVBoxLayout(box1)
+        l1.addWidget(self._btn("运行自检", self.self_check_run, success=True))
+        self.selfcheck_table = QTableWidget(0, 3)
+        self.selfcheck_table.setHorizontalHeaderLabels(["项目", "状态", "详情"])
+        self.selfcheck_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.selfcheck_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        l1.addWidget(self.selfcheck_table)
+        layout.addWidget(box1, 1)
+
+        box2 = QGroupBox("配置导入/导出")
+        l2 = QHBoxLayout(box2)
+        l2.addWidget(self._btn("导出配置包", self.export_config, success=True))
+        l2.addWidget(self._btn("导出（含密钥）", self.export_config_with_secrets, secondary=True))
+        l2.addWidget(self._btn("导入配置包", self.import_config))
+        l2.addWidget(self._btn("加密现有明文 Key", self.secure_keys_now, secondary=True))
+        l2.addStretch(1)
+        layout.addWidget(box2)
+
+        box3 = QGroupBox("Pi Manager 更新")
+        l3 = QVBoxLayout(box3)
+        self.mgr_version_lbl = QLabel(f"当前版本：{extras.APP_VERSION}")
+        l3.addWidget(self.mgr_version_lbl)
+        row = QHBoxLayout()
+        self.update_url_edit = QLineEdit(str((self.mgr or {}).get("update_manifest_url") or ""))
+        self.update_url_edit.setPlaceholderText("可选：版本清单 URL（JSON: version/notes/url）")
+        row.addWidget(self.update_url_edit, 1)
+        row.addWidget(self._btn("检查更新", self.check_manager_update, secondary=True))
+        l3.addLayout(row)
+        self.update_status = QLabel("")
+        self.update_status.setObjectName("subtitle")
+        self.update_status.setWordWrap(True)
+        l3.addWidget(self.update_status)
+        layout.addWidget(box3)
+        return w
+
+    def enhance_sessions_tab_widgets(self, layout: QVBoxLayout):
+        # called if we rebuild sessions - instead patch methods only
+        pass
+
+    # ---- health ----
+    def health_save_interval(self):
+        self.mgr["health_interval_min"] = int(self.health_interval.value())
+        self.persist_mgr()
+        self._setup_health_timer()
+        self.status.showMessage("健康检查定时已保存")
+
+    def health_run_silent(self):
+        self._run_health(show_dialog=False)
+
+    def health_run_now(self):
+        self._run_health(show_dialog=True)
+
+    def _health_scope_value(self) -> str:
+        if hasattr(self, "health_scope"):
+            return str(self.health_scope.currentData() or "favorites")
+        return "favorites"
+
+    def _run_health(self, show_dialog: bool = True):
+        if getattr(self, "_health_running", False):
+            if show_dialog:
+                QMessageBox.information(self, "提示", "健康检查进行中，请稍候。")
+            return
+        mode = self._test_mode() if hasattr(self, "_test_mode") else "auto"
+        scope = self._health_scope_value()
+        selected = []
+        if scope == "selected" and hasattr(self, "selected_model_rows"):
+            selected = [(m.provider, m.model) for m in self.selected_model_rows()]
+        self._health_running = True
+        self._health_show_dialog = show_dialog
+        self._health_done = 0
+        self._health_ok = 0
+        self.status.showMessage("健康检查进行中（逐项实时更新）…")
+        if hasattr(self, "health_status"):
+            self.health_status.setText("健康检查中：0 完成 …")
+
+        from .ui import BatchTestWorker
+
+        # pairs resolved inside run_health_check; pass empty to let scope collect
+        w = self._track(
+            BatchTestWorker(
+                [],
+                mode=mode,
+                kind="health",
+                health_scope=scope,
+                health_selected=selected,
+            )
+        )
+        w.progress.connect(self._on_health_progress, Qt.QueuedConnection)
+        w.done.connect(lambda r: self._on_health_done(r, getattr(self, "_health_show_dialog", True)), Qt.QueuedConnection)
+        w.failed.connect(self._on_health_fail, Qt.QueuedConnection)
+        w.start()
+
+    def _on_health_progress(self, r: dict):
+        if not isinstance(r, dict):
+            return
+        self._health_done = int(getattr(self, "_health_done", 0)) + 1
+        if r.get("available"):
+            self._health_ok = int(getattr(self, "_health_ok", 0)) + 1
+        key = f"{r.get('provider')}/{r.get('model')}"
+        # also mirror into models table if present
+        if hasattr(self, "test_results"):
+            self.test_results[key] = r
+            try:
+                self.fill_models_table()
+            except Exception:
+                pass
+        try:
+            self.health_refresh_table()
+        except Exception:
+            pass
+        try:
+            self.history_refresh()
+        except Exception:
+            pass
+        done = self._health_done
+        ok_n = self._health_ok
+        self.status.showMessage(f"健康检查 {done} 完成 · 可用 {ok_n} · 刚完成 {key}")
+        if hasattr(self, "health_status"):
+            self.health_status.setText(f"进行中：已完成 {done}（可用 {ok_n}）· 最近 {key}")
+
+    def _on_health_fail(self, err: str):
+        self._health_running = False
+        QMessageBox.warning(self, "健康检查失败", err)
+
+    def _worker_fn(self, fn):
+        from .ui import Worker
+
+        return Worker(fn)
+
+    def _on_health_done(self, result: dict, show_dialog: bool):
+        self._health_running = False
+        if not result.get("ok") and result.get("error"):
+            QMessageBox.warning(self, "健康检查", str(result.get("error")))
+            return
+        self.health_refresh_table()
+        results = result.get("results") or []
+        ok_n = sum(1 for r in results if r.get("available"))
+        scope = result.get("scope") or self._health_scope_value()
+        msg = f"健康检查完成：{ok_n}/{len(results)} 可用（范围: {scope}）"
+        self.status.showMessage(msg)
+        if hasattr(self, "health_status"):
+            self.health_status.setText(msg + f" | {result.get('health', {}).get('updated_at', '')}")
+        for r in results:
+            key = f"{r.get('provider')}/{r.get('model')}"
+            self.test_results[key] = r
+        try:
+            self.fill_models_table()
+            self.history_refresh()
+        except Exception:
+            pass
+        if show_dialog:
+            hint = ""
+            if ok_n == 0 and scope == "favorites":
+                hint = "\n\n提示：收藏可能是未登录的 openai-codex。可改范围「默认模型」或「自定义 Provider」，或把可用模型加入收藏。"
+            QMessageBox.information(self, "健康检查", msg + hint)
+
+    def health_refresh_table(self):
+        if not hasattr(self, "health_table"):
+            return
+        data = extras.load_health()
+        models = data.get("models") or {}
+        self.health_table.setRowCount(len(models))
+        for i, (key, info) in enumerate(sorted(models.items())):
+            avail = bool(info.get("available"))
+            self.health_table.setItem(i, 0, QTableWidgetItem(key))
+            self.health_table.setItem(i, 1, QTableWidgetItem("可用" if avail else "不可用"))
+            lat = info.get("latency_ms")
+            self.health_table.setItem(i, 2, QTableWidgetItem(f"{lat:.0f} ms" if isinstance(lat, (int, float)) else "—"))
+            self.health_table.setItem(i, 3, QTableWidgetItem(str(info.get("mode") or "—")))
+            self.health_table.setItem(i, 4, QTableWidgetItem(str(info.get("checked_at") or "—")))
+            self.health_table.setItem(i, 5, QTableWidgetItem(str(info.get("error") or "")[:160]))
+        if hasattr(self, "health_status"):
+            sc = data.get("last_scope") or "—"
+            self.health_status.setText(f"更新于 {data.get('updated_at') or '—'} | 上次范围 {sc}")
+
+    def health_add_ok_to_favorites(self):
+        data = extras.load_health()
+        models = data.get("models") or {}
+        favs = list((self.mgr or {}).get("favorites") or [])
+        n = 0
+        for key, info in models.items():
+            if info.get("available") and key not in favs:
+                favs.append(key)
+                n += 1
+        self.mgr["favorites"] = favs
+        self.persist_mgr()
+        try:
+            self.fill_favorites()
+        except Exception:
+            pass
+        QMessageBox.information(self, "收藏", f"新增 {n} 个可用模型到收藏（共 {len(favs)}）")
+
+    def health_retest_selected(self):
+        if not hasattr(self, "health_table"):
+            return
+        pairs = []
+        for idx in self.health_table.selectionModel().selectedRows():
+            item = self.health_table.item(idx.row(), 0)
+            if not item:
+                continue
+            key = item.text()
+            if "/" in key:
+                p, m = key.split("/", 1)
+                pairs.append((p, m))
+        if not pairs:
+            QMessageBox.information(self, "提示", "请先在健康表中选中行")
+            return
+        self._run_model_tests(pairs)
+
+    # ---- history ----
+    def history_refresh(self):
+        if not hasattr(self, "history_table"):
+            return
+        q = (self.history_filter.text() if hasattr(self, "history_filter") else "") or ""
+        q = q.lower().strip()
+        rows = extras.load_history()
+        if q:
+            rows = [r for r in rows if q in f"{r.get('provider')}/{r.get('model')}".lower()]
+        rows = list(reversed(rows[-200:]))
+        self.history_table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            self.history_table.setItem(i, 0, QTableWidgetItem(str(r.get("time") or "")))
+            self.history_table.setItem(i, 1, QTableWidgetItem(f"{r.get('provider')}/{r.get('model')}"))
+            self.history_table.setItem(i, 2, QTableWidgetItem("是" if r.get("available") else "否"))
+            lat = r.get("latency_ms")
+            self.history_table.setItem(i, 3, QTableWidgetItem(f"{lat:.0f}" if isinstance(lat, (int, float)) else "—"))
+            self.history_table.setItem(i, 4, QTableWidgetItem(str(r.get("mode") or "")))
+            extra = r.get("error") or r.get("preview") or ""
+            self.history_table.setItem(i, 5, QTableWidgetItem(str(extra)[:120]))
+
+    def history_clear(self):
+        if QMessageBox.question(self, "确认", "清空全部测试历史？") != QMessageBox.Yes:
+            return
+        extras.save_history([])
+        self.history_refresh()
+
+    # ---- self check / export ----
+    def self_check_run(self):
+        def job():
+            return extras.run_self_check()
+
+        w = self._track(self._worker_fn(job))
+        w.done.connect(self._on_selfcheck_done)
+        w.failed.connect(lambda e: QMessageBox.warning(self, "自检失败", e))
+        w.start()
+        self.status.showMessage("正在自检…")
+
+    def _on_selfcheck_done(self, checks: list):
+        if not hasattr(self, "selfcheck_table"):
+            return
+        self.selfcheck_table.setRowCount(len(checks))
+        for i, c in enumerate(checks):
+            ok = bool(c.get("ok"))
+            self.selfcheck_table.setItem(i, 0, QTableWidgetItem(str(c.get("name"))))
+            self.selfcheck_table.setItem(i, 1, QTableWidgetItem("通过" if ok else "注意"))
+            self.selfcheck_table.setItem(i, 2, QTableWidgetItem(str(c.get("detail") or "")))
+        bad = sum(1 for c in checks if not c.get("ok"))
+        self.status.showMessage(f"自检完成：{len(checks) - bad}/{len(checks)} 通过")
+
+    def export_config(self):
+        path, _ = QFileDialog.getSaveFileName(self, "导出配置", str(Path.home() / "pi-manager-config.zip"), "ZIP (*.zip)")
+        if not path:
+            return
+        try:
+            out = extras.export_config_bundle(path, include_secrets=False)
+            QMessageBox.information(self, "已导出", f"已导出到：\n{out}\n（密钥已脱敏/占位）")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", str(e))
+
+    def export_config_with_secrets(self):
+        if QMessageBox.question(self, "确认", "将导出包含 API Key 的配置包，请妥善保管。继续？") != QMessageBox.Yes:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "导出配置（含密钥）", str(Path.home() / "pi-manager-config-secrets.zip"), "ZIP (*.zip)")
+        if not path:
+            return
+        password, ok = QInputDialog.getText(
+            self,
+            "设置密钥包密码",
+            "请输入至少 10 个字符的密码：",
+            QLineEdit.Password,
+        )
+        if not ok:
+            return
+        confirm, ok = QInputDialog.getText(
+            self,
+            "确认密钥包密码",
+            "请再次输入密码：",
+            QLineEdit.Password,
+        )
+        if not ok or password != confirm:
+            QMessageBox.warning(self, "导出失败", "两次密码不一致")
+            return
+        try:
+            out = extras.export_config_bundle(path, include_secrets=True, password=password)
+            QMessageBox.information(self, "已导出", f"已导出到：\n{out}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", str(e))
+
+    def import_config(self):
+        path, _ = QFileDialog.getOpenFileName(self, "导入配置包", str(Path.home()), "ZIP (*.zip)")
+        if not path:
+            return
+        restore_secrets = extras.bundle_contains_secrets(path) and (
+            QMessageBox.question(self, "密钥", "配置包包含加密密钥，是否恢复？") == QMessageBox.Yes
+        )
+        password = ""
+        if restore_secrets:
+            password, ok = QInputDialog.getText(
+                self,
+                "输入密钥包密码",
+                "请输入导出时设置的密码：",
+                QLineEdit.Password,
+            )
+            if not ok:
+                return
+        res = extras.import_config_bundle(
+            path,
+            restore_secrets=restore_secrets,
+            password=password,
+        )
+        if res.get("requires_command_confirmation"):
+            providers = ", ".join(res.get("command_providers") or [])
+            if QMessageBox.question(
+                self,
+                "确认执行命令",
+                f"导入包中的 Provider「{providers}」包含 !command 密钥。\n"
+                "这会在 Pi 运行时执行外部命令，确认导入？",
+            ) == QMessageBox.Yes:
+                res = extras.import_config_bundle(
+                    path,
+                    restore_secrets=restore_secrets,
+                    password=password,
+                    allow_commands=True,
+                )
+        if not res.get("ok"):
+            QMessageBox.critical(self, "导入失败", str(res.get("error")))
+            return
+        self.mgr = core.load_manager_config()
+        self.refresh_all()
+        self.settings_load()
+        QMessageBox.information(self, "导入成功", "已恢复：\n" + "\n".join(res.get("restored") or []))
+
+    def secure_keys_now(self):
+        res = extras.secure_existing_keys()
+        QMessageBox.information(
+            self,
+            "加密完成",
+            f"已处理 provider 明文 Key。\n密钥库条目：{len(res.get('secrets') or [])}",
+        )
+        self.refresh_providers()
+
+    def check_manager_update(self):
+        url = self.update_url_edit.text().strip() if hasattr(self, "update_url_edit") else ""
+        self.mgr["update_manifest_url"] = url
+        self.persist_mgr()
+
+        def job():
+            return extras.check_manager_update()
+
+        w = self._track(self._worker_fn(job))
+        w.done.connect(self._on_mgr_update)
+        w.failed.connect(lambda e: QMessageBox.warning(self, "检查失败", e))
+        w.start()
+
+    def _on_mgr_update(self, res: dict):
+        msg = res.get("message") or ""
+        if hasattr(self, "update_status"):
+            self.update_status.setText(msg)
+        if res.get("has_update"):
+            QMessageBox.information(self, "发现更新", msg + "\n" + str(res.get("notes") or ""))
+        else:
+            QMessageBox.information(self, "更新检查", msg)
+
+    # ---- sessions extras ----
+    def session_selected_path(self) -> str | None:
+        rows = self.sessions_table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        r = rows[0].row()
+        item = self.sessions_table.item(r, 2)
+        return item.text() if item else None
+
+    def session_delete(self):
+        path = self.session_selected_path()
+        if not path:
+            QMessageBox.information(self, "提示", "请先选择会话")
+            return
+        if QMessageBox.question(self, "确认删除", f"删除会话文件？\n{path}") != QMessageBox.Yes:
+            return
+        if extras.session_delete(path):
+            self.refresh_sessions()
+            self.status.showMessage("会话已删除")
+        else:
+            QMessageBox.warning(self, "失败", "无法删除")
+
+    def session_rename(self):
+        path = self.session_selected_path()
+        if not path:
+            QMessageBox.information(self, "提示", "请先选择会话")
+            return
+        name, ok = QInputDialog.getText(self, "重命名", "新文件名：", text=Path(path).name)
+        if not ok or not name.strip():
+            return
+        try:
+            newp = extras.session_rename(path, name.strip())
+            self.refresh_sessions()
+            self.status.showMessage(f"已重命名为 {newp}")
+        except Exception as e:
+            QMessageBox.warning(self, "重命名失败", str(e))
+
+    def sessions_apply_filter(self):
+        wd = self.session_filter_wd.text().strip() if hasattr(self, "session_filter_wd") else ""
+        nm = self.session_filter_name.text().strip() if hasattr(self, "session_filter_name") else ""
+        rows = extras.list_sessions_filtered(limit=100, workdir_substr=wd, name_substr=nm)
+        self.sessions_table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            self.sessions_table.setItem(i, 0, QTableWidgetItem(r["name"]))
+            self.sessions_table.setItem(i, 1, QTableWidgetItem(r["folder"]))
+            self.sessions_table.setItem(i, 2, QTableWidgetItem(r["path"]))
+
+    # ---- chat multi-turn (context via prompt assembly) ----
+    def chat_clear_history(self):
+        self.chat_history = []
+        if hasattr(self, "chat_output"):
+            self.chat_output.setPlainText("")
+        self.status.showMessage("已清空对话历史")
+
+    def chat_send_enhanced(self):
+        prompt = self.chat_input.toPlainText().strip()
+        if not prompt:
+            return
+        provider = self.chat_provider.text().strip() or None
+        model = self.chat_model.text().strip() or None
+        # assemble short history context
+        history_lines = []
+        for turn in self.chat_history[-6:]:
+            history_lines.append(f"User: {turn.get('user','')}")
+            history_lines.append(f"Assistant: {turn.get('assistant','')}")
+        if history_lines:
+            full = "以下是近期对话，请承接上下文简要回答。\n" + "\n".join(history_lines) + f"\nUser: {prompt}\nAssistant:"
+        else:
+            full = prompt
+        self.chat_output.appendPlainText(f"\n你: {prompt}\n…思考中…")
+        self.chat_input.setEnabled(False)
+        workdir = self.workdir_edit.text().strip() or str(core.user_home())
+
+        def job():
+            return extras.chat_once(full, provider=provider, model=model, workdir=workdir)
+
+        w = self._track(self._worker_fn(job))
+        w.done.connect(lambda r, u=prompt: self._on_enhanced_chat_done(r, u))
+        w.failed.connect(self._on_enhanced_chat_fail)
+        w.start()
+
+    def _on_enhanced_chat_done(self, result: dict, user_prompt: str):
+        self.chat_input.setEnabled(True)
+        text = (result.get("stdout") or "").strip() or (result.get("stderr") or "").strip()
+        if not result.get("ok"):
+            self.chat_output.appendPlainText(f"失败({result.get('returncode')}): {text[:500]}")
+            return
+        self.chat_history.append({"user": user_prompt, "assistant": text})
+        lat = result.get("latency_ms")
+        self.chat_output.appendPlainText(f"Pi ({lat} ms):\n{text}\n")
+
+    def _on_enhanced_chat_fail(self, err: str):
+        self.chat_input.setEnabled(True)
+        self.chat_output.appendPlainText(f"错误: {err}")
+
+    # ---- settings helpers for proxy etc ----
+    def load_feature_settings_fields(self):
+        mgr = core.load_manager_config()
+        self.mgr = mgr
+        if hasattr(self, "proxy_enabled"):
+            self.proxy_enabled.setChecked(bool(mgr.get("proxy_enabled")))
+        if hasattr(self, "proxy_url"):
+            self.proxy_url.setText(str(mgr.get("proxy_url") or ""))
+        if hasattr(self, "test_concurrency"):
+            self.test_concurrency.setValue(int(mgr.get("test_concurrency") or 3))
+        if hasattr(self, "minimize_to_tray"):
+            self.minimize_to_tray.setChecked(bool(mgr.get("minimize_to_tray", True)))
+        if hasattr(self, "start_minimized"):
+            self.start_minimized.setChecked(bool(mgr.get("start_minimized", False)))
+        if hasattr(self, "secure_keys_chk"):
+            self.secure_keys_chk.setChecked(bool(mgr.get("secure_keys", True)))
+        if hasattr(self, "update_url_edit"):
+            self.update_url_edit.setText(str(mgr.get("update_manifest_url") or ""))
+        if hasattr(self, "mgr_version_lbl"):
+            self.mgr_version_lbl.setText(f"当前版本：{extras.APP_VERSION}")
+
+    def save_feature_settings_fields(self):
+        if hasattr(self, "proxy_enabled"):
+            self.mgr["proxy_enabled"] = self.proxy_enabled.isChecked()
+        if hasattr(self, "proxy_url"):
+            self.mgr["proxy_url"] = self.proxy_url.text().strip()
+        if hasattr(self, "test_concurrency"):
+            self.mgr["test_concurrency"] = int(self.test_concurrency.value())
+        if hasattr(self, "minimize_to_tray"):
+            self.mgr["minimize_to_tray"] = self.minimize_to_tray.isChecked()
+        if hasattr(self, "start_minimized"):
+            self.mgr["start_minimized"] = self.start_minimized.isChecked()
+        if hasattr(self, "secure_keys_chk"):
+            self.mgr["secure_keys"] = self.secure_keys_chk.isChecked()
+        if hasattr(self, "update_url_edit"):
+            self.mgr["update_manifest_url"] = self.update_url_edit.text().strip()
+        self.persist_mgr()
+        extras.set_proxy_settings(bool(self.mgr.get("proxy_enabled")), str(self.mgr.get("proxy_url") or ""))
+        extras.set_test_concurrency(int(self.mgr.get("test_concurrency") or 3))
+        self._setup_health_timer()
+        self.rebuild_tray_favorites()

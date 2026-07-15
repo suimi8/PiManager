@@ -1,0 +1,99 @@
+{
+  "name": "pi-cursor",
+  "displayName": "Pi Coding Agent",
+  "description": "在 Cursor 中一键启动/使用 Pi Coding Agent（终端完整会话）",
+  "version": "0.2.0",
+  "publisher": "pi-manager",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other", "AI"],
+  "activationEvents": [
+    "onCommand:pi.openTerminal",
+    "onCommand:pi.openWithDefaultModel",
+    "onCommand:pi.askPrompt",
+    "onCommand:pi.openConfig",
+    "onCommand:pi.checkVersion"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "pi.openTerminal",
+        "title": "Pi: 在终端启动完整会话",
+        "category": "Pi"
+      },
+      {
+        "command": "pi.openWithDefaultModel",
+        "title": "Pi: 用默认模型启动",
+        "category": "Pi"
+      },
+      {
+        "command": "pi.askPrompt",
+        "title": "Pi: 快速提问 (pi -p)",
+        "category": "Pi"
+      },
+      {
+        "command": "pi.openConfig",
+        "title": "Pi: 打开配置目录 (~/.pi/agent)",
+        "category": "Pi"
+      },
+      {
+        "command": "pi.checkVersion",
+        "title": "Pi: 检查版本",
+        "category": "Pi"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "pi.openWithDefaultModel",
+        "key": "ctrl+alt+p",
+        "mac": "cmd+alt+p"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "pi.openTerminal",
+          "group": "navigation@99",
+          "when": "explorerResourceIsFolder"
+        }
+      ],
+      "commandPalette": [
+        { "command": "pi.openTerminal" },
+        { "command": "pi.openWithDefaultModel" },
+        { "command": "pi.askPrompt" },
+        { "command": "pi.openConfig" },
+        { "command": "pi.checkVersion" }
+      ]
+    },
+    "configuration": {
+      "title": "Pi Coding Agent",
+      "properties": {
+        "pi.command": {
+          "type": "string",
+          "default": "pi",
+          "description": "Pi 可执行命令（默认 pi，也可填 node 路径到 cli.js）"
+        },
+        "pi.extraArgs": {
+          "type": "string",
+          "default": "",
+          "description": "额外启动参数，如 --thinking high"
+        },
+        "pi.useDefaultModelFromSettings": {
+          "type": "boolean",
+          "default": true,
+          "description": "启动时读取 ~/.pi/agent/settings.json 的 defaultProvider/defaultModel"
+        },
+        "pi.appendChinesePrompt": {
+          "type": "boolean",
+          "default": true,
+          "description": "启动时附加中文优先的 system prompt"
+        },
+        "pi.providerEnvCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Pi Manager 环境 helper 命令，例如 python /path/to/pi-manager/main.py --print-provider-env"
+        }
+      }
+    }
+  }
+}
