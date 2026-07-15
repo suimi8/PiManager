@@ -432,6 +432,107 @@ def upsert_custom_provider(
     return cfg
 
 
+def _parse_favorite_key(key: str) -> tuple[str, str] | None:
+    key = (key or "").strip()
+    if "/" not in key:
+        return None
+    provider, model = key.split("/", 1)
+    provider, model = provider.strip(), model.strip()
+    if not provider or not model:
+        return None
+    return provider, model
+
+
+def purge_favorites(
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    redefault: bool = True,
+) -> dict[str, Any]:
+    """从收藏中移除匹配项；若默认模型被移除，则自动切换到下一个收藏。
+
+    - 仅 provider：删除该 Provider 下全部收藏
+    - provider + model：只删除该模型收藏
+    - redefault=True：默认模型落在被删集合时，切到剩余收藏第一项；无剩余则清空默认
+    """
+    provider = (provider or "").strip()
+    model = (model or "").strip()
+    mgr = load_manager_config()
+    favs = list(mgr.get("favorites") or [])
+    kept: list[str] = []
+    removed: list[str] = []
+    for key in favs:
+        parsed = _parse_favorite_key(str(key))
+        if not parsed:
+            kept.append(str(key))
+            continue
+        p, m = parsed
+        drop = False
+        if provider and model:
+            drop = p == provider and m == model
+        elif provider:
+            drop = p == provider
+        if drop:
+            removed.append(str(key))
+        else:
+            kept.append(str(key))
+
+    changed = removed or favs != kept
+    if changed:
+        mgr["favorites"] = kept
+        save_manager_config(mgr)
+
+    result: dict[str, Any] = {
+        "removed_favorites": removed,
+        "favorites": kept,
+        "default_changed": False,
+        "default_provider": "",
+        "default_model": "",
+    }
+
+    if not redefault:
+        return result
+
+    cur_p, cur_m, thinking = get_default_model()
+    need_redefault = False
+    if provider and model:
+        need_redefault = cur_p == provider and cur_m == model
+    elif provider:
+        need_redefault = cur_p == provider
+    # 默认模型对应收藏已被删，或默认本身指向已删 provider
+    if not need_redefault and removed:
+        cur_key = f"{cur_p}/{cur_m}" if cur_p and cur_m else ""
+        if cur_key and cur_key in removed:
+            need_redefault = True
+
+    if need_redefault:
+        next_p, next_m = "", ""
+        for key in kept:
+            parsed = _parse_favorite_key(str(key))
+            if parsed:
+                next_p, next_m = parsed
+                break
+        if next_p and next_m:
+            set_default_model(next_p, next_m, thinking or None)
+            result["default_changed"] = True
+            result["default_provider"] = next_p
+            result["default_model"] = next_m
+        else:
+            # 无可用收藏：清空默认，避免指向已删除 provider
+            settings = load_settings()
+            settings["defaultProvider"] = ""
+            settings["defaultModel"] = ""
+            save_settings(settings)
+            result["default_changed"] = True
+            result["default_provider"] = ""
+            result["default_model"] = ""
+    else:
+        result["default_provider"] = cur_p
+        result["default_model"] = cur_m
+
+    return result
+
+
 def delete_custom_provider(name: str) -> dict[str, Any]:
     cfg = load_models_config()
     providers = cfg.get("providers", {})
@@ -445,6 +546,11 @@ def delete_custom_provider(name: str) -> dict[str, Any]:
         secretstore.delete_secret(secretstore.provider_key_name(name))
     except Exception:
         pass
+    # 同步清理收藏，并在默认属于该 Provider 时切换到下一个收藏
+    try:
+        cfg["_purge"] = purge_favorites(provider=name, redefault=True)
+    except Exception:
+        cfg["_purge"] = {"removed_favorites": [], "favorites": [], "default_changed": False}
     return cfg
 
 
@@ -472,6 +578,10 @@ def remove_model_from_provider(provider: str, model_id: str) -> dict[str, Any]:
         models = providers[provider].get("models", [])
         providers[provider]["models"] = [m for m in models if m.get("id") != model_id]
         save_models_config(cfg)
+    try:
+        cfg["_purge"] = purge_favorites(provider=provider, model=model_id, redefault=True)
+    except Exception:
+        cfg["_purge"] = {"removed_favorites": [], "favorites": [], "default_changed": False}
     return cfg
 
 

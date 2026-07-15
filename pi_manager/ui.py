@@ -2425,6 +2425,27 @@ class MainWindow(FeatureMixin, QMainWindow):
         if not item:
             return
         key = item.text()
+        parsed = self._parse_favorite_key(key)
+        if parsed:
+            purge = core.purge_favorites(provider=parsed[0], model=parsed[1], redefault=True)
+            self.mgr = core.load_manager_config()
+            self.fill_favorites()
+            self.fill_models_table()
+            try:
+                self.refresh_dashboard()
+                self.settings_load()
+            except Exception:
+                pass
+            if purge.get("default_changed"):
+                np = purge.get("default_provider") or ""
+                nm = purge.get("default_model") or ""
+                if np and nm:
+                    self.status.showMessage(f"已移除收藏 {key}；默认切换为 {np}/{nm}")
+                else:
+                    self.status.showMessage(f"已移除收藏 {key}；默认模型已清空")
+            else:
+                self.status.showMessage(f"已移除收藏 {key}")
+            return
         self.mgr["favorites"] = [x for x in (self.mgr.get("favorites") or []) if x != key]
         self.persist_mgr()
         self.fill_favorites()
@@ -2501,11 +2522,40 @@ class MainWindow(FeatureMixin, QMainWindow):
         if not item:
             return
         name = item.text()
-        if QMessageBox.question(self, "确认", f"删除自定义 provider「{name}」？") != QMessageBox.Yes:
+        if QMessageBox.question(
+            self,
+            "确认",
+            f"删除自定义 provider「{name}」？\n\n将同时移除收藏中该 Provider 的全部模型；\n若当前默认属于该 Provider，会自动切换到下一个收藏模型。",
+        ) != QMessageBox.Yes:
             return
-        core.delete_custom_provider(name)
+        result = core.delete_custom_provider(name)
+        purge = result.get("_purge") if isinstance(result, dict) else None
+        # 重新加载 manager 配置（收藏可能已变）
+        try:
+            self.mgr = core.load_manager_config()
+        except Exception:
+            pass
         self.refresh_providers()
         self.refresh_models()
+        try:
+            self.fill_favorites()
+            self.refresh_dashboard()
+            self.settings_load()
+            self.refresh_chat_model_choices()
+        except Exception:
+            pass
+        removed_n = len((purge or {}).get("removed_favorites") or [])
+        msg = f"已删除 Provider「{name}」"
+        if removed_n:
+            msg += f"，清理收藏 {removed_n} 项"
+        if (purge or {}).get("default_changed"):
+            np = (purge or {}).get("default_provider") or ""
+            nm = (purge or {}).get("default_model") or ""
+            if np and nm:
+                msg += f"；默认已切换为 {np}/{nm}"
+            else:
+                msg += "；默认模型已清空（无剩余收藏）"
+        self.status.showMessage(msg)
 
     def provider_add_model(self):
         item = self.provider_list.currentItem()
