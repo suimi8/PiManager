@@ -880,10 +880,13 @@ def list_sessions_filtered(limit: int = 100, workdir_substr: str = "", name_subs
     nm = (name_substr or "").lower().strip()
     out = []
     for r in rows:
-        blob = f"{r.get('path','')} {r.get('folder','')} {r.get('name','')}".lower()
+        blob = " ".join(
+            str(r.get(k) or "")
+            for k in ("path", "folder", "name", "cwd", "project", "model", "preview")
+        ).lower()
         if wd and wd not in blob:
             continue
-        if nm and nm not in (r.get("name") or "").lower():
+        if nm and nm not in blob:
             continue
         out.append(r)
         if len(out) >= limit:

@@ -263,10 +263,20 @@ def build_stylesheet(mode: str = "night", accent: str = "blue") -> str:
 * {{
   font-family: {font};
 }}
-QMainWindow, QWidget {{
+QMainWindow {{
   background: {c['window']};
   color: {c['text']};
   font-size: 13px;
+}}
+/* 默认透明：避免卡片/表单内 QLabel 继承窗体底色导致色块 */
+QWidget {{
+  background: transparent;
+  color: {c['text']};
+  font-size: 13px;
+}}
+QLabel {{
+  background: transparent;
+  color: {c['text']};
 }}
 QToolTip {{
   background: {c['tooltip_bg']};
@@ -292,6 +302,7 @@ QLabel#brandIcon {{
   border-radius: 12px;
 }}
 QLabel#navBrand {{
+  background: transparent;
   font-size: 17px;
   font-weight: 800;
   color: {c['title']};
@@ -299,6 +310,7 @@ QLabel#navBrand {{
   padding: 2px 2px 0 2px;
 }}
 QLabel#navTag {{
+  background: transparent;
   color: {c['subtitle']};
   font-size: 11px;
   padding: 0 2px 10px 2px;
@@ -345,34 +357,40 @@ QFrame#headerRule {{
   min-height: 1px;
 }}
 QLabel#pageTitle {{
+  background: transparent;
   font-size: 22px;
   font-weight: 800;
   color: {c['title']};
   letter-spacing: -0.2px;
 }}
 QLabel#sectionTitle {{
+  background: transparent;
   font-size: 13px;
   font-weight: 700;
   color: {c['accent_text']};
   letter-spacing: 0.2px;
 }}
 QLabel#heroValue {{
+  background: transparent;
   font-size: 18px;
   font-weight: 800;
   color: {c['accent_text']};
   font-family: {mono};
 }}
 QLabel#title {{
+  background: transparent;
   font-size: 20px;
   font-weight: 700;
   color: {c['title']};
 }}
 QLabel#subtitle {{
+  background: transparent;
   color: {c['subtitle']};
   font-size: 12.5px;
   line-height: 1.4;
 }}
 QLabel#muted {{
+  background: transparent;
   color: {c['muted']};
   font-size: 12px;
 }}
@@ -421,6 +439,7 @@ QGroupBox::title {{
   left: 14px;
   padding: 0 8px;
   color: {c['group_title']};
+  background: transparent;
   font-weight: 700;
   font-size: 12.5px;
 }}

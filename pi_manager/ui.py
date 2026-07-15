@@ -1182,45 +1182,57 @@ class MainWindow(FeatureMixin, QMainWindow):
         QMessageBox.warning(self, "拉取失败", err)
 
     def _build_models_tab(self) -> QWidget:
-        """精简模型列表：4 列信息 + 主操作 + 更多菜单（功能不减）。"""
+        """模型列表：紧凑列 + 智能隐藏 Provider + 默认/收藏优先。"""
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
-        # 过滤 + Provider 筛选 + 刷新
+        # 过滤：Provider / 搜索 / 仅收藏 / 刷新
         filt = QHBoxLayout()
         filt.setSpacing(8)
         self.model_provider_filter = QComboBox()
-        self.model_provider_filter.setMinimumWidth(160)
+        self.model_provider_filter.setMinimumWidth(150)
         self.model_provider_filter.setMinimumHeight(34)
         self.model_provider_filter.addItem("全部 Provider", "")
         self.model_provider_filter.currentIndexChanged.connect(self.fill_models_table)
         self.model_filter = QLineEdit()
-        self.model_filter.setPlaceholderText("搜索模型名…")
+        self.model_filter.setPlaceholderText("搜索模型 / Provider…")
         self.model_filter.setMinimumHeight(34)
         try:
             self.model_filter.setClearButtonEnabled(True)
         except Exception:
             pass
         self.model_filter.textChanged.connect(self.fill_models_table)
+        self.model_only_favorites = QCheckBox("仅收藏")
+        self.model_only_favorites.setToolTip("只显示已收藏模型")
+        self.model_only_favorites.toggled.connect(self.fill_models_table)
         filt.addWidget(self.model_provider_filter)
         filt.addWidget(self.model_filter, 1)
+        filt.addWidget(self.model_only_favorites)
         filt.addWidget(self._btn("刷新", self.refresh_models, secondary=True))
         layout.addLayout(filt)
 
+        meta = QHBoxLayout()
+        meta.setSpacing(8)
         self.models_count_lbl = QLabel("0 个模型")
         self.models_count_lbl.setObjectName("subtitle")
-        layout.addWidget(self.models_count_lbl)
+        meta.addWidget(self.models_count_lbl, 1)
+        legend = QLabel("● 默认  ★ 收藏  · 双击设默认")
+        legend.setObjectName("subtitle")
+        meta.addWidget(legend)
+        layout.addLayout(meta)
 
-        # 精简 4 列：模型 / 能力 / 状态 / 延迟
-        self.models_table = QTableWidget(0, 4)
-        self.models_table.setHorizontalHeaderLabels(["模型", "能力", "状态", "延迟"])
+        # 5 列：模型名 / Provider / 能力 / 状态 / 延迟
+        # Provider 列在「已选单一 Provider」时自动隐藏，避免每行重复
+        self.models_table = QTableWidget(0, 5)
+        self.models_table.setHorizontalHeaderLabels(["模型", "Provider", "能力", "状态", "延迟"])
         hdr = self.models_table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.Stretch)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self._polish_table(self.models_table)
         self.models_table.doubleClicked.connect(self.model_set_default)
         layout.addWidget(self.models_table, 1)
@@ -1270,39 +1282,97 @@ class MainWindow(FeatureMixin, QMainWindow):
         primary.addStretch(1)
         layout.addLayout(primary)
 
-        self.test_status = QLabel("双击设默认 · Ctrl/Shift 多选 · 次要操作在「更多」")
+        self.test_status = QLabel("Ctrl/Shift 多选 · 次要操作在「更多」")
         self.test_status.setObjectName("subtitle")
         self.test_status.setWordWrap(True)
         layout.addWidget(self.test_status)
         return w
 
     def _model_capability_text(self, m: core.ModelInfo) -> str:
+        """紧凑能力标签：上下文 + 思考/图像符号。"""
         parts: list[str] = []
-        if m.context:
-            parts.append(m.context)
+        ctx = (m.context or "").strip()
+        if ctx:
+            # 统一长数字：272000 -> 272K
+            compact = ctx
+            try:
+                n = int(str(ctx).replace(",", "").replace("k", "000").replace("K", "000"))
+                if n >= 1000:
+                    compact = f"{n // 1000}K" if n % 1000 == 0 else f"{n / 1000:.1f}K".rstrip("0").rstrip(".")
+                else:
+                    compact = str(n)
+            except Exception:
+                compact = ctx.replace(" tokens", "").replace("token", "").strip()
+            parts.append(compact)
         th = (m.thinking or "").lower()
         if th in {"yes", "true", "y", "1"}:
-            parts.append("思考")
+            parts.append("思")
         elif th and th not in {"no", "false", "n", "0", "-"}:
-            parts.append(f"思考:{m.thinking}")
+            parts.append(f"思:{m.thinking}")
         img = (m.images or "").lower()
         if img in {"yes", "true", "y", "1"}:
-            parts.append("图像")
+            parts.append("图")
         elif img and img not in {"no", "false", "n", "0", "-"}:
             parts.append(f"图:{m.images}")
-        return " · ".join(parts) if parts else "—"
+        return " ".join(parts) if parts else "—"
+
+    def _model_status_cells(self, m: core.ModelInfo) -> tuple[QTableWidgetItem, QTableWidgetItem]:
+        """状态 / 延迟：短文案 + 着色。"""
+        res = self.test_results.get(m.key)
+        st = QTableWidgetItem("—")
+        lat_item = QTableWidgetItem("—")
+        st.setTextAlignment(Qt.AlignCenter)
+        lat_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        if not res:
+            st.setForeground(QColor("#8b98a8"))
+            lat_item.setForeground(QColor("#8b98a8"))
+            return st, lat_item
+        if res.get("pending"):
+            st.setText("…")
+            st.setForeground(QColor("#fbbf24"))
+            lat_item.setText("…")
+            return st, lat_item
+        if res.get("available") is True:
+            st.setText("✓")
+            st.setToolTip("可用")
+            st.setForeground(QColor("#34d399"))
+        elif res.get("available") is False:
+            st.setText("✗")
+            err = str(res.get("error") or res.get("preview") or "不可用")
+            st.setToolTip(err[:300])
+            st.setForeground(QColor("#f87171"))
+        else:
+            st.setText("?")
+            st.setForeground(QColor("#8b98a8"))
+        lat = res.get("latency_ms")
+        if isinstance(lat, (int, float)):
+            lat_item.setText(f"{lat:.0f}ms")
+            if lat < 800:
+                lat_item.setForeground(QColor("#34d399"))
+            elif lat < 2000:
+                lat_item.setForeground(QColor("#fbbf24"))
+            else:
+                lat_item.setForeground(QColor("#f87171"))
+        return st, lat_item
 
     def _model_row_key(self, row: int) -> tuple[str, str] | None:
+        # 兼容：UserRole 存在于「模型」列（第 0 列）
         item = self.models_table.item(row, 0)
         if not item:
             return None
         data = item.data(Qt.UserRole)
         if isinstance(data, (list, tuple)) and len(data) == 2:
             return str(data[0]), str(data[1])
-        text = item.text()
+        # 兜底：Provider 列 + 去掉标记后的模型名
+        prov_item = self.models_table.item(row, 1)
+        if prov_item and item.text():
+            name = item.text().lstrip("●★· ").strip()
+            if name:
+                return prov_item.text().strip(), name
+        text = item.text().lstrip("●★· ").strip()
         if "/" in text:
             p, m = text.split("/", 1)
-            return p, m
+            return p.strip(), m.strip()
         return None
 
     def _build_providers_tab(self) -> QWidget:
@@ -1369,15 +1439,24 @@ class MainWindow(FeatureMixin, QMainWindow):
         ctrl_l.setSpacing(10)
         row = QHBoxLayout()
         row.setSpacing(8)
-        self.chat_provider = QLineEdit()
-        self.chat_provider.setPlaceholderText("provider")
-        self.chat_model = QLineEdit()
-        self.chat_model.setPlaceholderText("model")
+        self.chat_provider = QComboBox()
+        self.chat_provider.setEditable(True)
+        self.chat_provider.setInsertPolicy(QComboBox.NoInsert)
+        self.chat_provider.setMinimumWidth(160)
+        self.chat_provider.setMinimumHeight(34)
+        self.chat_provider.setPlaceholderText("选择 Provider")
+        self.chat_provider.currentTextChanged.connect(self._on_chat_provider_changed)
+        self.chat_model = QComboBox()
+        self.chat_model.setEditable(True)
+        self.chat_model.setInsertPolicy(QComboBox.NoInsert)
+        self.chat_model.setMinimumHeight(34)
+        self.chat_model.setPlaceholderText("选择模型")
         row.addWidget(QLabel("Provider"))
         row.addWidget(self.chat_provider, 1)
         row.addWidget(QLabel("Model"))
-        row.addWidget(self.chat_model, 1)
+        row.addWidget(self.chat_model, 2)
         row.addWidget(self._btn("填入当前默认", self.chat_fill_default, secondary=True))
+        row.addWidget(self._btn("刷新列表", self.refresh_chat_model_choices, secondary=True))
         row.addWidget(self._btn("清空对话", self.chat_clear_history, secondary=True))
         ctrl_l.addLayout(row)
         self.chat_input = QPlainTextEdit()
@@ -1409,13 +1488,16 @@ class MainWindow(FeatureMixin, QMainWindow):
         layout = QVBoxLayout(w)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
+        tip = QLabel("从会话文件解析项目目录 / 模型；可按项目名或路径筛选。")
+        tip.setObjectName("subtitle")
+        layout.addWidget(tip)
         filt = QHBoxLayout()
         filt.setSpacing(8)
         self.session_filter_wd = QLineEdit()
-        self.session_filter_wd.setPlaceholderText("按工作目录/路径过滤…")
+        self.session_filter_wd.setPlaceholderText("按项目 / 工作目录过滤…")
         self.session_filter_wd.setMinimumHeight(34)
         self.session_filter_name = QLineEdit()
-        self.session_filter_name.setPlaceholderText("按名称过滤…")
+        self.session_filter_name.setPlaceholderText("按模型 / 预览 / 文件名过滤…")
         self.session_filter_name.setMinimumHeight(34)
         self.session_filter_wd.textChanged.connect(self.sessions_apply_filter)
         self.session_filter_name.textChanged.connect(self.sessions_apply_filter)
@@ -1423,14 +1505,21 @@ class MainWindow(FeatureMixin, QMainWindow):
         filt.addWidget(self.session_filter_name, 1)
         filt.addWidget(self._btn("刷新", self.refresh_sessions, secondary=True))
         layout.addLayout(filt)
-        self.sessions_table = QTableWidget(0, 3)
-        self.sessions_table.setHorizontalHeaderLabels(["名称", "目录", "路径"])
-        self.sessions_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        # 项目 | 工作目录 | 模型 | 时间 | 预览（路径存 UserRole）
+        self.sessions_table = QTableWidget(0, 5)
+        self.sessions_table.setHorizontalHeaderLabels(["项目", "工作目录", "模型", "时间", "首条预览"])
+        hdr = self.sessions_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(4, QHeaderView.Stretch)
         self._polish_table(self.sessions_table)
         layout.addWidget(self.sessions_table, 1)
         row = QHBoxLayout()
         row.setSpacing(8)
         row.addWidget(self._btn("继续会话", self.session_continue, success=True))
+        row.addWidget(self._btn("打开项目目录", self.session_open_project, secondary=True))
         row.addWidget(self._btn("资源管理器", self.session_reveal, secondary=True))
         row.addWidget(self._btn("重命名", self.session_rename, secondary=True))
         row.addWidget(self._btn("删除选中", self.session_delete, danger=True))
@@ -1670,6 +1759,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.mgr["favorites"] = favs
         self.persist_mgr()
         self.fill_favorites()
+        self.fill_models_table()
         self.status.showMessage(f"批量收藏 +{n}，共 {len(favs)}")
 
     def model_select_visible(self):
@@ -1730,9 +1820,9 @@ class MainWindow(FeatureMixin, QMainWindow):
             return
         paths = []
         for idx in sm.selectedRows():
-            item = self.sessions_table.item(idx.row(), 2)
-            if item and item.text():
-                paths.append(item.text())
+            path = self._session_path_at(idx.row())
+            if path:
+                paths.append(path)
         if not paths:
             QMessageBox.information(self, "提示", "请多选要删除的会话")
             return
@@ -2053,17 +2143,28 @@ class MainWindow(FeatureMixin, QMainWindow):
     def _on_models_loaded(self, models: list[core.ModelInfo]):
         self.models = models
         self.fill_models_table()
+        try:
+            self.refresh_chat_model_choices()
+        except Exception:
+            pass
         self.status.showMessage(f"已加载 {len(models)} 个模型")
 
     def fill_models_table(self):
         q = (self.model_filter.text() or "").lower().strip()
+        only_fav = bool(getattr(self, "model_only_favorites", None) and self.model_only_favorites.isChecked())
+        fav_set = {str(x) for x in (self.mgr.get("favorites") or [])}
+        try:
+            def_p, def_m, _ = core.get_default_model()
+        except Exception:
+            def_p, def_m = "", ""
+        default_key = f"{def_p}/{def_m}" if def_p and def_m else ""
+
         prov = ""
         if hasattr(self, "model_provider_filter"):
             prov = str(self.model_provider_filter.currentData() or "")
             # rebuild provider list options if models changed
             current = prov
             providers = sorted({m.provider for m in self.models})
-            # only rebuild when set of providers differs
             existing = []
             for i in range(self.model_provider_filter.count()):
                 existing.append(str(self.model_provider_filter.itemData(i) or ""))
@@ -2074,48 +2175,79 @@ class MainWindow(FeatureMixin, QMainWindow):
                 self.model_provider_filter.addItem("全部 Provider", "")
                 for p in providers:
                     self.model_provider_filter.addItem(p, p)
-                # restore selection
                 idx = self.model_provider_filter.findData(current)
                 self.model_provider_filter.setCurrentIndex(idx if idx >= 0 else 0)
                 self.model_provider_filter.blockSignals(False)
                 prov = str(self.model_provider_filter.currentData() or "")
 
-        rows = []
+        rows: list[core.ModelInfo] = []
         for m in self.models:
             if prov and m.provider != prov:
+                continue
+            if only_fav and m.key not in fav_set:
                 continue
             if q and q not in m.key.lower() and q not in m.provider.lower() and q not in m.model.lower():
                 continue
             rows.append(m)
 
+        # 默认模型置顶，其次收藏，再按 provider + model 名
+        def _sort_key(m: core.ModelInfo) -> tuple:
+            is_def = 0 if m.key == default_key else 1
+            is_fav = 0 if m.key in fav_set else 1
+            return (is_def, is_fav, m.provider.lower(), m.model.lower())
+
+        rows.sort(key=_sort_key)
+
+        # 选中单一 Provider 时隐藏 Provider 列，减少重复
+        hide_provider_col = bool(prov)
+        if self.models_table.columnCount() >= 2:
+            self.models_table.setColumnHidden(1, hide_provider_col)
+
         self.models_table.setRowCount(len(rows))
         for i, m in enumerate(rows):
-            name_item = QTableWidgetItem(f"{m.provider} / {m.model}")
+            is_default = m.key == default_key
+            is_fav = m.key in fav_set
+            prefix = ""
+            if is_default:
+                prefix += "● "
+            if is_fav:
+                prefix += "★ "
+            name_item = QTableWidgetItem(f"{prefix}{m.model}")
             name_item.setData(Qt.UserRole, [m.provider, m.model])
-            name_item.setToolTip(m.key)
+            tip_bits = [m.key]
+            if is_default:
+                tip_bits.append("当前默认")
+            if is_fav:
+                tip_bits.append("已收藏")
+            name_item.setToolTip(" · ".join(tip_bits))
+            if is_default:
+                name_item.setForeground(QColor("#60a5fa"))
             self.models_table.setItem(i, 0, name_item)
-            self.models_table.setItem(i, 1, QTableWidgetItem(self._model_capability_text(m)))
-            res = self.test_results.get(m.key)
-            if not res:
-                self.models_table.setItem(i, 2, QTableWidgetItem("—"))
-                self.models_table.setItem(i, 3, QTableWidgetItem("—"))
-            elif res.get("pending"):
-                self.models_table.setItem(i, 2, QTableWidgetItem("测试中…"))
-                self.models_table.setItem(i, 3, QTableWidgetItem("…"))
-            else:
-                if res.get("available") is True:
-                    avail = "可用"
-                elif res.get("available") is False:
-                    avail = "不可用"
-                else:
-                    avail = "—"
-                self.models_table.setItem(i, 2, QTableWidgetItem(avail))
-                lat = res.get("latency_ms")
-                lat_s = f"{lat:.0f} ms" if isinstance(lat, (int, float)) else "—"
-                self.models_table.setItem(i, 3, QTableWidgetItem(lat_s))
+
+            prov_item = QTableWidgetItem(m.provider)
+            prov_item.setToolTip(m.provider)
+            prov_item.setForeground(QColor("#8b98a8"))
+            self.models_table.setItem(i, 1, prov_item)
+
+            cap = QTableWidgetItem(self._model_capability_text(m))
+            cap.setToolTip(
+                f"context={m.context or '-'}  thinking={m.thinking or '-'}  images={m.images or '-'}"
+            )
+            self.models_table.setItem(i, 2, cap)
+
+            st, lat_item = self._model_status_cells(m)
+            self.models_table.setItem(i, 3, st)
+            self.models_table.setItem(i, 4, lat_item)
+
         if hasattr(self, "models_count_lbl"):
             total = len(self.models)
-            self.models_count_lbl.setText(f"显示 {len(rows)} / 共 {total} 个模型")
+            fav_n = sum(1 for m in self.models if m.key in fav_set)
+            extra = f" · 收藏 {fav_n}"
+            if only_fav:
+                extra += " · 仅收藏"
+            if prov:
+                extra += f" · {prov}"
+            self.models_count_lbl.setText(f"显示 {len(rows)} / 共 {total}{extra}")
 
     def refresh_providers(self):
         cfg = core.load_models_config()
@@ -2125,6 +2257,10 @@ class MainWindow(FeatureMixin, QMainWindow):
             self.provider_list.addItem(name)
         safe_cfg = core.redact_sensitive_config(cfg)
         self.provider_detail.setPlainText(json.dumps(safe_cfg, ensure_ascii=False, indent=2) if providers else "（暂无自定义 provider）")
+        try:
+            self.refresh_chat_model_choices()
+        except Exception:
+            pass
 
     def on_provider_selected(self, cur: QListWidgetItem | None, _prev):
         if not cur:
@@ -2139,13 +2275,64 @@ class MainWindow(FeatureMixin, QMainWindow):
         if hasattr(self, "session_filter_wd"):
             self.sessions_apply_filter()
             return
-        rows = core.list_sessions()
+        self._fill_sessions_table(core.list_sessions())
+
+    def _session_path_at(self, row: int) -> str | None:
+        item = self.sessions_table.item(row, 0)
+        if not item:
+            # 兼容旧 3 列布局：路径在第 2 列
+            legacy = self.sessions_table.item(row, 2)
+            return legacy.text() if legacy else None
+        data = item.data(Qt.UserRole)
+        if data:
+            return str(data)
+        legacy = self.sessions_table.item(row, 2)
+        return legacy.text() if legacy else None
+
+    def _session_cwd_at(self, row: int) -> str | None:
+        item = self.sessions_table.item(row, 0)
+        if item:
+            cwd = item.data(Qt.UserRole + 1)
+            if cwd:
+                return str(cwd)
+        # 工作目录列
+        wd = self.sessions_table.item(row, 1)
+        return wd.text() if wd and wd.text() else None
+
+    def _fill_sessions_table(self, rows: list[dict[str, str]]) -> None:
         self.sessions_table.setRowCount(len(rows))
         for i, r in enumerate(rows):
-            self.sessions_table.setItem(i, 0, QTableWidgetItem(r["name"]))
-            self.sessions_table.setItem(i, 1, QTableWidgetItem(r["folder"]))
-            self.sessions_table.setItem(i, 2, QTableWidgetItem(r["path"]))
+            project = r.get("project") or core._project_name_from_path(r.get("cwd") or r.get("folder") or "")
+            cwd = r.get("cwd") or r.get("folder") or ""
+            model = r.get("model") or "—"
+            when = r.get("started") or r.get("mtime_text") or ""
+            preview = r.get("preview") or ""
+            path = r.get("path") or ""
 
+            proj_item = QTableWidgetItem(project)
+            proj_item.setData(Qt.UserRole, path)
+            proj_item.setData(Qt.UserRole + 1, cwd)
+            tip = f"项目: {project}\n目录: {cwd}\n文件: {path}"
+            if r.get("session_id"):
+                tip += f"\nID: {r.get('session_id')}"
+            proj_item.setToolTip(tip)
+            self.sessions_table.setItem(i, 0, proj_item)
+
+            cwd_item = QTableWidgetItem(cwd)
+            cwd_item.setToolTip(cwd)
+            self.sessions_table.setItem(i, 1, cwd_item)
+
+            model_item = QTableWidgetItem(model)
+            model_item.setToolTip(model)
+            self.sessions_table.setItem(i, 2, model_item)
+
+            time_item = QTableWidgetItem(when)
+            time_item.setToolTip(when)
+            self.sessions_table.setItem(i, 3, time_item)
+
+            prev_item = QTableWidgetItem(preview or r.get("name") or "")
+            prev_item.setToolTip(preview or r.get("name") or path)
+            self.sessions_table.setItem(i, 4, prev_item)
 
     def launch_default(self):
         provider, model, thinking = core.get_default_model()
@@ -2180,6 +2367,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         core.set_default_model(m.provider, m.model, self.thinking_combo.currentText())
         self.refresh_dashboard()
         self.settings_load()
+        self.fill_models_table()
         self.status.showMessage(f"默认模型已切换为 {m.key}")
 
     def model_add_favorite(self):
@@ -2197,6 +2385,7 @@ class MainWindow(FeatureMixin, QMainWindow):
             self.mgr["favorites"] = favs
             self.persist_mgr()
             self.fill_favorites()
+            self.fill_models_table()
         self.status.showMessage(f"已收藏 {m.key}")
 
     def model_launch(self):
@@ -2239,6 +2428,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.mgr["favorites"] = [x for x in (self.mgr.get("favorites") or []) if x != key]
         self.persist_mgr()
         self.fill_favorites()
+        self.fill_models_table()
 
     def _apply_favorite(self, key: str, launch: bool):
         if "/" not in key:
@@ -2247,6 +2437,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         core.set_default_model(provider, model, self.thinking_combo.currentText())
         self.refresh_dashboard()
         self.settings_load()
+        self.fill_models_table()
         self.status.showMessage(f"已切换到 {key}")
         if launch:
             self._launch(provider, model, self.thinking_combo.currentText())
@@ -2331,17 +2522,139 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.refresh_providers()
         self.refresh_models()
 
+    def _chat_combo_text(self, combo: QComboBox | None) -> str:
+        if combo is None:
+            return ""
+        try:
+            return (combo.currentText() or "").strip()
+        except Exception:
+            return ""
+
+    def _set_chat_combo_text(self, combo: QComboBox | None, text: str) -> None:
+        if combo is None:
+            return
+        text = (text or "").strip()
+        if not text:
+            combo.setCurrentIndex(-1)
+            combo.setEditText("")
+            return
+        idx = combo.findText(text)
+        if idx < 0:
+            combo.addItem(text)
+            idx = combo.findText(text)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.setEditText(text)
+
+    def refresh_chat_model_choices(self) -> None:
+        """用当前 models 列表填充快速提问的 Provider / Model 下拉。"""
+        if not hasattr(self, "chat_provider") or not isinstance(self.chat_provider, QComboBox):
+            return
+        cur_p = self._chat_combo_text(self.chat_provider)
+        cur_m = self._chat_combo_text(self.chat_model)
+
+        providers = sorted({m.provider for m in (self.models or []) if m.provider})
+        # 也并入 models.json 自定义 providers（即使尚未 list-models）
+        try:
+            cfg = core.load_models_config()
+            for name in (cfg.get("providers") or {}):
+                if name and name not in providers:
+                    providers.append(str(name))
+            providers = sorted(set(providers))
+        except Exception:
+            pass
+
+        self.chat_provider.blockSignals(True)
+        self.chat_provider.clear()
+        for p in providers:
+            self.chat_provider.addItem(p)
+        self.chat_provider.blockSignals(False)
+
+        if cur_p:
+            self._set_chat_combo_text(self.chat_provider, cur_p)
+        elif providers:
+            # 默认选中当前默认 provider
+            try:
+                dp, _, _ = core.get_default_model()
+            except Exception:
+                dp = ""
+            self._set_chat_combo_text(self.chat_provider, dp or providers[0])
+
+        self._reload_chat_models_for_provider(self._chat_combo_text(self.chat_provider), prefer_model=cur_m)
+
+    def _on_chat_provider_changed(self, _text: str = "") -> None:
+        if not hasattr(self, "chat_model") or not isinstance(self.chat_model, QComboBox):
+            return
+        prefer = self._chat_combo_text(self.chat_model)
+        self._reload_chat_models_for_provider(self._chat_combo_text(self.chat_provider), prefer_model=prefer)
+
+    def _reload_chat_models_for_provider(self, provider: str, prefer_model: str = "") -> None:
+        if not hasattr(self, "chat_model") or not isinstance(self.chat_model, QComboBox):
+            return
+        provider = (provider or "").strip()
+        models: list[str] = []
+        for m in self.models or []:
+            if not provider or m.provider == provider:
+                if m.model and m.model not in models:
+                    models.append(m.model)
+        # models.json 兜底
+        if not models and provider:
+            try:
+                cfg = core.load_models_config()
+                pdata = (cfg.get("providers") or {}).get(provider) or {}
+                for item in pdata.get("models") or []:
+                    mid = ""
+                    if isinstance(item, dict):
+                        mid = str(item.get("id") or item.get("model") or "")
+                    elif isinstance(item, str):
+                        mid = item
+                    if mid and mid not in models:
+                        models.append(mid)
+            except Exception:
+                pass
+
+        self.chat_model.blockSignals(True)
+        self.chat_model.clear()
+        for mid in models:
+            self.chat_model.addItem(mid)
+        self.chat_model.blockSignals(False)
+
+        if prefer_model and (not provider or any(m.provider == provider and m.model == prefer_model for m in (self.models or [])) or prefer_model in models):
+            self._set_chat_combo_text(self.chat_model, prefer_model)
+        elif models:
+            try:
+                dp, dm, _ = core.get_default_model()
+            except Exception:
+                dp, dm = "", ""
+            if provider and dp == provider and dm in models:
+                self._set_chat_combo_text(self.chat_model, dm)
+            else:
+                self._set_chat_combo_text(self.chat_model, models[0])
+        else:
+            self.chat_model.setEditText(prefer_model or "")
+
     def chat_fill_default(self):
         p, m, _t = core.get_default_model()
-        self.chat_provider.setText(p)
-        self.chat_model.setText(m)
+        if hasattr(self, "chat_provider") and isinstance(self.chat_provider, QComboBox):
+            # 确保下拉有数据
+            if self.chat_provider.count() == 0:
+                self.refresh_chat_model_choices()
+            self._set_chat_combo_text(self.chat_provider, p)
+            self._reload_chat_models_for_provider(p, prefer_model=m)
+            self._set_chat_combo_text(self.chat_model, m)
+        else:
+            # 旧控件兼容
+            try:
+                self.chat_provider.setText(p)
+                self.chat_model.setText(m)
+            except Exception:
+                pass
 
     def chat_send(self):
         prompt = self.chat_input.toPlainText().strip()
         if not prompt:
             return
-        provider = self.chat_provider.text().strip() or None
-        model = self.chat_model.text().strip() or None
+        provider = self._chat_combo_text(self.chat_provider) or None
+        model = self._chat_combo_text(self.chat_model) or None
         workdir = self.workdir_edit.text().strip() or str(core.user_home())
         self.chat_output.appendPlainText(f"\n>>> {prompt}\n…请求中，请稍候…\n")
         self.status.showMessage("Pi 快速提问运行中…")
@@ -2380,18 +2693,37 @@ class MainWindow(FeatureMixin, QMainWindow):
         rows = self.sessions_table.selectionModel().selectedRows()
         if not rows:
             return
-        path = self.sessions_table.item(rows[0].row(), 2).text()
-        core.open_in_explorer(path)
+        path = self._session_path_at(rows[0].row())
+        if path:
+            core.open_in_explorer(path)
+
+    def session_open_project(self):
+        rows = self.sessions_table.selectionModel().selectedRows()
+        if not rows:
+            QMessageBox.information(self, "提示", "请先选择会话")
+            return
+        cwd = self._session_cwd_at(rows[0].row())
+        if not cwd:
+            QMessageBox.information(self, "提示", "无法解析该会话的项目目录")
+            return
+        p = Path(cwd)
+        if not p.exists():
+            QMessageBox.warning(self, "目录不存在", f"项目目录不存在：\n{cwd}")
+            return
+        core.open_path(str(p))
 
     def session_continue(self):
         rows = self.sessions_table.selectionModel().selectedRows()
         if not rows:
             return
-        path = self.sessions_table.item(rows[0].row(), 2).text()
+        path = self._session_path_at(rows[0].row())
+        if not path:
+            return
+        cwd = self._session_cwd_at(rows[0].row()) or self.workdir_edit.text().strip() or str(core.user_home())
         self.persist_mgr()
         try:
             cmd = core.launch_pi_interactive(
-                self.workdir_edit.text().strip() or str(core.user_home()),
+                cwd,
                 terminal=str(self.terminal_combo.currentData() or self.terminal_combo.currentText() or "auto"),
                 extra=["--session", path],
             )

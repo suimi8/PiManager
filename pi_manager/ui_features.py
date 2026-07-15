@@ -753,8 +753,13 @@ class FeatureMixin:
         if not rows:
             return None
         r = rows[0].row()
-        item = self.sessions_table.item(r, 2)
-        return item.text() if item else None
+        if hasattr(self, "_session_path_at"):
+            return self._session_path_at(r)
+        item = self.sessions_table.item(r, 0)
+        if item and item.data(Qt.UserRole):
+            return str(item.data(Qt.UserRole))
+        legacy = self.sessions_table.item(r, 2)
+        return legacy.text() if legacy else None
 
     def session_delete(self):
         path = self.session_selected_path()
@@ -788,11 +793,14 @@ class FeatureMixin:
         wd = self.session_filter_wd.text().strip() if hasattr(self, "session_filter_wd") else ""
         nm = self.session_filter_name.text().strip() if hasattr(self, "session_filter_name") else ""
         rows = extras.list_sessions_filtered(limit=100, workdir_substr=wd, name_substr=nm)
+        if hasattr(self, "_fill_sessions_table"):
+            self._fill_sessions_table(rows)
+            return
         self.sessions_table.setRowCount(len(rows))
         for i, r in enumerate(rows):
-            self.sessions_table.setItem(i, 0, QTableWidgetItem(r["name"]))
-            self.sessions_table.setItem(i, 1, QTableWidgetItem(r["folder"]))
-            self.sessions_table.setItem(i, 2, QTableWidgetItem(r["path"]))
+            self.sessions_table.setItem(i, 0, QTableWidgetItem(r.get("project") or r.get("name") or ""))
+            self.sessions_table.setItem(i, 1, QTableWidgetItem(r.get("cwd") or r.get("folder") or ""))
+            self.sessions_table.setItem(i, 2, QTableWidgetItem(r.get("model") or r.get("path") or ""))
 
     # ---- chat multi-turn (context via prompt assembly) ----
     def chat_clear_history(self):
@@ -805,8 +813,14 @@ class FeatureMixin:
         prompt = self.chat_input.toPlainText().strip()
         if not prompt:
             return
-        provider = self.chat_provider.text().strip() or None
-        model = self.chat_model.text().strip() or None
+        if hasattr(self, "_chat_combo_text"):
+            provider = self._chat_combo_text(self.chat_provider) or None
+            model = self._chat_combo_text(self.chat_model) or None
+        else:
+            provider = self.chat_provider.currentText().strip() if hasattr(self.chat_provider, "currentText") else self.chat_provider.text().strip()
+            model = self.chat_model.currentText().strip() if hasattr(self.chat_model, "currentText") else self.chat_model.text().strip()
+            provider = provider or None
+            model = model or None
         # assemble short history context
         history_lines = []
         for turn in self.chat_history[-6:]:

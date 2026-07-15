@@ -545,6 +545,111 @@ def run_pi_print(
     return p.returncode, p.stdout or "", p.stderr or ""
 
 
+def _decode_session_folder_slug(slug: str) -> str:
+    """Pi 将 cwd 编码为目录名，如 --C--Users-suimi-Desktop-app-- → C:\\Users\\suimi\\Desktop\\app。"""
+    s = (slug or "").strip()
+    if not s or s in {".", ""}:
+        return s
+    # Windows: --C--Users-suimi-Desktop-app--
+    m = re.match(r"^--([A-Za-z])--(.+)--$", s)
+    if m:
+        drive = m.group(1).upper()
+        rest = m.group(2).replace("-", "\\")
+        return f"{drive}:\\{rest}"
+    # 退化：去掉两侧 --
+    if s.startswith("--") and s.endswith("--") and len(s) > 4:
+        body = s[2:-2]
+        return "/" + body.replace("-", "/")
+    return s
+
+
+def _project_name_from_path(path_str: str) -> str:
+    p = Path(path_str or "")
+    name = p.name.strip() if str(p) else ""
+    if name:
+        return name
+    # Windows 根目录 C:\
+    s = str(path_str or "").rstrip("\\/")
+    return s or "（未知项目）"
+
+
+def _parse_session_meta(path: Path) -> dict[str, str]:
+    """从 session jsonl 头部提取 cwd / model / 首条用户消息摘要。"""
+    meta: dict[str, str] = {
+        "cwd": "",
+        "project": "",
+        "model": "",
+        "provider": "",
+        "preview": "",
+        "session_id": "",
+        "started": "",
+    }
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i > 120:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                t = str(obj.get("type") or "")
+                if t == "session":
+                    cwd = str(obj.get("cwd") or "").strip()
+                    if cwd:
+                        meta["cwd"] = cwd
+                        meta["project"] = _project_name_from_path(cwd)
+                    sid = str(obj.get("id") or "").strip()
+                    if sid:
+                        meta["session_id"] = sid
+                    ts = str(obj.get("timestamp") or "").strip()
+                    if ts:
+                        meta["started"] = ts
+                elif t == "model_change":
+                    provider = str(obj.get("provider") or "").strip()
+                    model_id = str(obj.get("modelId") or obj.get("model") or "").strip()
+                    if provider:
+                        meta["provider"] = provider
+                    if provider and model_id:
+                        meta["model"] = f"{provider}/{model_id}"
+                    elif model_id:
+                        meta["model"] = model_id
+                elif t == "message" and not meta["preview"]:
+                    # Pi jsonl: {"type":"message","message":{"role":"user","content":[...]}}
+                    msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+                    role = str(msg.get("role") or obj.get("role") or "").lower()
+                    if role and role not in {"user", "human"}:
+                        continue
+                    text = ""
+                    content = msg.get("content")
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list):
+                        bits = []
+                        for part in content:
+                            if isinstance(part, dict):
+                                if part.get("type") in {"text", "input_text", None} and part.get("text"):
+                                    bits.append(str(part.get("text")))
+                            elif isinstance(part, str):
+                                bits.append(part)
+                        text = " ".join(bits)
+                    elif isinstance(msg.get("text"), str):
+                        text = str(msg.get("text"))
+                    text = re.sub(r"\s+", " ", text).strip()
+                    if text:
+                        meta["preview"] = text[:80] + ("…" if len(text) > 80 else "")
+                if meta["cwd"] and meta["model"] and meta["preview"]:
+                    break
+    except OSError:
+        pass
+    return meta
+
+
 def list_sessions(limit: int = 50) -> list[dict[str, str]]:
     root = sessions_dir()
     if not root.exists():
@@ -555,7 +660,6 @@ def list_sessions(limit: int = 50) -> list[dict[str, str]]:
             files.append(p)
         elif p.is_file() and "session" in p.name.lower():
             files.append(p)
-    # also include any files
     if not files:
         files = [p for p in root.rglob("*") if p.is_file()]
     files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
@@ -563,13 +667,38 @@ def list_sessions(limit: int = 50) -> list[dict[str, str]]:
     for p in files[:limit]:
         try:
             st = p.stat()
+            folder_slug = str(p.parent.relative_to(root)) if p.parent != root else "."
+            meta = _parse_session_meta(p)
+            cwd = meta.get("cwd") or _decode_session_folder_slug(folder_slug)
+            project = meta.get("project") or _project_name_from_path(cwd)
+            # 时间展示
+            from datetime import datetime
+
+            try:
+                mtime_s = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                mtime_s = ""
+            started = meta.get("started") or ""
+            if started.endswith("Z") and "T" in started:
+                try:
+                    started = started.replace("T", " ")[:16]
+                except Exception:
+                    pass
             rows.append(
                 {
                     "path": str(p),
                     "name": p.name,
-                    "folder": str(p.parent.relative_to(root)) if p.parent != root else ".",
+                    "folder": folder_slug,
                     "mtime": str(st.st_mtime),
+                    "mtime_text": mtime_s,
+                    "started": started or mtime_s,
                     "size": str(st.st_size),
+                    "cwd": cwd,
+                    "project": project,
+                    "model": meta.get("model") or "",
+                    "provider": meta.get("provider") or "",
+                    "preview": meta.get("preview") or "",
+                    "session_id": meta.get("session_id") or "",
                 }
             )
         except OSError:
