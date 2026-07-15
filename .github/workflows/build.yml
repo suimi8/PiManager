@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version label (e.g. 1.6.2)"
+        description: "Release version label (e.g. 1.6.3)"
         required: true
-        default: "1.6.2"
+        default: "1.6.3"
       upload_to_release:
-        description: "Existing GitHub Release tag to upload into (e.g. v1.6.2). Leave empty for artifacts only."
+        description: "Existing GitHub Release tag to upload into (e.g. v1.6.3). Leave empty for artifacts only."
         required: false
         default: ""
   push:
@@ -89,7 +89,7 @@ jobs:
           elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=1.6.2" >> "$GITHUB_OUTPUT"
+            echo "version=1.6.3" >> "$GITHUB_OUTPUT"
           fi
 
       - name: PyInstaller (directory / app)
@@ -152,7 +152,7 @@ jobs:
           mkdir -p release-assets
           npm install -g @vscode/vsce
           cd extensions/pi-cursor
-          vsce package --allow-missing-repository --out ../../release-assets/pi-manager-pi-cursor-0.2.0.vsix
+          vsce package --allow-missing-repository --out ../../release-assets/pi-manager-pi-cursor-0.3.0.vsix
           ls -lah ../../release-assets
       - uses: actions/upload-artifact@v4
         with:

@@ -18,10 +18,14 @@ from . import core
 from . import secrets as secretstore
 from . import storage
 
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 APP_NAME = "Pi Manager"
 # Optional remote version manifest (JSON: {"version":"x.y.z","notes":"...","url":"..."})
+# 未配置时自动回退 GitHub Releases API
 UPDATE_MANIFEST_URL = ""  # user can set in manager config
+GITHUB_REPO = "suimi8/PiManager"
+GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 
 
 def history_path() -> Path:
@@ -672,45 +676,137 @@ def run_self_check() -> list[dict[str, Any]]:
     return checks
 
 
+def _http_get_json(url: str, *, timeout: int = 15) -> dict[str, Any]:
+    import urllib.request
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": f"PiManager/{APP_VERSION}",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+    data = json.loads(body)
+    return data if isinstance(data, dict) else {}
+
+
+def _pick_release_asset(assets: list[dict[str, Any]]) -> dict[str, str]:
+    """按当前平台挑选推荐下载资源。"""
+    import sys
+
+    names = [(str(a.get("name") or ""), str(a.get("browser_download_url") or "")) for a in assets]
+    names = [(n, u) for n, u in names if n and u]
+    prefer: list[str] = []
+    if sys.platform == "win32":
+        prefer = ["windows-x64-dir.zip", "windows-x64-onefile.zip", "windows"]
+    elif sys.platform == "darwin":
+        # Apple Silicon 优先 arm64，否则任意 macos
+        prefer = ["macos-arm64.zip", "macos-x64.zip", "macos"]
+    else:
+        prefer = ["linux-x64.tar.gz", "linux"]
+    for key in prefer:
+        for n, u in names:
+            if key in n.lower():
+                return {"name": n, "url": u}
+    if names:
+        return {"name": names[0][0], "url": names[0][1]}
+    return {"name": "", "url": ""}
+
+
 def check_manager_update() -> dict[str, Any]:
-    """Check remote manifest if configured; always returns local version."""
+    """检查 Pi Manager 自身更新。
+
+    优先级：
+    1. manager 配置 / 常量中的 update_manifest_url（自定义 JSON）
+    2. GitHub Releases latest API（默认，无需用户配置）
+    """
     cfg = core.load_manager_config()
     url = str(cfg.get("update_manifest_url") or UPDATE_MANIFEST_URL or "").strip()
     local = APP_VERSION
-    result = {
+    result: dict[str, Any] = {
         "ok": True,
         "local": local,
         "remote": None,
         "has_update": False,
         "notes": "",
-        "url": url,
+        "url": url or GITHUB_RELEASES_PAGE,
+        "download": "",
+        "asset_name": "",
+        "source": "",
         "message": f"当前版本 {local}",
     }
     cfg["last_manager_update_check"] = datetime.now().isoformat(timespec="seconds")
     core.save_manager_config(cfg)
-    if not url:
-        result["message"] = f"当前版本 {local}（未配置 update_manifest_url，跳过远程检查）"
-        return result
-    try:
-        import urllib.request
 
-        req = urllib.request.Request(url, headers={"User-Agent": f"PiManager/{local}"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-        data = json.loads(body)
-        remote = str(data.get("version") or "")
-        result["remote"] = remote
-        result["notes"] = str(data.get("notes") or "")
-        result["download"] = data.get("url") or data.get("download") or ""
+    try:
+        if url:
+            data = _http_get_json(url)
+            remote = str(data.get("version") or "").lstrip("vV")
+            result["source"] = "manifest"
+            result["remote"] = remote
+            result["notes"] = str(data.get("notes") or "")
+            result["download"] = str(data.get("url") or data.get("download") or "")
+            result["url"] = result["download"] or url
+        else:
+            data = _http_get_json(GITHUB_RELEASES_API)
+            tag = str(data.get("tag_name") or data.get("name") or "").strip()
+            remote = tag.lstrip("vV")
+            result["source"] = "github"
+            result["remote"] = remote
+            result["notes"] = str(data.get("body") or "")[:2000]
+            result["url"] = str(data.get("html_url") or GITHUB_RELEASES_PAGE)
+            assets = data.get("assets") if isinstance(data.get("assets"), list) else []
+            picked = _pick_release_asset([a for a in assets if isinstance(a, dict)])
+            result["download"] = picked.get("url") or result["url"]
+            result["asset_name"] = picked.get("name") or ""
+
+        remote = str(result.get("remote") or "")
         if remote and core.parse_semver(remote) > core.parse_semver(local):
             result["has_update"] = True
-            result["message"] = f"发现新版本 {remote}（当前 {local}）"
+            asset = result.get("asset_name") or ""
+            extra = f" · 推荐包 {asset}" if asset else ""
+            result["message"] = f"发现新版本 v{remote}（当前 v{local}）{extra}"
+        elif remote:
+            result["message"] = f"已是最新（本地 v{local}，远程 v{remote}）"
         else:
-            result["message"] = f"已是最新（本地 {local}，远程 {remote or '—'}）"
+            result["message"] = f"当前版本 v{local}（未能解析远程版本号）"
     except Exception as e:
         result["ok"] = False
         result["message"] = f"检查失败：{e}"
     return result
+
+
+def download_manager_update(download_url: str, dest_dir: str | Path | None = None) -> dict[str, Any]:
+    """下载更新包到目录（默认 ~/Downloads/PiManager-updates）。不自动覆盖正在运行的程序。"""
+    import urllib.request
+
+    download_url = (download_url or "").strip()
+    if not download_url:
+        raise ValueError("无下载地址")
+    dest_root = Path(dest_dir) if dest_dir else (Path.home() / "Downloads" / "PiManager-updates")
+    dest_root.mkdir(parents=True, exist_ok=True)
+    name = download_url.rstrip("/").split("/")[-1] or f"PiManager-update-{APP_VERSION}"
+    # 去掉 query
+    name = name.split("?", 1)[0]
+    target = dest_root / name
+    req = urllib.request.Request(
+        download_url,
+        headers={"User-Agent": f"PiManager/{APP_VERSION}"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp, target.open("wb") as f:
+        while True:
+            chunk = resp.read(1024 * 256)
+            if not chunk:
+                break
+            f.write(chunk)
+    return {
+        "ok": True,
+        "path": str(target),
+        "dir": str(dest_root),
+        "message": f"已下载到 {target}",
+    }
 
 
 def load_health() -> dict[str, Any]:

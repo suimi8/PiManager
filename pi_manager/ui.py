@@ -2853,13 +2853,18 @@ class MainWindow(FeatureMixin, QMainWindow):
         # first-run wizard
         if not core.is_setup_done():
             self.open_setup_wizard(force=True)
-        # update check
+        # update check：官方 Pi CLI + Pi Manager 自身
         cfg = core.load_manager_config()
         if cfg.get("auto_check_update", True):
             w = self._track(Worker(core.needs_pi_install_or_update))
             w.done.connect(self._on_update_status)
-            w.failed.connect(lambda e: self.status.showMessage(f"检查更新失败: {e}"))
+            w.failed.connect(lambda e: self.status.showMessage(f"检查 Pi 更新失败: {e}"))
             w.start()
+            # Manager 自身：静默检查，有新版本再弹窗
+            try:
+                self.check_manager_update(silent=True)
+            except Exception:
+                pass
 
     def _on_update_status(self, st: dict):
         self.status.showMessage(st.get("message") or "")

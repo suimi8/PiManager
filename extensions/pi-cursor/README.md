@@ -1,27 +1,29 @@
-# Pi for Cursor
+# Pi Coding Agent（Cursor / VS Code 扩展）
 
-在 Cursor 中启动官方 Pi Coding Agent 终端会话。
+在 Cursor 中启动官方 Pi，并**热切换** `~/.pi/agent/settings.json` 中的默认 Provider / 模型。
 
-## 命令
+## 功能
 
-- `Pi: 用默认模型启动`（快捷键 Ctrl+Alt+P）
-- `Pi: 在终端启动完整会话`
-- `Pi: 快速提问 (pi -p)`
-- `Pi: 打开配置目录`
-- `Pi: 检查版本`
+- 侧栏 **Pi Manager** Webview：Provider / Model 下拉、收藏一键设默认、启动 Pi
+- 命令面板 / 快捷键切换默认模型（写 settings，下次启动生效）
+- 状态栏显示当前默认模型，点击即可切换
+- 终端启动完整 Pi 会话；快速提问 `pi -p`
+- 支持 Pi Manager 安全密钥 helper（`pi.providerEnvCommand`）
 
-## 依赖
+## 快捷键
 
-需已安装：`npm install -g @earendil-works/pi-coding-agent`
+| 快捷键 | 作用 |
+|--------|------|
+| `Ctrl+Alt+P` / `Cmd+Alt+P` | 用默认模型启动 Pi |
+| `Ctrl+Alt+M` / `Cmd+Alt+M` | 切换默认 Provider/模型 |
+| `Ctrl+Alt+Shift+P` / `Cmd+Alt+Shift+P` | 打开侧栏管理面板 |
 
-## Pi Manager 安全密钥
+## 热切换说明
 
-扩展会在相邻的 `pi-manager` 源码目录中自动发现环境 helper，并把所选 Provider 的密钥仅注入新终端环境。若扩展与 Pi Manager 不在相邻目录，请设置：
+- **能做的**：立即改写 `settings.json` 的 `defaultProvider` / `defaultModel`（可选同步 `enabledModels`）
+- **不能做的**：无法注入已在运行的 Pi 交互会话内部状态；已开会话需在 Pi 内 `Ctrl+P` 循环，或重新启动会话
+- 模型列表来源：`pi-manager.json` 收藏、`settings.enabledModels`、`models.json` providers
 
-```text
-pi.providerEnvCommand = python C:\path\to\pi-manager\main.py --print-provider-env
-```
+## 安装
 
-打包版可配置为：`C:\path\to\PiManager.exe --print-provider-env`。
-
-使用 Pi Manager 安全密钥但 helper 不可用时，扩展会停止启动并显示错误，避免以无效占位符请求接口而返回 401。
+从 [PiManager Releases](https://github.com/suimi8/PiManager/releases) 下载 `pi-manager-pi-cursor-*.vsix`，在 Cursor 中 “Install from VSIX”。

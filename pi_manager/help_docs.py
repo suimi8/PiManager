@@ -7,7 +7,7 @@ import re
 
 HELP_MARKDOWN = r'''# Pi Manager 使用教程与常见问题
 
-> 版本 1.6.2 · 跨平台 GUI 管理官方 Pi Coding Agent（Windows / macOS / Linux）  
+> 版本 1.6.3 · 跨平台 GUI 管理官方 Pi Coding Agent（Windows / macOS / Linux）  
 > 完整 agent 能力始终由官方 `pi` 提供，本工具负责配置、切换、测试与启动。
 
 ---

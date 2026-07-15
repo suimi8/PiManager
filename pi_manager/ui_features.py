@@ -419,19 +419,27 @@ class FeatureMixin:
         box3 = QGroupBox("Pi Manager 更新")
         l3 = QVBoxLayout(box3)
         l3.setSpacing(10)
-        self.mgr_version_lbl = QLabel(f"当前版本：{extras.APP_VERSION}")
+        self.mgr_version_lbl = QLabel(f"当前版本：v{extras.APP_VERSION}")
         l3.addWidget(self.mgr_version_lbl)
+        tip_upd = QLabel(
+            "默认从 GitHub Releases 检查更新；也可自定义版本清单 URL（JSON: version/notes/url）。"
+            "检测到新版本可下载安装包，需手动替换运行中的程序。"
+        )
+        tip_upd.setObjectName("subtitle")
+        tip_upd.setWordWrap(True)
+        l3.addWidget(tip_upd)
         row = QHBoxLayout()
         row.setSpacing(8)
         self.update_url_edit = QLineEdit(str((self.mgr or {}).get("update_manifest_url") or ""))
-        self.update_url_edit.setPlaceholderText("可选：版本清单 URL（JSON: version/notes/url）")
+        self.update_url_edit.setPlaceholderText("可选：自定义 manifest URL（留空=GitHub Releases）")
         row.addWidget(self.update_url_edit, 1)
-        row.addWidget(self._btn("检查更新", self.check_manager_update, secondary=True))
+        row.addWidget(self._btn("检查更新", self.check_manager_update, success=True))
         l3.addLayout(row)
         self.update_status = QLabel("")
         self.update_status.setObjectName("subtitle")
         self.update_status.setWordWrap(True)
         l3.addWidget(self.update_status)
+        self._last_manager_update: dict = {}
         layout.addWidget(box3)
         return w
 
@@ -751,27 +759,102 @@ class FeatureMixin:
         )
         self.refresh_providers()
 
-    def check_manager_update(self):
-        url = self.update_url_edit.text().strip() if hasattr(self, "update_url_edit") else ""
-        self.mgr["update_manifest_url"] = url
-        self.persist_mgr()
+    def check_manager_update(self, silent: bool = False):
+        if hasattr(self, "update_url_edit"):
+            url = self.update_url_edit.text().strip()
+            self.mgr["update_manifest_url"] = url
+            self.persist_mgr()
 
         def job():
             return extras.check_manager_update()
 
         w = self._track(self._worker_fn(job))
-        w.done.connect(self._on_mgr_update)
-        w.failed.connect(lambda e: QMessageBox.warning(self, "检查失败", e))
+        w.done.connect(lambda res: self._on_mgr_update(res, silent=silent))
+        w.failed.connect(
+            lambda e: (
+                self.status.showMessage(f"检查更新失败: {e}")
+                if silent
+                else QMessageBox.warning(self, "检查失败", e)
+            )
+        )
         w.start()
 
-    def _on_mgr_update(self, res: dict):
+    def _on_mgr_update(self, res: dict, silent: bool = False):
+        self._last_manager_update = dict(res or {})
         msg = res.get("message") or ""
         if hasattr(self, "update_status"):
             self.update_status.setText(msg)
-        if res.get("has_update"):
-            QMessageBox.information(self, "发现更新", msg + "\n" + str(res.get("notes") or ""))
-        else:
-            QMessageBox.information(self, "更新检查", msg)
+        if hasattr(self, "mgr_version_lbl"):
+            remote = res.get("remote") or ""
+            if remote:
+                self.mgr_version_lbl.setText(
+                    f"当前版本：v{extras.APP_VERSION}  ·  远程：v{remote}"
+                )
+            else:
+                self.mgr_version_lbl.setText(f"当前版本：v{extras.APP_VERSION}")
+        self.status.showMessage(msg)
+
+        if not res.get("has_update"):
+            if not silent:
+                QMessageBox.information(self, "更新检查", msg)
+            return
+
+        notes = str(res.get("notes") or "").strip()
+        notes_short = (notes[:500] + "…") if len(notes) > 500 else notes
+        body = msg
+        if notes_short:
+            body += f"\n\n更新说明：\n{notes_short}"
+        body += "\n\n可下载安装包后手动替换，或打开 Release 页面。"
+
+        box = QMessageBox(self)
+        box.setWindowTitle("发现 Pi Manager 新版本")
+        box.setIcon(QMessageBox.Information)
+        box.setText(body)
+        btn_dl = box.addButton("下载安装包", QMessageBox.AcceptRole)
+        btn_open = box.addButton("打开 Release 页", QMessageBox.ActionRole)
+        box.addButton("稍后", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == btn_dl:
+            self._download_manager_update(res)
+        elif clicked == btn_open:
+            page = str(res.get("url") or extras.GITHUB_RELEASES_PAGE)
+            try:
+                from PySide6.QtGui import QDesktopServices
+                from PySide6.QtCore import QUrl
+
+                QDesktopServices.openUrl(QUrl(page))
+            except Exception:
+                core.open_path(page)
+
+    def _download_manager_update(self, res: dict | None = None):
+        res = res or getattr(self, "_last_manager_update", {}) or {}
+        url = str(res.get("download") or res.get("url") or "").strip()
+        if not url:
+            QMessageBox.information(self, "提示", "没有可用的下载地址")
+            return
+        self.status.showMessage("正在下载更新包…")
+
+        def job():
+            return extras.download_manager_update(url)
+
+        w = self._track(self._worker_fn(job))
+
+        def _done(r: dict):
+            path = str((r or {}).get("path") or "")
+            self.status.showMessage((r or {}).get("message") or "下载完成")
+            ret = QMessageBox.question(
+                self,
+                "下载完成",
+                f"{(r or {}).get('message') or path}\n\n"
+                "请退出 Pi Manager 后解压/替换为新版本。\n是否打开所在文件夹？",
+            )
+            if ret == QMessageBox.Yes and path:
+                core.open_in_explorer(path)
+
+        w.done.connect(_done)
+        w.failed.connect(lambda e: QMessageBox.warning(self, "下载失败", e))
+        w.start()
 
     # ---- sessions extras ----
     def session_selected_path(self) -> str | None:

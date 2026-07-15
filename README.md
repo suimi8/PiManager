@@ -109,7 +109,7 @@ pi.providerEnvCommand = python /path/to/PiManager/main.py --print-provider-env
 python -m pip install -r requirements.txt pyinstaller
 python -m PyInstaller --noconfirm --clean PiManager.spec
 python scripts/smoke_test_dist.py
-python scripts/package_release.py --version 1.6.2
+python scripts/package_release.py --version 1.6.3
 ```
 
 跨平台（Windows / macOS / Linux）推荐用 GitHub Actions：

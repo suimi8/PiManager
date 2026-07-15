@@ -1,17 +1,21 @@
 {
   "name": "pi-cursor",
   "displayName": "Pi Coding Agent",
-  "description": "在 Cursor 中一键启动/使用 Pi Coding Agent（终端完整会话）",
-  "version": "0.2.0",
+  "description": "在 Cursor 中启动 Pi、切换 Provider/模型、快速提问（读取 ~/.pi/agent 配置）",
+  "version": "0.3.0",
   "publisher": "pi-manager",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Other", "AI"],
   "activationEvents": [
+    "onStartupFinished",
     "onCommand:pi.openTerminal",
     "onCommand:pi.openWithDefaultModel",
     "onCommand:pi.askPrompt",
     "onCommand:pi.openConfig",
-    "onCommand:pi.checkVersion"
+    "onCommand:pi.checkVersion",
+    "onCommand:pi.switchModel",
+    "onCommand:pi.openPanel",
+    "onView:pi.managerView"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -40,6 +44,21 @@
         "command": "pi.checkVersion",
         "title": "Pi: 检查版本",
         "category": "Pi"
+      },
+      {
+        "command": "pi.switchModel",
+        "title": "Pi: 切换默认 Provider/模型",
+        "category": "Pi"
+      },
+      {
+        "command": "pi.openPanel",
+        "title": "Pi: 打开管理面板",
+        "category": "Pi"
+      },
+      {
+        "command": "pi.refreshModels",
+        "title": "Pi: 刷新模型列表",
+        "category": "Pi"
       }
     ],
     "keybindings": [
@@ -47,8 +66,36 @@
         "command": "pi.openWithDefaultModel",
         "key": "ctrl+alt+p",
         "mac": "cmd+alt+p"
+      },
+      {
+        "command": "pi.switchModel",
+        "key": "ctrl+alt+m",
+        "mac": "cmd+alt+m"
+      },
+      {
+        "command": "pi.openPanel",
+        "key": "ctrl+alt+shift+p",
+        "mac": "cmd+alt+shift+p"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "pi-manager",
+          "title": "Pi Manager",
+          "icon": "media/pi.svg"
+        }
+      ]
+    },
+    "views": {
+      "pi-manager": [
+        {
+          "type": "webview",
+          "id": "pi.managerView",
+          "name": "模型热切换"
+        }
+      ]
+    },
     "menus": {
       "explorer/context": [
         {
@@ -62,7 +109,22 @@
         { "command": "pi.openWithDefaultModel" },
         { "command": "pi.askPrompt" },
         { "command": "pi.openConfig" },
-        { "command": "pi.checkVersion" }
+        { "command": "pi.checkVersion" },
+        { "command": "pi.switchModel" },
+        { "command": "pi.openPanel" },
+        { "command": "pi.refreshModels" }
+      ],
+      "view/title": [
+        {
+          "command": "pi.refreshModels",
+          "when": "view == pi.managerView",
+          "group": "navigation"
+        },
+        {
+          "command": "pi.openWithDefaultModel",
+          "when": "view == pi.managerView",
+          "group": "navigation"
+        }
       ]
     },
     "configuration": {
@@ -92,6 +154,11 @@
           "type": "string",
           "default": "",
           "description": "Pi Manager 环境 helper 命令，例如 python /path/to/pi-manager/main.py --print-provider-env"
+        },
+        "pi.syncEnabledModelsOnSwitch": {
+          "type": "boolean",
+          "default": true,
+          "description": "切换默认模型时，把收藏列表同步写入 settings.enabledModels（便于 Pi 内 Ctrl+P 循环）"
         }
       }
     }
