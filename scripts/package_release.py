@@ -19,6 +19,14 @@ import zipfile
 from pathlib import Path
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def resolve_repo_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
 def detect_platform() -> str:
     system = platform.system().lower()
     if system == "windows":
@@ -135,8 +143,8 @@ def main() -> int:
     parser.add_argument("--out", default="release-assets")
     args = parser.parse_args()
 
-    dist = Path(args.dist)
-    out = Path(args.out)
+    dist = resolve_repo_path(args.dist)
+    out = resolve_repo_path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     version = args.version
     plat = args.platform.lower()

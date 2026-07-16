@@ -130,6 +130,7 @@ class BatchTestWorker(QThread):
                 max_workers=extras.get_test_concurrency(),
                 on_one=on_one,
                 append_history_each=True,
+                is_cancelled=self.isInterruptionRequested,
             )
             self.done.emit(results)
         except Exception as e:
@@ -340,6 +341,118 @@ class ProviderEditorDialog(QDialog):
         return name, data
 
 
+class ProviderKeysDialog(QDialog):
+    def __init__(self, provider: str, parent=None):
+        super().__init__(parent)
+        self.provider = provider
+        self.setWindowTitle(f"API Keys · {provider}")
+        self.resize(760, 460)
+
+        layout = QVBoxLayout(self)
+        title = QLabel(f"Provider「{provider}」的 API Key 池")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(title)
+
+        hint = QLabel("请求遇到鉴权、限流或额度错误时，会将当前 Key 暂时标记为失效并切换下一把。")
+        hint.setObjectName("subtitle")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["API Key", "状态", "当前", "失败时间", "失败原因"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
+        layout.addWidget(self.table, 1)
+
+        row = QHBoxLayout()
+        add_btn = QPushButton("添加 Key")
+        add_btn.clicked.connect(self.add_key)
+        delete_btn = QPushButton("删除")
+        delete_btn.setProperty("danger", True)
+        delete_btn.clicked.connect(self.delete_key)
+        restore_btn = QPushButton("恢复选中")
+        restore_btn.setProperty("secondary", True)
+        restore_btn.clicked.connect(self.restore_key)
+        restore_all_btn = QPushButton("恢复全部失效 Key")
+        restore_all_btn.setProperty("secondary", True)
+        restore_all_btn.clicked.connect(self.restore_all)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        row.addWidget(add_btn)
+        row.addWidget(delete_btn)
+        row.addWidget(restore_btn)
+        row.addWidget(restore_all_btn)
+        row.addStretch(1)
+        row.addWidget(close_btn)
+        layout.addLayout(row)
+        self.refresh()
+
+    def refresh(self):
+        rows = core.list_provider_api_keys(self.provider)
+        self.table.setRowCount(len(rows))
+        for index, meta in enumerate(rows):
+            key_item = QTableWidgetItem(str(meta.get("masked") or ""))
+            key_item.setData(Qt.UserRole, str(meta.get("id") or ""))
+            self.table.setItem(index, 0, key_item)
+            status = "可用" if meta.get("status") == "available" else "失效"
+            self.table.setItem(index, 1, QTableWidgetItem(status))
+            self.table.setItem(index, 2, QTableWidgetItem("是" if meta.get("active") else ""))
+            self.table.setItem(index, 3, QTableWidgetItem(str(meta.get("failed_at") or "")))
+            reason_item = QTableWidgetItem(str(meta.get("failure_reason") or ""))
+            reason_item.setToolTip(str(meta.get("failure_reason") or ""))
+            self.table.setItem(index, 4, reason_item)
+        if rows:
+            self.table.selectRow(0)
+
+    def selected_key_id(self) -> str:
+        row = self.table.currentRow()
+        item = self.table.item(row, 0) if row >= 0 else None
+        return str(item.data(Qt.UserRole) or "") if item else ""
+
+    def add_key(self):
+        value, ok = QInputDialog.getText(
+            self, "添加 API Key", "API Key：", QLineEdit.Password
+        )
+        if not ok or not value.strip():
+            return
+        try:
+            core.add_provider_api_key(self.provider, value.strip())
+            self.refresh()
+        except Exception as exc:
+            QMessageBox.warning(self, "添加失败", str(exc))
+
+    def delete_key(self):
+        key_id = self.selected_key_id()
+        if not key_id:
+            QMessageBox.information(self, "提示", "请先选择一把 Key")
+            return
+        if QMessageBox.question(self, "确认删除", "确定从 Key 池中永久删除选中的 Key？") != QMessageBox.Yes:
+            return
+        core.remove_provider_api_key(self.provider, key_id)
+        self.refresh()
+
+    def restore_key(self):
+        key_id = self.selected_key_id()
+        if not key_id:
+            QMessageBox.information(self, "提示", "请先选择一把 Key")
+            return
+        core.restore_provider_api_key(self.provider, key_id)
+        self.refresh()
+
+    def restore_all(self):
+        restored = core.restore_all_provider_api_keys(self.provider)
+        self.refresh()
+        QMessageBox.information(self, "恢复完成", f"已恢复 {restored} 把 Key")
+
+
 class FetchModelsDialog(QDialog):
     """Standalone: baseUrl + apiKey -> list models -> save provider."""
 
@@ -519,6 +632,7 @@ class InstallPiDialog(QDialog):
         self.setWindowTitle("安装 / 升级 Pi")
         self.resize(560, 420)
         self._worker = None
+        self.install_succeeded = False
         layout = QVBoxLayout(self)
         tip = QLabel(
             "将通过 npm 全局安装最新版：\n"
@@ -548,6 +662,7 @@ class InstallPiDialog(QDialog):
         layout.addLayout(row)
 
     def _run(self):
+        self.install_succeeded = False
         self.btn_install.setEnabled(False)
         self.log.appendPlainText("正在执行 npm install -g …")
         self._worker = Worker(core.install_or_update_pi)
@@ -563,8 +678,10 @@ class InstallPiDialog(QDialog):
             self.log.appendPlainText(err)
         self.btn_install.setEnabled(True)
         if code == 0:
-            self.log.appendPlainText("\n完成：安装/升级成功。")
-            QMessageBox.information(self, "成功", "Pi 已安装或升级完成。")
+            self.install_succeeded = True
+            self.log.appendPlainText("\n完成：安装/升级成功，正在返回管理器面板。")
+            # 结束模态对话框，避免安装成功后主面板仍被更新界面阻塞。
+            self.accept()
         else:
             self.log.appendPlainText(f"\n失败：退出码 {code}")
             QMessageBox.warning(self, "失败", f"安装失败（code={code}）。请检查 Node/npm 与网络。")
@@ -1400,6 +1517,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         pb.addWidget(self._btn("添加", self.provider_add))
         pb.addWidget(self._btn("从 API 拉取模型", self.provider_fetch_api, success=True))
         pb.addWidget(self._btn("编辑", self.provider_edit, secondary=True))
+        pb.addWidget(self._btn("API Keys", self.provider_manage_keys, secondary=True))
         pb.addWidget(self._btn("删除", self.provider_delete, danger=True))
         left.addLayout(pb)
         layout.addWidget(left_card, 1)
@@ -1478,6 +1596,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         out_title.setObjectName("sectionTitle")
         out_l.addWidget(out_title)
         self.chat_output = QPlainTextEdit()
+        self.chat_output.setMaximumBlockCount(10_000)
         self.chat_output.setReadOnly(True)
         out_l.addWidget(self.chat_output, 1)
         layout.addWidget(out_card, 1)
@@ -2283,6 +2402,12 @@ class MainWindow(FeatureMixin, QMainWindow):
         cfg = core.load_models_config()
         data = (cfg.get("providers") or {}).get(name, {})
         preview = core.redact_sensitive_config(data)
+        keys = core.list_provider_api_keys(name)
+        preview["apiKeys"] = {
+            "available": sum(1 for item in keys if item.get("status") == "available"),
+            "invalid": sum(1 for item in keys if item.get("status") == "invalid"),
+            "items": keys,
+        }
         self.provider_detail.setPlainText(json.dumps(preview, ensure_ascii=False, indent=2))
 
     def refresh_sessions(self):
@@ -2530,6 +2655,14 @@ class MainWindow(FeatureMixin, QMainWindow):
             self.status.showMessage(f"已更新 provider: {name}")
         except Exception as e:
             QMessageBox.warning(self, "保存失败", str(e))
+
+    def provider_manage_keys(self):
+        item = self.provider_list.currentItem()
+        if not item:
+            QMessageBox.information(self, "提示", "请先选择 provider")
+            return
+        ProviderKeysDialog(item.text(), self).exec()
+        self.on_provider_selected(item, None)
 
     def provider_delete(self):
         item = self.provider_list.currentItem()
@@ -2933,6 +3066,8 @@ class MainWindow(FeatureMixin, QMainWindow):
         dlg = InstallPiDialog(self, status=status)
         dlg.exec()
         self.refresh_dashboard()
+        if dlg.install_succeeded:
+            self.status.showMessage("Pi 已安装或升级完成，已返回管理器面板。", 6000)
 
     def check_pi_update(self):
         self.status.showMessage("正在检查 Pi 版本…")

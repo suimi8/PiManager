@@ -5,13 +5,16 @@ providers/models/settings and launches full Pi sessions.
 """
 from __future__ import annotations
 
+import heapq
 import json
 import os
 import re
-import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import threading
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -132,6 +135,35 @@ def list_terminal_options() -> list[tuple[str, str]]:
     return pu.list_terminal_options()
 
 
+def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+    except Exception:
+        process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            if sys.platform != "win32":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except Exception:
+            process.kill()
+        process.wait(timeout=2)
+
+
 def run_pi(
     args: list[str],
     *,
@@ -139,23 +171,64 @@ def run_pi(
     timeout: float | None = 60,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Run Pi with real-time 8 MiB limits for stdout and stderr."""
     cmd = pi_base_cmd() + args
     full_env = os.environ.copy()
     if env:
         full_env.update(env)
-    # Prefer UTF-8 output
     full_env.setdefault("PYTHONIOENCODING", "utf-8")
-    return subprocess.run(
+    output_limit = 8 * 1024 * 1024
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    if sys.platform == "win32" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP
+    process = subprocess.Popen(
         cmd,
         cwd=cwd or os.getcwd(),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         env=full_env,
-        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        creationflags=creationflags,
+        start_new_session=sys.platform != "win32",
     )
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    limit_exceeded = threading.Event()
+
+    def read_stream(name: str, stream) -> None:
+        try:
+            while chunk := stream.read(64 * 1024):
+                buffer = buffers[name]
+                remaining = output_limit - len(buffer)
+                if remaining > 0:
+                    buffer.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    limit_exceeded.set()
+                    _terminate_process_tree(process)
+                    break
+        finally:
+            stream.close()
+
+    readers = [
+        threading.Thread(target=read_stream, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=read_stream, args=("stderr", process.stderr), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(process)
+        for reader in readers:
+            reader.join(timeout=2)
+        raise
+    for reader in readers:
+        reader.join(timeout=2)
+    stdout = buffers["stdout"].decode("utf-8", errors="replace")
+    stderr = buffers["stderr"].decode("utf-8", errors="replace")
+    if limit_exceeded.is_set():
+        return subprocess.CompletedProcess(
+            cmd, -1, stdout, "process output limit exceeded\n" + stderr
+        )
+    return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
 
 
 def get_pi_version() -> str:
@@ -248,6 +321,30 @@ def save_settings(data: dict[str, Any]) -> None:
     save_json(settings_path(), data)
 
 
+DEFAULT_OPENAI_COMPAT_USER_AGENT = "PiManager/1.0 (+PiCLI)"
+_OPENAI_COMPAT_APIS = frozenset(
+    {"openai", "openai-completions", "openai-responses"}
+)
+
+
+def _openai_compat_headers(
+    api: str, headers: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Add a WAF-friendly UA without overriding a non-empty custom value."""
+    result = dict(headers or {})
+    if str(api or "").strip().lower() not in _OPENAI_COMPAT_APIS:
+        return result
+    user_agent_key = next(
+        (key for key in result if str(key).strip().lower() == "user-agent"),
+        None,
+    )
+    if user_agent_key is None:
+        result["User-Agent"] = DEFAULT_OPENAI_COMPAT_USER_AGENT
+    elif not str(result.get(user_agent_key) or "").strip():
+        result[user_agent_key] = DEFAULT_OPENAI_COMPAT_USER_AGENT
+    return result
+
+
 def load_models_config() -> dict[str, Any]:
     cfg = load_json(models_path(), {"providers": {}})
     if not isinstance(cfg, dict):
@@ -282,6 +379,37 @@ def load_models_config() -> dict[str, Any]:
     except Exception:
         # Keep configuration readable even if the platform keyring is broken.
         pass
+
+    # OpenAI's Node SDK UA may be blocked by some compatible-provider WAFs.
+    # Persist the safe default so upgraded, existing providers behave like new ones.
+    providers = cfg.get("providers", {})
+    if isinstance(providers, dict):
+        updated_providers = dict(providers)
+        headers_changed = False
+        for name, entry in providers.items():
+            if not isinstance(entry, dict):
+                continue
+            current_headers = entry.get("headers")
+            if current_headers is not None and not isinstance(current_headers, dict):
+                continue
+            effective_headers = _openai_compat_headers(
+                str(entry.get("api") or "openai-completions"),
+                current_headers,
+            )
+            if effective_headers == (current_headers or {}):
+                continue
+            updated_entry = dict(entry)
+            updated_entry["headers"] = effective_headers
+            updated_providers[name] = updated_entry
+            headers_changed = True
+        if headers_changed:
+            cfg = dict(cfg)
+            cfg["providers"] = updated_providers
+            try:
+                save_models_config(cfg)
+            except Exception:
+                # Keep the in-memory config usable if models.json is temporarily locked.
+                pass
     return cfg
 
 
@@ -374,7 +502,26 @@ def save_manager_config(data: dict[str, Any]) -> None:
     save_json(manager_config_path(), data)
 
 
+def normalize_model_pair(
+    provider: str | None,
+    model: str | None,
+    *,
+    allow_empty: bool = True,
+) -> tuple[str, str] | None:
+    """Normalize an atomic Provider/Model pair without mixing partial defaults."""
+    p = str(provider or "").strip()
+    m = str(model or "").strip()
+    if not p and not m and allow_empty:
+        return None
+    if not p or not m:
+        raise ValueError("Provider 和 Model 必须成对指定，不能跨模型混用")
+    return p, m
+
+
 def set_default_model(provider: str, model: str, thinking: str | None = None) -> dict[str, Any]:
+    pair = normalize_model_pair(provider, model, allow_empty=False)
+    assert pair is not None
+    provider, model = pair
     settings = load_settings()
     settings["defaultProvider"] = provider
     settings["defaultModel"] = model
@@ -432,8 +579,13 @@ def upsert_custom_provider(
         entry["compat"] = compat
     elif "compat" in existing:
         entry["compat"] = existing["compat"]
-    if headers is not None:
-        entry["headers"] = headers
+    header_source = headers if headers is not None else existing.get("headers")
+    if isinstance(header_source, dict) or header_source is None:
+        effective_headers = _openai_compat_headers(api, header_source)
+        if effective_headers or headers is not None or "headers" in existing:
+            entry["headers"] = secretstore.store_provider_headers(
+                name, effective_headers
+            )
     elif "headers" in existing:
         entry["headers"] = existing["headers"]
     providers[name] = entry
@@ -545,6 +697,7 @@ def purge_favorites(
 def delete_custom_provider(name: str) -> dict[str, Any]:
     cfg = load_models_config()
     providers = cfg.get("providers", {})
+    deleted_entry = providers.get(name) if isinstance(providers, dict) else None
     if name in providers:
         del providers[name]
         cfg["providers"] = providers
@@ -552,7 +705,9 @@ def delete_custom_provider(name: str) -> dict[str, Any]:
     try:
         from . import secrets as secretstore
 
-        secretstore.delete_secret(secretstore.provider_key_name(name))
+        if isinstance(deleted_entry, dict) and isinstance(deleted_entry.get("headers"), dict):
+            secretstore.delete_provider_header_secrets(name, deleted_entry["headers"])
+        secretstore.delete_provider_api_keys(name)
     except Exception:
         pass
     # 同步清理收藏，并在默认属于该 Provider 时切换到下一个收藏
@@ -603,10 +758,10 @@ def build_pi_launch_args(
     extra: list[str] | None = None,
 ) -> list[str]:
     args: list[str] = []
-    if provider:
-        args += ["--provider", provider]
-    if model:
-        args += ["--model", model]
+    pair = normalize_model_pair(provider, model)
+    if pair is not None:
+        pair_provider, pair_model = pair
+        args += ["--provider", pair_provider, "--model", pair_model]
     if thinking:
         args += ["--thinking", thinking]
     if extra:
@@ -655,13 +810,39 @@ def run_pi_print(
     args += ["-p", "--no-session", prompt]
     # project trust for non-interactive
     args += ["--approve"]
-    p = run_pi(
-        args,
-        cwd=workdir,
-        timeout=timeout,
-        env=provider_runtime_env(provider),
-    )
-    return p.returncode, p.stdout or "", p.stderr or ""
+    attempted_key_ids: set[str] = set()
+    while True:
+        credential = provider_runtime_credential(provider)
+        p = run_pi(
+            args,
+            cwd=workdir,
+            timeout=timeout,
+            env=credential["env"],
+        )
+        stdout = p.stdout or ""
+        stderr = p.stderr or ""
+        key_id = str(credential.get("key_id") or "")
+        if p.returncode == 0 or not key_id or not is_provider_key_error(
+            p.returncode, stdout, stderr
+        ):
+            return p.returncode, stdout, stderr
+        if key_id in attempted_key_ids:
+            return p.returncode, stdout, stderr
+        attempted_key_ids.add(key_id)
+
+        from . import secrets as secretstore
+
+        reason = provider_key_failure_reason(p.returncode, stdout, stderr)
+        changed = secretstore.mark_provider_key_failed(
+            str(provider or ""), key_id, reason
+        )
+        next_credential = secretstore.get_active_provider_credential(str(provider or ""))
+        if (
+            not changed
+            or not next_credential
+            or next_credential["key_id"] in attempted_key_ids
+        ):
+            return p.returncode, stdout, stderr
 
 
 def _decode_session_folder_slug(slug: str) -> str:
@@ -771,21 +952,28 @@ def _parse_session_meta(path: Path) -> dict[str, str]:
 
 def list_sessions(limit: int = 50) -> list[dict[str, str]]:
     root = sessions_dir()
-    if not root.exists():
+    if not root.exists() or limit <= 0:
         return []
-    files: list[Path] = []
-    for p in root.rglob("*"):
-        if p.is_file() and p.suffix.lower() in {".jsonl", ".json", ".pi"}:
-            files.append(p)
-        elif p.is_file() and "session" in p.name.lower():
-            files.append(p)
-    if not files:
-        files = [p for p in root.rglob("*") if p.is_file()]
-    files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+
+    def candidates(preferred_only: bool):
+        for path in root.rglob("*"):
+            try:
+                if not path.is_file():
+                    continue
+                preferred = path.suffix.lower() in {".jsonl", ".json", ".pi"} or "session" in path.name.lower()
+                if preferred_only and not preferred:
+                    continue
+                stat_result = path.stat()
+                yield stat_result.st_mtime, str(path), path, stat_result
+            except OSError:
+                continue
+
+    selected = heapq.nlargest(limit, candidates(True), key=lambda item: item[:2])
+    if not selected:
+        selected = heapq.nlargest(limit, candidates(False), key=lambda item: item[:2])
     rows = []
-    for p in files[:limit]:
+    for _mtime, _path_key, p, st in selected:
         try:
-            st = p.stat()
             folder_slug = str(p.parent.relative_to(root)) if p.parent != root else "."
             meta = _parse_session_meta(p)
             cwd = meta.get("cwd") or _decode_session_folder_slug(folder_slug)
@@ -1066,38 +1254,128 @@ class ProviderKeyError(RuntimeError):
     """Raised when a selected custom provider has no usable credential."""
 
 
-def _run_api_key_command(command: str) -> str:
-    try:
-        argv = shlex.split(command, posix=os.name != "nt")
-        if not argv:
-            return ""
-        p = subprocess.run(
-            argv,
-            shell=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+_PROVIDER_SERVER_ERROR_PATTERN = r"\b(?:http\s*)?5\d\d\b"
+_PROVIDER_KEY_HTTP_STATUS_PATTERN = r"\b(?:http\s*)?(?:401|403|429)\b"
+_PROVIDER_REQUEST_BLOCK_PATTERNS: tuple[str, ...] = (
+    r"\byour request (?:was|is|has been) blocked\b",
+    r"\brequest (?:was |is |has been )?blocked\b",
+    r"\bblocked by\b[^\n]{0,80}\b(?:waf|firewall|security|policy|cloudflare)\b",
+    r"\b(?:waf|firewall|cloudflare)\b[^\n]{0,80}\b(?:blocked?|denied)\b",
+)
+
+
+def _is_provider_request_block_error(text: str) -> bool:
+    return any(
+        re.search(pattern, text or "", re.IGNORECASE)
+        for pattern in _PROVIDER_REQUEST_BLOCK_PATTERNS
+    )
+
+
+def classify_provider_key_failure(
+    returncode: int, stdout: str, stderr: str
+) -> dict[str, str]:
+    """Classify a provider failure into the shared key state machine."""
+    from datetime import datetime, timedelta, timezone
+
+    combined = f"{stdout or ''}\n{stderr or ''}"
+    low = combined.lower()
+    if int(returncode or 0) == 0 or _is_provider_request_block_error(combined):
+        return {"status": "", "failure_kind": "", "reason": "", "retry_at": ""}
+    if re.search(_PROVIDER_SERVER_ERROR_PATTERN, combined, re.IGNORECASE) and not re.search(
+        _PROVIDER_KEY_HTTP_STATUS_PATTERN, combined, re.IGNORECASE
+    ):
+        return {"status": "", "failure_kind": "", "reason": "", "retry_at": ""}
+    if re.search(r"\b(?:http\s*)?429\b|rate(?:\s+|_|-)limit|too(?:\s+|_|-)many(?:\s+|_|-)requests", low):
+        retry_at = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat(
+            timespec="seconds"
         )
-        if p.returncode != 0:
-            return ""
-        return (p.stdout or "").strip()[:16384]
-    except Exception:
-        return ""
+        return {
+            "status": "cooldown",
+            "failure_kind": "rate_limit",
+            "reason": "HTTP 429",
+            "retry_at": retry_at,
+        }
+    if re.search(r"(?:quota|credit|billing)", low):
+        return {
+            "status": "restricted",
+            "failure_kind": "account_restricted",
+            "reason": "quota or billing restriction",
+            "retry_at": "",
+        }
+    if re.search(r"\b(?:http\s*)?401\b", low):
+        return {
+            "status": "invalid",
+            "failure_kind": "invalid_credential",
+            "reason": "HTTP 401",
+            "retry_at": "",
+        }
+    if re.search(r"\b(?:http\s*)?403\b", low):
+        revoked = bool(
+            re.search(
+                r"invalid(?:\s+|_|-)api(?:\s+|_|-)key|(?:revoked|disabled|invalid)(?:\s+|_|-)(?:api(?:\s+|_|-)?key|credential)",
+                low,
+            )
+        )
+        return {
+            "status": "invalid" if revoked else "restricted",
+            "failure_kind": "invalid_credential" if revoked else "permission_restricted",
+            "reason": "HTTP 403",
+            "retry_at": "",
+        }
+    if re.search(r"invalid(?:\s+|_|-)api(?:\s+|_|-)key|unauthori[sz]ed", low):
+        return {
+            "status": "invalid",
+            "failure_kind": "invalid_credential",
+            "reason": "invalid API key",
+            "retry_at": "",
+        }
+    if re.search(r"authentication(?:\s+failed|\s+error|\s+required)?", low):
+        return {
+            "status": "invalid",
+            "failure_kind": "authentication_failed",
+            "reason": "authentication failed",
+            "retry_at": "",
+        }
+    return {"status": "", "failure_kind": "", "reason": "", "retry_at": ""}
+
+
+def provider_key_failure_reason(returncode: int, stdout: str, stderr: str) -> str:
+    return classify_provider_key_failure(returncode, stdout, stderr)["reason"]
+
+
+def is_provider_key_error(returncode: int, stdout: str, stderr: str) -> bool:
+    return bool(classify_provider_key_failure(returncode, stdout, stderr)["status"])
+
+
+def normalize_config_string(value: Any) -> str:
+    """Normalize security-sensitive strings before applying prefix policies."""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    for _ in range(4):
+        text = text.strip()
+        if len(text) < 2 or text[0] not in {"'", '"'} or text[-1] != text[0]:
+            break
+        text = text[1:-1]
+    return text.strip()
+
+
+def is_executable_config_value(value: Any) -> bool:
+    return normalize_config_string(value).startswith("!")
 
 
 def resolve_api_key_value(
     api_key: str,
     provider: str = "",
     *,
-    allow_command: bool = True,
+    allow_command: bool = False,
 ) -> str:
-    """Resolve models.json apiKey field: secure reference / env / literal / command."""
+    """Resolve a secure reference, environment reference, or literal credential.
+
+    Command credentials are permanently disabled. ``allow_command`` remains only
+    as a source-compatible argument for callers from older integrations.
+    """
     if not api_key:
         return ""
-    key = str(api_key).strip().strip('"').strip("'")
+    key = normalize_config_string(api_key)
     if not key:
         return ""
     if key.startswith("__DPAPI__:") or provider:
@@ -1111,8 +1389,8 @@ def resolve_api_key_value(
                 key = secretstore.resolve_provider_api_key(key, provider)
         except Exception:
             pass
-    if key.startswith("!"):
-        return _run_api_key_command(key[1:].strip()) if allow_command else ""
+    if is_executable_config_value(key):
+        return ""
     try:
         from . import secrets as secretstore
 
@@ -1126,7 +1404,7 @@ def resolve_api_key_value(
     return key
 
 
-def provider_runtime_env(provider: str | None) -> dict[str, str]:
+def provider_runtime_credential(provider: str | None) -> dict[str, Any]:
     """Resolve one custom provider credential for a Pi child process.
 
     The real key stays out of models.json and command-line arguments. Built-in
@@ -1134,18 +1412,25 @@ def provider_runtime_env(provider: str | None) -> dict[str, str]:
     """
     provider = (provider or "").strip()
     if not provider:
-        return {}
+        return {"env": {}, "key_id": ""}
     entry = get_provider_config(provider)
     if not entry:
-        return {}
+        return {"env": {}, "key_id": ""}
 
     from . import secrets as secretstore
 
-    raw = str(entry.get("apiKey") or "").strip()
-    if not raw or raw.startswith("!"):
-        # Pi natively supports !command. Keeping it in models.json avoids
-        # putting command output in a process argument or persistent file.
-        return {}
+    raw = normalize_config_string(entry.get("apiKey"))
+    header_env = secretstore.provider_header_runtime_env(
+        provider,
+        entry.get("headers") if isinstance(entry.get("headers"), dict) else {},
+    )
+    if not raw:
+        return {"env": header_env, "key_id": ""}
+    if is_executable_config_value(raw):
+        raise ProviderKeyError(
+            f"Provider「{provider}」使用了已禁用的 !command 凭据。"
+            "请改为环境变量引用或在 Provider 编辑页写入安全密钥库。"
+        )
 
     env_name = secretstore.referenced_env_name(raw)
     if not env_name:
@@ -1194,11 +1479,20 @@ def provider_runtime_env(provider: str | None) -> dict[str, str]:
                 )
 
     if not env_name:
-        return {}
+        return {"env": header_env, "key_id": ""}
     if env_name == secretstore.provider_env_name(provider):
-        value = secretstore.get_secret(secretstore.provider_key_name(provider))
-        if not value:
-            value = os.environ.get(env_name, "")
+        credential = secretstore.get_active_provider_credential(provider)
+        if credential:
+            return {
+                "env": {**header_env, env_name: credential["value"]},
+                "key_id": credential["key_id"],
+            }
+        if secretstore.list_provider_keys(provider):
+            raise ProviderKeyError(
+                f"Provider「{provider}」的 API Key 已全部暂时失效。"
+                "请在 Provider 的“管理 API Keys”中恢复或添加可用 Key。"
+            )
+        value = os.environ.get(env_name, "")
     else:
         value = os.environ.get(env_name, "")
     if not value:
@@ -1206,7 +1500,12 @@ def provider_runtime_env(provider: str | None) -> dict[str, str]:
             f"Provider「{provider}」引用的环境变量 {env_name} 未设置或安全密钥已丢失。"
             "请在 Provider 编辑页重新填写 API Key 后保存。"
         )
-    return {env_name: value}
+    return {"env": {**header_env, env_name: value}, "key_id": ""}
+
+
+def provider_runtime_env(provider: str | None) -> dict[str, str]:
+    """Compatibility wrapper returning only child-process environment values."""
+    return dict(provider_runtime_credential(provider)["env"])
 
 
 def all_provider_runtime_env(*, strict: bool = False) -> dict[str, str]:
@@ -1259,8 +1558,47 @@ def _ssl_context(insecure: bool = False):
     return ctx
 
 
+def redact_endpoint_url(url: str) -> str:
+    """Redact URL userinfo and credential-like query parameters."""
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    raw = str(url or "")
+    if not raw:
+        return raw
+    try:
+        parts = urlsplit(raw)
+        host = parts.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        netloc = host + (f":{parts.port}" if parts.port is not None else "")
+        query = parse_qsl(parts.query, keep_blank_values=True)
+        redacted: list[tuple[str, str]] = []
+        for name, value in query:
+            normalized = name.lower().replace("-", "").replace("_", "")
+            sensitive = normalized == "key" or normalized.endswith(
+                ("apikey", "token", "secret", "password")
+            )
+            redacted.append((name, "***" if sensitive else value))
+        safe_query = urlencode(redacted, doseq=True, safe="*")
+        return urlunsplit(
+            (parts.scheme, netloc, parts.path, safe_query, parts.fragment)
+        )
+    except (TypeError, ValueError):
+        return raw
+
+
+def redact_secret_values(text: str, secret_values: list[str]) -> str:
+    result = str(text or "")
+    for secret in sorted({str(item) for item in secret_values if item}, key=len, reverse=True):
+        result = result.replace(secret, "***")
+    return result
+
+
 def _friendly_fetch_error(exc: BaseException, endpoint: str = "") -> str:
+    safe_endpoint = redact_endpoint_url(endpoint)
     msg = str(exc)
+    if endpoint and endpoint != safe_endpoint:
+        msg = msg.replace(endpoint, safe_endpoint)
     low = msg.lower()
     tips: list[str] = []
     if "missing bearer" in low or "unauthorized" in low or "401" in low:
@@ -1281,8 +1619,8 @@ def _friendly_fetch_error(exc: BaseException, endpoint: str = "") -> str:
     header = f"{type(exc).__name__}: {msg}"
     if tips:
         return header + "\n\n排查建议：\n- " + "\n- ".join(tips)
-    if endpoint:
-        return header + f"\nendpoint: {endpoint}"
+    if safe_endpoint:
+        return header + f"\nendpoint: {safe_endpoint}"
     return header
 
 
@@ -1296,6 +1634,7 @@ def fetch_remote_models(
     insecure_ssl: bool = False,
     proxy: str = "",
     provider: str = "",
+    _attempted_key_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Fetch available models from provider endpoint using baseUrl + apiKey.
 
@@ -1304,12 +1643,38 @@ def fetch_remote_models(
     import urllib.error
     import urllib.request
 
+    from . import http_client
+
     base = normalize_openai_base_url(base_url)
     if not base:
         return {"ok": False, "models": [], "endpoint": "", "error": "Base URL 为空", "raw_count": 0}
 
     raw_key = (api_key or "").strip()
-    key = resolve_api_key_value(api_key, provider=provider)
+    key_id = ""
+    managed_key = False
+    if provider:
+        from . import secrets as secretstore
+
+        managed_key = raw_key.startswith("__DPAPI__:") or (
+            secretstore.referenced_env_name(raw_key) == secretstore.provider_env_name(provider)
+        )
+        if managed_key:
+            try:
+                credential = provider_runtime_credential(provider)
+                key_id = str(credential.get("key_id") or "")
+                key = next(iter(credential["env"].values()), "")
+            except ProviderKeyError as exc:
+                return {
+                    "ok": False,
+                    "models": [],
+                    "endpoint": "",
+                    "error": str(exc),
+                    "raw_count": 0,
+                }
+        else:
+            key = resolve_api_key_value(api_key, provider=provider)
+    else:
+        key = resolve_api_key_value(api_key, provider=provider)
     api = (api or "openai-completions").lower()
 
     # OpenAI / Anthropic always need a key for /models
@@ -1381,7 +1746,7 @@ def fetch_remote_models(
             return {
                 "ok": False,
                 "models": [],
-                "endpoint": endpoint,
+                "endpoint": redact_endpoint_url(endpoint),
                 "error": "Google 接口需要 API Key（查询参数 key=...）。",
                 "raw_count": 0,
             }
@@ -1391,9 +1756,15 @@ def fetch_remote_models(
         if key:
             req_headers["Authorization"] = f"Bearer {key}"
 
+    public_endpoint = redact_endpoint_url(endpoint)
+
     if headers:
+        from . import secrets as secretstore
+
         for k, v in headers.items():
-            req_headers[k] = resolve_api_key_value(v) if isinstance(v, str) else str(v)
+            req_headers[k] = secretstore.resolve_provider_header_value(
+                provider, str(k), str(v)
+            )
 
     proxy = (proxy or "").strip()
     if not proxy:
@@ -1422,29 +1793,55 @@ def fetch_remote_models(
                 }
             )
         )
-    # Always use our SSL context via HTTPSHandler
+    # Provider credentials must never be replayed by urllib across redirects.
+    handlers.append(http_client.DenyRedirectHandler())
     handlers.append(urllib.request.HTTPSHandler(context=_ssl_context(insecure_ssl)))
     opener = urllib.request.build_opener(*handlers)
 
     try:
         req = urllib.request.Request(endpoint, headers=req_headers, method="GET")
         with opener.open(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
+            body = http_client.read_limited(
+                resp, http_client.MODEL_LIST_MAX_BYTES
+            ).decode("utf-8", errors="replace")
             status = getattr(resp, "status", 200)
     except urllib.error.HTTPError as e:
         err_body = ""
         try:
-            err_body = e.read().decode("utf-8", errors="replace")[:500]
+            err_body = http_client.read_limited(
+                e, http_client.ERROR_MAX_BYTES
+            ).decode("utf-8", errors="replace")[:500]
         except Exception:
             pass
         detail = f"HTTP {e.code}: {e.reason}"
         if err_body:
             detail += f"\n{err_body}"
+        attempted = set(_attempted_key_ids or ())
+        if key_id and key_id not in attempted and is_provider_key_error(1, detail, ""):
+            from . import secrets as secretstore
+
+            attempted.add(key_id)
+            secretstore.mark_provider_key_failed(
+                provider, key_id, provider_key_failure_reason(1, detail, "")
+            )
+            next_credential = secretstore.get_active_provider_credential(provider)
+            if next_credential and next_credential["key_id"] not in attempted:
+                return fetch_remote_models(
+                    base_url,
+                    api_key,
+                    api=api,
+                    timeout=timeout,
+                    headers=headers,
+                    insecure_ssl=insecure_ssl,
+                    proxy=proxy,
+                    provider=provider,
+                    _attempted_key_ids=attempted,
+                )
         friendly = _friendly_fetch_error(Exception(detail), endpoint)
         return {
             "ok": False,
             "models": [],
-            "endpoint": endpoint,
+            "endpoint": public_endpoint,
             "error": friendly,
             "raw_count": 0,
             "http_status": e.code,
@@ -1454,7 +1851,7 @@ def fetch_remote_models(
         return {
             "ok": False,
             "models": [],
-            "endpoint": endpoint,
+            "endpoint": public_endpoint,
             "error": _friendly_fetch_error(e, endpoint),
             "raw_count": 0,
             "proxy": proxy or "",
@@ -1466,7 +1863,7 @@ def fetch_remote_models(
         return {
             "ok": False,
             "models": [],
-            "endpoint": endpoint,
+            "endpoint": public_endpoint,
             "error": f"响应不是 JSON: {body[:200]}",
             "raw_count": 0,
         }
@@ -1525,7 +1922,7 @@ def fetch_remote_models(
         return {
             "ok": False,
             "models": [],
-            "endpoint": endpoint,
+            "endpoint": public_endpoint,
             "error": f"无法识别模型列表结构，keys={list(data.keys()) if isinstance(data, dict) else type(data)}",
             "raw_count": 0,
         }
@@ -1542,7 +1939,7 @@ def fetch_remote_models(
     return {
         "ok": True,
         "models": uniq,
-        "endpoint": endpoint,
+        "endpoint": public_endpoint,
         "error": "",
         "raw_count": len(uniq),
         "http_status": status,
@@ -1594,6 +1991,45 @@ def get_provider_config(provider: str) -> dict[str, Any] | None:
     return entry if isinstance(entry, dict) else None
 
 
+def list_provider_api_keys(provider: str) -> list[dict[str, Any]]:
+    from . import secrets as secretstore
+
+    return secretstore.list_provider_keys(provider)
+
+
+def add_provider_api_key(provider: str, value: str) -> dict[str, Any]:
+    from . import secrets as secretstore
+
+    result = secretstore.add_provider_api_key(provider, value)
+    cfg = load_models_config()
+    providers = cfg.get("providers") or {}
+    entry = providers.get(provider)
+    if isinstance(entry, dict):
+        reference = secretstore.provider_api_key_reference(provider)
+        if entry.get("apiKey") != reference:
+            entry["apiKey"] = reference
+            save_models_config(cfg)
+    return result
+
+
+def remove_provider_api_key(provider: str, key_id: str) -> bool:
+    from . import secrets as secretstore
+
+    return secretstore.remove_provider_api_key(provider, key_id)
+
+
+def restore_provider_api_key(provider: str, key_id: str) -> bool:
+    from . import secrets as secretstore
+
+    return secretstore.restore_provider_key(provider, key_id)
+
+
+def restore_all_provider_api_keys(provider: str) -> int:
+    from . import secrets as secretstore
+
+    return secretstore.restore_all_provider_keys(provider)
+
+
 def _http_json_request(
     url: str,
     *,
@@ -1608,6 +2044,8 @@ def _http_json_request(
     import time
     import urllib.error
     import urllib.request
+
+    from . import http_client
 
     req_headers = dict(headers or {})
     proxy = (proxy or "").strip()
@@ -1630,6 +2068,7 @@ def _http_json_request(
     handlers: list[Any] = []
     if proxy:
         handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    handlers.append(http_client.DenyRedirectHandler())
     handlers.append(urllib.request.HTTPSHandler(context=_ssl_context(insecure_ssl)))
     opener = urllib.request.build_opener(*handlers)
 
@@ -1637,7 +2076,7 @@ def _http_json_request(
     t0 = time.perf_counter()
     try:
         with opener.open(req, timeout=timeout) as resp:
-            raw = resp.read()
+            raw = http_client.read_limited(resp, http_client.MODEL_TEST_MAX_BYTES)
             t1 = time.perf_counter()
             status = getattr(resp, "status", 200)
             text = raw.decode("utf-8", errors="replace")
@@ -1647,14 +2086,16 @@ def _http_json_request(
                 "body": text,
                 "latency_ms": round((t1 - t0) * 1000, 1),
                 "bytes": len(raw),
-                "proxy": proxy,
+                "proxy": redact_endpoint_url(proxy),
                 "error": "",
             }
     except urllib.error.HTTPError as e:
         t1 = time.perf_counter()
         err_body = ""
         try:
-            err_body = e.read().decode("utf-8", errors="replace")[:800]
+            err_body = http_client.read_limited(
+                e, http_client.ERROR_MAX_BYTES
+            ).decode("utf-8", errors="replace")[:800]
         except Exception:
             pass
         return {
@@ -1663,7 +2104,7 @@ def _http_json_request(
             "body": err_body,
             "latency_ms": round((t1 - t0) * 1000, 1),
             "bytes": len(err_body.encode("utf-8", errors="ignore")),
-            "proxy": proxy,
+            "proxy": redact_endpoint_url(proxy),
             "error": f"HTTP {e.code}: {e.reason}",
         }
     except Exception as e:
@@ -1674,7 +2115,7 @@ def _http_json_request(
             "body": "",
             "latency_ms": round((t1 - t0) * 1000, 1),
             "bytes": 0,
-            "proxy": proxy,
+            "proxy": redact_endpoint_url(proxy),
             "error": _friendly_fetch_error(e, url),
         }
 
@@ -1743,6 +2184,7 @@ def test_model_http(
     insecure_ssl: bool = False,
     proxy: str = "",
     prompt: str = "Reply with exactly: OK",
+    _attempted_key_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Test model via provider BaseURL HTTP (custom providers in models.json)."""
     entry = get_provider_config(provider)
@@ -1762,7 +2204,33 @@ def test_model_http(
 
     base = normalize_openai_base_url(str(entry.get("baseUrl") or ""))
     api = str(entry.get("api") or "openai-completions").lower()
-    key = resolve_api_key_value(str(entry.get("apiKey") or ""), provider=provider)
+    raw_key = str(entry.get("apiKey") or "").strip()
+    key_id = ""
+    from . import secrets as secretstore
+
+    managed_key = raw_key.startswith("__DPAPI__:") or (
+        secretstore.referenced_env_name(raw_key) == secretstore.provider_env_name(provider)
+    )
+    if managed_key:
+        try:
+            credential = provider_runtime_credential(provider)
+            key_id = str(credential.get("key_id") or "")
+            key = next(iter(credential["env"].values()), "")
+        except ProviderKeyError as exc:
+            return {
+                "ok": False,
+                "available": False,
+                "mode": "http",
+                "provider": provider,
+                "model": model,
+                "latency_ms": None,
+                "error": str(exc),
+                "preview": "",
+                "endpoint": base,
+                "http_status": 0,
+            }
+    else:
+        key = resolve_api_key_value(raw_key, provider=provider)
     extra_headers = entry.get("headers") if isinstance(entry.get("headers"), dict) else {}
 
     if not base:
@@ -1779,13 +2247,17 @@ def test_model_http(
             "http_status": 0,
         }
 
+    effective_headers = _openai_compat_headers(api, extra_headers)
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "PiManager/1.0 (+model-test)",
     }
-    for k, v in (extra_headers or {}).items():
-        headers[str(k)] = resolve_api_key_value(str(v)) if isinstance(v, str) else str(v)
+    if not any(str(key).strip().lower() == "user-agent" for key in effective_headers):
+        headers["User-Agent"] = "PiManager/1.0 (+model-test)"
+    for k, v in effective_headers.items():
+        headers[str(k)] = secretstore.resolve_provider_header_value(
+            provider, str(k), str(v)
+        )
 
     body_obj: dict[str, Any]
     if api in {"openai-completions", "openai"}:
@@ -1841,8 +2313,10 @@ def test_model_http(
         else:
             endpoint = f"{root}/models/{model}:generateContent"
         if key:
+            from urllib.parse import quote
+
             sep = "&" if "?" in endpoint else "?"
-            endpoint = f"{endpoint}{sep}key={key}"
+            endpoint = f"{endpoint}{sep}key={quote(key, safe='')}"
         body_obj = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {"maxOutputTokens": 16, "temperature": 0},
@@ -1859,6 +2333,7 @@ def test_model_http(
         }
 
     payload = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
+    public_endpoint = redact_endpoint_url(endpoint)
     result = _http_json_request(
         endpoint,
         method="POST",
@@ -1868,6 +2343,32 @@ def test_model_http(
         insecure_ssl=insecure_ssl,
         proxy=proxy,
     )
+    attempted = set(_attempted_key_ids or ())
+    failure_text = f"HTTP {result.get('status') or 0}\n{result.get('error') or ''}\n{result.get('body') or ''}"
+    if (
+        not result.get("ok")
+        and key_id
+        and key_id not in attempted
+        and is_provider_key_error(1, failure_text, "")
+    ):
+        attempted.add(key_id)
+        secretstore.mark_provider_key_failed(
+            provider, key_id, provider_key_failure_reason(1, failure_text, "")
+        )
+        next_credential = secretstore.get_active_provider_credential(provider)
+        if next_credential and next_credential["key_id"] not in attempted:
+            return test_model_http(
+                provider,
+                model,
+                timeout=timeout,
+                insecure_ssl=insecure_ssl,
+                proxy=proxy,
+                prompt=prompt,
+                _attempted_key_ids=attempted,
+            )
+    secret_values = [key, *[str(value) for value in headers.values()]]
+    result["body"] = redact_secret_values(str(result.get("body") or ""), secret_values)
+    result["error"] = redact_secret_values(str(result.get("error") or ""), secret_values)
     preview = _extract_reply_preview(api, result.get("body") or "") if result.get("ok") else (result.get("body") or "")[:160]
     available = bool(result.get("ok"))
     err = result.get("error") or ""
@@ -1883,7 +2384,7 @@ def test_model_http(
         "latency_ms": result.get("latency_ms"),
         "error": err if not available else "",
         "preview": preview,
-        "endpoint": endpoint,
+        "endpoint": public_endpoint,
         "http_status": result.get("status") or 0,
         "proxy": result.get("proxy") or "",
         "api": api,

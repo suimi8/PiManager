@@ -7,12 +7,26 @@ import threading
 import uuid
 from contextlib import contextmanager
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Literal
 
 
 _LOCKS_GUARD = threading.Lock()
 _LOCKS: dict[str, threading.RLock] = {}
+
+
+class CorruptJsonError(ValueError):
+    """Raised when an existing JSON document cannot be safely loaded."""
+
+
+@dataclass(frozen=True)
+class LoadResult:
+    status: Literal["ok", "missing", "corrupt", "unsupported"]
+    data: Any
+    error: str = ""
+    source_path: Path | None = None
+    backup_path: Path | None = None
 
 
 def _thread_lock(path: Path) -> threading.RLock:
@@ -70,24 +84,68 @@ def locked(path: Path) -> Iterator[None]:
                 lock_file.close()
 
 
-def _read_unlocked(path: Path, default: Any) -> Any:
+def _read_result_unlocked(path: Path, default: Any) -> LoadResult:
     if not path.exists():
-        return deepcopy(default)
+        return LoadResult("missing", deepcopy(default), source_path=path)
+    if not path.is_file():
+        return LoadResult(
+            "unsupported", deepcopy(default), "配置路径不是普通文件", source_path=path
+        )
     try:
         with path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except (json.JSONDecodeError, OSError):
-        return deepcopy(default)
+            return LoadResult("ok", json.load(handle), source_path=path)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return LoadResult("corrupt", deepcopy(default), str(exc), source_path=path)
+    except OSError as exc:
+        return LoadResult("unsupported", deepcopy(default), str(exc), source_path=path)
+
+
+def _read_unlocked(path: Path, default: Any) -> Any:
+    result = _read_result_unlocked(path, default)
+    if result.status in {"corrupt", "unsupported"}:
+        raise CorruptJsonError(f"配置文件无法读取：{path}: {result.error}")
+    return result.data
+
+
+def load_json_result(path: Path, default: Any) -> LoadResult:
+    path = Path(path)
+    with locked(path):
+        return _read_result_unlocked(path, default)
 
 
 def load_json(path: Path, default: Any) -> Any:
-    path = Path(path)
-    with locked(path):
-        return _read_unlocked(path, default)
+    result = load_json_result(path, default)
+    if result.status in {"corrupt", "unsupported"}:
+        raise CorruptJsonError(f"配置文件无法读取：{path}: {result.error}")
+    return result.data
+
+
+def _rotate_backups(path: Path) -> None:
+    if not path.exists() or not path.is_file():
+        return
+    first = path.with_name(f"{path.name}.bak.1")
+    second = path.with_name(f"{path.name}.bak.2")
+    if first.exists():
+        os.replace(first, second)
+    backup_temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.bak.tmp")
+    try:
+        with path.open("rb") as source, backup_temp.open("xb") as target:
+            while chunk := source.read(64 * 1024):
+                target.write(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(backup_temp, first)
+    finally:
+        backup_temp.unlink(missing_ok=True)
 
 
 def _write_unlocked(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    current = _read_result_unlocked(path, None)
+    if current.status in {"corrupt", "unsupported"}:
+        raise CorruptJsonError(
+            f"拒绝覆盖无法读取的配置文件：{path}: {current.error}"
+        )
     temp = path.with_name(
         f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
     )
@@ -97,6 +155,7 @@ def _write_unlocked(path: Path, data: Any) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        _rotate_backups(path)
         os.replace(temp, path)
     finally:
         try:

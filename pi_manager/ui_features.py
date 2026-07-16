@@ -181,10 +181,8 @@ class FeatureMixin:
             remaining = max(0, int((deadline - time.monotonic()) * 1000))
             if worker.isRunning() and remaining:
                 worker.wait(remaining)
-        for worker in workers:
-            if worker.isRunning():
-                worker.terminate()
-                worker.wait(500)
+        # Do not terminate Python threads: running calls finish cooperatively.
+        # QThreads are parented/tracked and their finished signals remove them.
 
     def closeEvent(self, event):
         # minimize to tray if enabled
@@ -728,20 +726,6 @@ class FeatureMixin:
             restore_secrets=restore_secrets,
             password=password,
         )
-        if res.get("requires_command_confirmation"):
-            providers = ", ".join(res.get("command_providers") or [])
-            if QMessageBox.question(
-                self,
-                "确认执行命令",
-                f"导入包中的 Provider「{providers}」包含 !command 密钥。\n"
-                "这会在 Pi 运行时执行外部命令，确认导入？",
-            ) == QMessageBox.Yes:
-                res = extras.import_config_bundle(
-                    path,
-                    restore_secrets=restore_secrets,
-                    password=password,
-                    allow_commands=True,
-                )
         if not res.get("ok"):
             QMessageBox.critical(self, "导入失败", str(res.get("error")))
             return
@@ -804,23 +788,17 @@ class FeatureMixin:
         body = msg
         if notes_short:
             body += f"\n\n更新说明：\n{notes_short}"
-        body += "\n\n可下载安装包后手动替换，或打开 Release 页面。"
+        body += "\n\n签名更新链完成前已禁用自动下载和原地安装，请从官方 Release 页面手动更新。"
 
         box = QMessageBox(self)
         box.setWindowTitle("发现 Pi Manager 新版本")
         box.setIcon(QMessageBox.Information)
         box.setText(body)
-        btn_apply = box.addButton("立即更新并重启", QMessageBox.AcceptRole)
-        btn_dl = box.addButton("仅下载", QMessageBox.ActionRole)
         btn_open = box.addButton("打开 Release 页", QMessageBox.ActionRole)
         box.addButton("稍后", QMessageBox.RejectRole)
         box.exec()
         clicked = box.clickedButton()
-        if clicked == btn_apply:
-            self._download_manager_update(res, apply_inplace=True)
-        elif clicked == btn_dl:
-            self._download_manager_update(res, apply_inplace=False)
-        elif clicked == btn_open:
+        if clicked == btn_open:
             page = str(res.get("url") or extras.GITHUB_RELEASES_PAGE)
             try:
                 from PySide6.QtGui import QDesktopServices
@@ -965,15 +943,26 @@ class FeatureMixin:
             model = self.chat_model.currentText().strip() if hasattr(self.chat_model, "currentText") else self.chat_model.text().strip()
             provider = provider or None
             model = model or None
-        # assemble short history context
+        # Keep the request context within both turn and byte budgets.
         history_lines = []
-        for turn in self.chat_history[-6:]:
-            history_lines.append(f"User: {turn.get('user','')}")
-            history_lines.append(f"Assistant: {turn.get('assistant','')}")
+        context_bytes = 0
+        for turn in reversed(self.chat_history[-6:]):
+            lines = [
+                f"User: {turn.get('user', '')}",
+                f"Assistant: {turn.get('assistant', '')}",
+            ]
+            size = len("\n".join(lines).encode("utf-8"))
+            if context_bytes + size > 128 * 1024:
+                break
+            history_lines[0:0] = lines
+            context_bytes += size
         if history_lines:
             full = "以下是近期对话，请承接上下文简要回答。\n" + "\n".join(history_lines) + f"\nUser: {prompt}\nAssistant:"
         else:
             full = prompt
+        encoded = full.encode("utf-8")
+        if len(encoded) > 128 * 1024:
+            full = encoded[-128 * 1024 :].decode("utf-8", errors="ignore")
         self.chat_output.appendPlainText(f"\n你: {prompt}\n…思考中…")
         self.chat_input.setEnabled(False)
         workdir = self.workdir_edit.text().strip() or str(core.user_home())
@@ -1025,6 +1014,11 @@ class FeatureMixin:
             self.chat_output.appendPlainText(f"失败({result.get('returncode')}): {err}")
             return
         self.chat_history.append({"user": user_prompt, "assistant": text})
+        self.chat_history = self.chat_history[-20:]
+        while self.chat_history and len(
+            json.dumps(self.chat_history, ensure_ascii=False).encode("utf-8")
+        ) > 512 * 1024:
+            self.chat_history.pop(0)
         lat = result.get("latency_ms")
         tag = f"{p}/{m} · {lat} ms" if p and m else f"{lat} ms"
         self.chat_output.appendPlainText(f"Pi ({tag}):\n{text}\n")

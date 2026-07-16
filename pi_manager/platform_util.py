@@ -271,8 +271,10 @@ def _launch_windows(argv: list[str], workdir: str, mode: str, env: dict[str, str
             Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WindowsApps" / "wt.exe"
         )
         if wt and Path(wt).exists():
+            # Pass each Pi argument directly to Windows Terminal. Going through
+            # cmd /k corrupts quoted paths and multiline system prompts.
             subprocess.Popen(
-                [wt, "-d", workdir, "cmd", "/k", cmdline_cmd],
+                [wt, "-d", workdir, *argv],
                 cwd=workdir,
                 env=env,
             )
@@ -280,18 +282,14 @@ def _launch_windows(argv: list[str], workdir: str, mode: str, env: dict[str, str
         mode = "cmd"
 
     if mode == "cmd":
+        # CREATE_NEW_CONSOLE provides the requested terminal without another
+        # shell parsing pass. This also works when Windows delegates consoles
+        # to Windows Terminal.
         subprocess.Popen(
-            [
-                "cmd.exe",
-                "/c",
-                "start",
-                "Pi Coding Agent",
-                "cmd.exe",
-                "/k",
-                f"cd /d {cmd_quote(workdir)} && {cmdline_cmd}",
-            ],
+            argv,
             cwd=workdir,
             env=env,
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
         )
         return f"cmd: {cmdline_cmd}"
 

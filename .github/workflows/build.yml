@@ -74,7 +74,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-          python -m pip install pyinstaller
 
       - name: Build macOS icon (.icns)
         if: matrix.platform == 'macos'
@@ -144,16 +143,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
       - name: Package Cursor extension
+        working-directory: extensions/pi-cursor
+        run: npm ci
+      - name: Build Cursor extension package
         run: |
-          mkdir -p release-assets
-          npm install -g @vscode/vsce
-          cd extensions/pi-cursor
-          vsce package --allow-missing-repository --out ../../release-assets/pi-manager-pi-cursor-0.3.0.vsix
-          ls -lah ../../release-assets
+          python scripts/package_extension.py --out release-assets
       - uses: actions/upload-artifact@v4
         with:
           name: PiManager-vsix

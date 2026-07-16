@@ -2,10 +2,21 @@
   "name": "pi-cursor",
   "displayName": "Pi Coding Agent",
   "description": "在 Cursor 中启动 Pi、切换 Provider/模型、快速提问（读取 ~/.pi/agent 配置）",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "publisher": "pi-manager",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/suimi8/PiManager.git"
+  },
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Other", "AI"],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "3.9.2"
+  },
   "activationEvents": [
     "onStartupFinished",
     "onCommand:pi.openTerminal",
@@ -13,11 +24,23 @@
     "onCommand:pi.askPrompt",
     "onCommand:pi.openConfig",
     "onCommand:pi.checkVersion",
+    "onCommand:pi.checkExtensionUpdate",
     "onCommand:pi.switchModel",
     "onCommand:pi.openPanel",
     "onView:pi.managerView"
   ],
   "main": "./extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "未信任工作区中禁用 Pi 进程启动和凭据 helper。",
+      "restrictedConfigurations": [
+        "pi.command",
+        "pi.extraArgs",
+        "pi.providerEnvCommand"
+      ]
+    }
+  },
   "contributes": {
     "commands": [
       {
@@ -43,6 +66,11 @@
       {
         "command": "pi.checkVersion",
         "title": "Pi: 检查版本",
+        "category": "Pi"
+      },
+      {
+        "command": "pi.checkExtensionUpdate",
+        "title": "Pi: 检查 Cursor 扩展更新",
         "category": "Pi"
       },
       {
@@ -110,6 +138,7 @@
         { "command": "pi.askPrompt" },
         { "command": "pi.openConfig" },
         { "command": "pi.checkVersion" },
+        { "command": "pi.checkExtensionUpdate" },
         { "command": "pi.switchModel" },
         { "command": "pi.openPanel" },
         { "command": "pi.refreshModels" }
@@ -132,13 +161,15 @@
       "properties": {
         "pi.command": {
           "type": "string",
+          "scope": "machine",
           "default": "pi",
-          "description": "Pi 可执行命令（默认 pi，也可填 node 路径到 cli.js）"
+          "description": "Pi 可执行文件或 Node CLI 路径，仅接受用户级设置"
         },
         "pi.extraArgs": {
           "type": "string",
+          "scope": "machine",
           "default": "",
-          "description": "额外启动参数，如 --thinking high"
+          "description": "额外启动参数，仅接受用户级设置，如 --thinking high"
         },
         "pi.useDefaultModelFromSettings": {
           "type": "boolean",
@@ -152,13 +183,19 @@
         },
         "pi.providerEnvCommand": {
           "type": "string",
+          "scope": "machine",
           "default": "",
-          "description": "Pi Manager 环境 helper 命令，例如 python /path/to/pi-manager/main.py --print-provider-env"
+          "description": "Pi Manager 环境 helper 命令，仅接受用户级设置"
         },
         "pi.syncEnabledModelsOnSwitch": {
           "type": "boolean",
           "default": true,
           "description": "切换默认模型时，把收藏列表同步写入 settings.enabledModels（便于 Pi 内 Ctrl+P 循环）"
+        },
+        "pi.autoCheckExtensionUpdate": {
+          "type": "boolean",
+          "default": true,
+          "description": "启动后每天检查 PiManager Release 中是否有新版 Cursor VSIX"
         }
       }
     }

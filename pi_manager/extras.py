@@ -150,6 +150,7 @@ def test_models_batch_concurrent(
     max_workers: int | None = None,
     on_one: Callable[[dict[str, Any]], None] | None = None,
     append_history_each: bool = False,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Concurrent model tests with ordered result list matching input pairs.
 
@@ -200,11 +201,31 @@ def test_models_batch_concurrent(
         return idx, res
 
     results: list[dict[str, Any] | None] = [None] * len(pairs)
+    indexed = iter(enumerate(pairs))
+    in_flight: set[concurrent.futures.Future[tuple[int, dict[str, Any]]]] = set()
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = [pool.submit(one, (i, p)) for i, p in enumerate(pairs)]
-        for fut in concurrent.futures.as_completed(futs):
-            idx, res = fut.result()
-            results[idx] = res
+        def submit_until_budget() -> None:
+            while len(in_flight) < workers * 2 and not (is_cancelled and is_cancelled()):
+                try:
+                    item = next(indexed)
+                except StopIteration:
+                    return
+                in_flight.add(pool.submit(one, item))
+
+        submit_until_budget()
+        while in_flight:
+            done, in_flight = concurrent.futures.wait(
+                in_flight,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for fut in done:
+                idx, res = fut.result()
+                results[idx] = res
+            if is_cancelled and is_cancelled():
+                for fut in in_flight:
+                    fut.cancel()
+                break
+            submit_until_budget()
     out = [r if r is not None else {"ok": False, "available": False, "error": "missing"} for r in results]
     if not append_history_each:
         try:
@@ -473,11 +494,10 @@ def _atomic_replace_bytes(path: Path, content: bytes) -> None:
         temp.unlink(missing_ok=True)
 
 
-def _validate_models(models: dict[str, Any]) -> list[str]:
+def _validate_models(models: dict[str, Any]) -> None:
     providers = models.get("providers", {})
     if not isinstance(providers, dict):
         raise ValueError("models.json.providers 必须是对象")
-    commands: list[str] = []
     for name, entry in providers.items():
         if not isinstance(name, str) or not isinstance(entry, dict):
             raise ValueError("models.json Provider 条目无效")
@@ -485,17 +505,19 @@ def _validate_models(models: dict[str, Any]) -> list[str]:
             raise ValueError(f"Provider {name} 的 models 必须是数组")
         if "apiKey" in entry and not isinstance(entry["apiKey"], str):
             raise ValueError(f"Provider {name} 的 apiKey 必须是字符串")
-        if str(entry.get("apiKey") or "").strip().startswith("!"):
-            commands.append(name)
+        if core.is_executable_config_value(entry.get("apiKey")):
+            raise ValueError(f"Provider {name} 包含已禁用的 !command 凭据")
         headers = entry.get("headers", {})
         if headers and not isinstance(headers, dict):
             raise ValueError(f"Provider {name} 的 headers 必须是对象")
-        if isinstance(headers, dict) and any(
-            isinstance(value, str) and value.strip().startswith("!")
-            for value in headers.values()
-        ):
-            commands.append(name)
-    return sorted(set(commands))
+        if isinstance(headers, dict):
+            for header_name, value in headers.items():
+                if not isinstance(header_name, str) or not isinstance(value, str):
+                    raise ValueError(f"Provider {name} 的 Header 必须是字符串键值")
+                if core.is_executable_config_value(value):
+                    raise ValueError(
+                        f"Provider {name} 的 Header {header_name} 包含已禁用的 !command 凭据"
+                    )
 
 
 def _secret_snapshot() -> dict[str, str]:
@@ -528,14 +550,8 @@ def import_config_bundle(
         settings = _parse_bundle_json(files, "settings.json")
         models = _parse_bundle_json(files, "models.json")
         manager = _parse_bundle_json(files, "pi-manager.json")
-        commands = _validate_models(models) if models is not None else []
-        if commands and not allow_commands:
-            return {
-                "ok": False,
-                "error": "导入包包含可执行的 !command 密钥配置",
-                "requires_command_confirmation": True,
-                "command_providers": commands,
-            }
+        if models is not None:
+            _validate_models(models)
         theme_data: dict[str, dict[str, Any]] = {}
         for name in files:
             if name.startswith("themes/"):
@@ -679,6 +695,8 @@ def run_self_check() -> list[dict[str, Any]]:
 def _http_get_json(url: str, *, timeout: int = 15) -> dict[str, Any]:
     import urllib.request
 
+    from . import http_client
+
     req = urllib.request.Request(
         url,
         headers={
@@ -686,8 +704,11 @@ def _http_get_json(url: str, *, timeout: int = 15) -> dict[str, Any]:
             "Accept": "application/vnd.github+json",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read().decode("utf-8", errors="replace")
+    opener = urllib.request.build_opener(http_client.DenyRedirectHandler())
+    with opener.open(req, timeout=timeout) as resp:
+        body = http_client.read_limited(
+            resp, http_client.MANIFEST_MAX_BYTES
+        ).decode("utf-8", errors="replace")
     data = json.loads(body)
     return data if isinstance(data, dict) else {}
 
@@ -716,14 +737,9 @@ def _pick_release_asset(assets: list[dict[str, Any]]) -> dict[str, str]:
 
 
 def check_manager_update() -> dict[str, Any]:
-    """检查 Pi Manager 自身更新。
-
-    优先级：
-    1. manager 配置 / 常量中的 update_manifest_url（自定义 JSON）
-    2. GitHub Releases latest API（默认，无需用户配置）
-    """
+    """Check the official release feed without trusting it for installation."""
     cfg = core.load_manager_config()
-    url = str(cfg.get("update_manifest_url") or UPDATE_MANIFEST_URL or "").strip()
+    url = ""
     local = APP_VERSION
     result: dict[str, Any] = {
         "ok": True,
@@ -741,26 +757,17 @@ def check_manager_update() -> dict[str, Any]:
     core.save_manager_config(cfg)
 
     try:
-        if url:
-            data = _http_get_json(url)
-            remote = str(data.get("version") or "").lstrip("vV")
-            result["source"] = "manifest"
-            result["remote"] = remote
-            result["notes"] = str(data.get("notes") or "")
-            result["download"] = str(data.get("url") or data.get("download") or "")
-            result["url"] = result["download"] or url
-        else:
-            data = _http_get_json(GITHUB_RELEASES_API)
-            tag = str(data.get("tag_name") or data.get("name") or "").strip()
-            remote = tag.lstrip("vV")
-            result["source"] = "github"
-            result["remote"] = remote
-            result["notes"] = str(data.get("body") or "")[:2000]
-            result["url"] = str(data.get("html_url") or GITHUB_RELEASES_PAGE)
-            assets = data.get("assets") if isinstance(data.get("assets"), list) else []
-            picked = _pick_release_asset([a for a in assets if isinstance(a, dict)])
-            result["download"] = picked.get("url") or result["url"]
-            result["asset_name"] = picked.get("name") or ""
+        data = _http_get_json(GITHUB_RELEASES_API)
+        tag = str(data.get("tag_name") or data.get("name") or "").strip()
+        remote = tag.lstrip("vV")
+        result["source"] = "github-notification-only"
+        result["remote"] = remote
+        result["notes"] = str(data.get("body") or "")[:2000]
+        result["url"] = str(data.get("html_url") or GITHUB_RELEASES_PAGE)
+        assets = data.get("assets") if isinstance(data.get("assets"), list) else []
+        picked = _pick_release_asset([a for a in assets if isinstance(a, dict)])
+        result["asset_name"] = picked.get("name") or ""
+        result["download"] = ""
 
         remote = str(result.get("remote") or "")
         if remote and core.parse_semver(remote) > core.parse_semver(local):
@@ -779,34 +786,10 @@ def check_manager_update() -> dict[str, Any]:
 
 
 def download_manager_update(download_url: str, dest_dir: str | Path | None = None) -> dict[str, Any]:
-    """下载更新包到目录（默认 ~/Downloads/PiManager-updates）。"""
-    import urllib.request
-
-    download_url = (download_url or "").strip()
-    if not download_url:
-        raise ValueError("无下载地址")
-    dest_root = Path(dest_dir) if dest_dir else (Path.home() / "Downloads" / "PiManager-updates")
-    dest_root.mkdir(parents=True, exist_ok=True)
-    name = download_url.rstrip("/").split("/")[-1] or f"PiManager-update-{APP_VERSION}"
-    # 去掉 query
-    name = name.split("?", 1)[0]
-    target = dest_root / name
-    req = urllib.request.Request(
-        download_url,
-        headers={"User-Agent": f"PiManager/{APP_VERSION}"},
+    """Reject unverified update downloads until signed manifests are supported."""
+    raise RuntimeError(
+        "签名更新链尚未启用，已禁止应用内下载。请从官方 Release 页面手动更新。"
     )
-    with urllib.request.urlopen(req, timeout=120) as resp, target.open("wb") as f:
-        while True:
-            chunk = resp.read(1024 * 256)
-            if not chunk:
-                break
-            f.write(chunk)
-    return {
-        "ok": True,
-        "path": str(target),
-        "dir": str(dest_root),
-        "message": f"已下载到 {target}",
-    }
 
 
 def _install_root() -> Path:
@@ -822,31 +805,101 @@ def _install_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _safe_archive_target(dest: Path, member_name: str, seen: set[str]) -> Path:
+    normalized = member_name.replace("\\", "/")
+    member = PurePosixPath(normalized)
+    if (
+        not normalized
+        or member.is_absolute()
+        or normalized.startswith("//")
+        or any(part in {"", ".", ".."} for part in member.parts)
+        or (member.parts and ":" in member.parts[0])
+    ):
+        raise ValueError(f"更新包包含非法路径: {member_name}")
+    key = normalized.casefold()
+    if key in seen:
+        raise ValueError(f"更新包包含重复或大小写冲突路径: {member_name}")
+    seen.add(key)
+    target = (dest / Path(*member.parts)).resolve()
+    root = dest.resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"更新包成员逃逸解压目录: {member_name}") from exc
+    return target
+
+
+def _copy_archive_stream(source, target: Path, expected_size: int, budget: list[int]) -> None:
+    if expected_size > 256 * 1024 * 1024:
+        raise ValueError(f"更新包单个文件超过限制: {target.name}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with target.open("xb") as output:
+        while True:
+            chunk = source.read(64 * 1024)
+            if not chunk:
+                break
+            written += len(chunk)
+            budget[0] += len(chunk)
+            if written > expected_size or budget[0] > 1024 * 1024 * 1024:
+                raise ValueError("更新包解压后大小超过限制")
+            output.write(chunk)
+    if written != expected_size:
+        raise ValueError(f"更新包成员长度异常: {target.name}")
+
+
 def _extract_update_archive(archive: Path, dest: Path) -> Path:
-    """解压更新包，返回解压内容中最可能的应用根目录。"""
+    """Safely extract an update archive into an empty staging directory."""
     import shutil
+    import stat
     import tarfile
 
     dest.mkdir(parents=True, exist_ok=True)
-    # 清空旧解压
     for child in dest.iterdir():
-        if child.is_dir():
+        if child.is_dir() and not child.is_symlink():
             shutil.rmtree(child, ignore_errors=True)
         else:
-            try:
-                child.unlink()
-            except Exception:
-                pass
+            child.unlink(missing_ok=True)
 
+    seen: set[str] = set()
+    budget = [0]
     name = archive.name.lower()
     if name.endswith(".zip"):
         with zipfile.ZipFile(archive, "r") as zf:
-            zf.extractall(dest)
+            infos = zf.infolist()
+            if len(infos) > 20_000:
+                raise ValueError("更新包成员数超过限制")
+            for info in infos:
+                target = _safe_archive_target(dest, info.filename, seen)
+                mode = (info.external_attr >> 16) & 0xFFFF
+                if stat.S_ISLNK(mode):
+                    raise ValueError(f"更新包不允许符号链接: {info.filename}")
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                compressed = max(1, int(info.compress_size or 0))
+                if info.file_size > compressed * 100 and info.file_size > 1024 * 1024:
+                    raise ValueError(f"更新包成员压缩比超过限制: {info.filename}")
+                with zf.open(info, "r") as source:
+                    _copy_archive_stream(source, target, info.file_size, budget)
     elif name.endswith(".tar.gz") or name.endswith(".tgz"):
         with tarfile.open(archive, "r:gz") as tf:
-            tf.extractall(dest)
+            members = tf.getmembers()
+            if len(members) > 20_000:
+                raise ValueError("更新包成员数超过限制")
+            for member in members:
+                target = _safe_archive_target(dest, member.name, seen)
+                if member.issym() or member.islnk() or not (member.isdir() or member.isfile()):
+                    raise ValueError(f"更新包包含不允许的特殊成员: {member.name}")
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                source = tf.extractfile(member)
+                if source is None:
+                    raise ValueError(f"无法读取更新包成员: {member.name}")
+                with source:
+                    _copy_archive_stream(source, target, member.size, budget)
     else:
-        # 单文件可执行：直接复制
         target = dest / archive.name
         shutil.copy2(archive, target)
         return target
@@ -967,10 +1020,16 @@ log done
 
 
 def apply_manager_update_inplace(archive_path: str | Path) -> dict[str, Any]:
-    """下载包已就绪时：解压并启动外部更新器，调用方应随后退出进程。
+    """Reject in-place installation until signed package verification exists."""
+    return {
+        "ok": False,
+        "need_exit": False,
+        "message": "签名更新链尚未启用，已禁止原地安装。请从官方 Release 页面手动更新。",
+    }
 
-    真正的 in-place：等待当前 PID 退出后覆盖安装目录并重启。
-    """
+
+def _legacy_apply_manager_update_inplace(archive_path: str | Path) -> dict[str, Any]:
+    """Legacy updater retained temporarily but unreachable from product code."""
     import sys
     import shutil
     import subprocess
@@ -1246,14 +1305,17 @@ def chat_once(
 ) -> dict[str, Any]:
     apply_proxy_env()
     t0 = time.perf_counter()
-    code, out, err = core.run_pi_print(
-        prompt,
-        workdir=workdir or str(core.user_home()),
-        provider=provider,
-        model=model,
-        thinking=thinking or "off",
-        timeout=timeout,
-    )
+    try:
+        code, out, err = core.run_pi_print(
+            prompt,
+            workdir=workdir or str(core.user_home()),
+            provider=provider,
+            model=model,
+            thinking=thinking or "off",
+            timeout=timeout,
+        )
+    except Exception as exc:
+        code, out, err = -1, "", str(exc)
     ms = round((time.perf_counter() - t0) * 1000, 1)
     text = (out or "").strip()
     err_text = (err or "").strip()
@@ -1320,6 +1382,14 @@ def failover_chain(start_provider: str | None = None, start_model: str | None = 
     return chain
 
 
+def _model_pair_key(provider: str | None, model: str | None) -> str:
+    try:
+        pair = core.normalize_model_pair(provider, model)
+    except ValueError:
+        return ""
+    return f"{pair[0]}/{pair[1]}" if pair is not None else ""
+
+
 def _fail_counts() -> dict[str, int]:
     mgr = core.load_manager_config()
     raw = mgr.get("failover_fail_counts") or {}
@@ -1341,8 +1411,8 @@ def _save_fail_counts(counts: dict[str, int]) -> None:
 
 
 def record_model_success(provider: str, model: str) -> None:
-    key = f"{(provider or '').strip()}/{(model or '').strip()}"
-    if key == "/":
+    key = _model_pair_key(provider, model)
+    if not key:
         return
     counts = _fail_counts()
     if key in counts:
@@ -1352,8 +1422,8 @@ def record_model_success(provider: str, model: str) -> None:
 
 def record_model_failure(provider: str, model: str) -> int:
     """累计失败次数并返回当前计数。"""
-    key = f"{(provider or '').strip()}/{(model or '').strip()}"
-    if key == "/":
+    key = _model_pair_key(provider, model)
+    if not key:
         return 0
     counts = _fail_counts()
     counts[key] = int(counts.get(key) or 0) + 1
@@ -1367,8 +1437,8 @@ def should_failover(provider: str, model: str) -> bool:
         return False
     thr = int(mgr.get("failover_fail_threshold") or 3)
     thr = max(1, thr)
-    key = f"{(provider or '').strip()}/{(model or '').strip()}"
-    return int(_fail_counts().get(key) or 0) >= thr
+    key = _model_pair_key(provider, model)
+    return bool(key) and int(_fail_counts().get(key) or 0) >= thr
 
 
 def chat_with_failover(
@@ -1391,13 +1461,28 @@ def chat_with_failover(
     thr = max(1, int(mgr.get("failover_fail_threshold") or 3))
     silent = bool(mgr.get("failover_silent", True))
 
-    if not provider or not model:
-        try:
+    try:
+        requested_pair = core.normalize_model_pair(provider, model)
+        if requested_pair is not None:
+            provider, model = requested_pair
+        else:
             dp, dm, _ = core.get_default_model()
-            provider = provider or dp
-            model = model or dm
-        except Exception:
-            pass
+            default_pair = core.normalize_model_pair(dp, dm)
+            if default_pair is not None:
+                provider, model = default_pair
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "returncode": -1,
+            "stdout": "",
+            "stderr": str(exc),
+            "latency_ms": 0,
+            "provider": provider,
+            "model": model,
+            "switched": False,
+            "attempts": [],
+            "error": str(exc),
+        }
 
     chain = failover_chain(provider, model)
     if not chain:

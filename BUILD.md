@@ -33,6 +33,16 @@ Windows 还可打单文件：
 python -m PyInstaller --noconfirm --clean PiManagerOneFile.spec
 ```
 
+Cursor 扩展统一从项目根目录打包：
+
+```bash
+python scripts/package_extension.py
+```
+
+脚本会先运行扩展测试，再按 `package.json` 版本生成
+`release-assets/pi-manager-pi-cursor-<版本>.vsix`。相对输出路径始终以项目根目录为基准。
+若本机未全局安装 `vsce`，脚本会自动通过 `npx @vscode/vsce` 获取官方打包工具。
+
 ## 各平台独立运行要求
 
 | 平台 | 推荐产物 | 用户操作 | 保持完整的目录 |
@@ -99,5 +109,5 @@ git push origin v1.6.4
 ## 注意
 
 - 不要把本机 `~/.pi/agent` 配置、密钥库打进安装包
-- 二进制与 VSIX 走 GitHub Releases，不进入源码树
+- 二进制与 VSIX 的本地发布产物统一写入项目根目录 `release-assets/`，再由 CI 上传到 GitHub Releases
 - Apple 正式签名/公证需额外 Developer ID 证书（可选增强，不是独立运行的硬性条件）

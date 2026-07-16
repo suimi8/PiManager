@@ -13,6 +13,7 @@
 ## 功能概览
 
 - 自定义 Provider / 模型配置、从 API 拉取模型、批量可用性测试
+- Provider 支持多 API Key：鉴权、限流或额度错误时先在同一接口内热切 Key，失败 Key 暂存失效池并可手动恢复
 - Provider API Key 安全存储：OS keyring 优先，当前用户 AES-GCM 文件库回退
 - 启动官方 Pi 时仅向子进程注入密钥（`models.json` 只存环境变量引用）
 - 全局代理、健康监控、测试历史、并发测试
@@ -89,7 +90,9 @@ python -m pytest tests -q
 
 扩展源码位于 [`extensions/pi-cursor`](extensions/pi-cursor)。
 
-1. 打包：在扩展目录用 `vsce package`（或使用 Release 中的 `.vsix`）
+`pi.askPrompt` 会先尝试同一 Provider 的其他可用 Key；只有 Key 池耗尽后，才按桌面端相同的失败阈值和候选顺序切换 Provider / 模型。扩展会独立检查 PiManager Release 中的新版 VSIX。
+
+1. 打包：在项目根目录运行 `python scripts/package_extension.py`，产物固定写入 `release-assets/pi-manager-pi-cursor-<版本>.vsix`（或使用 Release 中的 `.vsix`）
 2. 在 Cursor 中安装 VSIX
 3. 命令面板搜索 `Pi:` 即可启动会话
 
@@ -137,6 +140,8 @@ ${PI_MANAGER_PROVIDER_<SLUG>_<HASH>_API_KEY}
 ```
 
 PiManager 启动官方 Pi 时从安全存储读取并注入子进程环境。
+
+同一 Provider 可在 **Provider 管理 → API Keys** 中维护多把密钥。遇到 HTTP 401/403/429 或明确的鉴权、限流、额度错误时，当前 Key 会被暂时移入失效池并自动尝试下一把；网络错误和 HTTP 5xx 不会停用 Key。失效 Key 可在同一窗口恢复，整个过程不会把真实 Key 写入 `models.json`。
 
 ## 文档
 

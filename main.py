@@ -46,6 +46,17 @@ def main():
         from pi_manager.provider_env import main as provider_env_main
 
         return provider_env_main(sys.argv[2:])
+    if len(sys.argv) >= 2 and sys.argv[1] == "--config-mutate":
+        import json
+
+        from pi_manager.config_broker import mutate_file
+
+        if len(sys.argv) != 3:
+            print(json.dumps({"ok": False, "error": "request file is required"}))
+            return 2
+        result = mutate_file(sys.argv[2])
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result.get("ok") else 2
     if len(sys.argv) >= 2 and sys.argv[1] in {"--self-check", "--smoke-test"}:
         from pi_manager.resources import self_check
 

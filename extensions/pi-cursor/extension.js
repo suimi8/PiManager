@@ -2,7 +2,20 @@ const vscode = require("vscode");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const https = require("https");
 const { execFile } = require("child_process");
+const { chatWithFailover, normalizeModelPair } = require("./failover");
+const { commandParts, resolveCommand } = require("./invocation");
+const { runWithProviderKeyFailover } = require("./provider-keys");
+const { vsixUpdateInfo } = require("./release");
+const {
+  requireTrustedExecution,
+  trustedConfigurationValue,
+} = require("./security-policy");
+
+const GITHUB_RELEASE_API = "https://api.github.com/repos/suimi8/PiManager/releases/latest";
+const RELEASE_PAGE = "https://github.com/suimi8/PiManager/releases/latest";
+const VSIX_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 const ZH_PROMPT =
   "请尽可能使用简体中文与用户交流。仅当中文无法准确表达时保留必要英文（API/库名/协议/代码标识符），并可附简短中文说明。代码标识符、命令、路径保持原样。";
@@ -11,6 +24,9 @@ const ZH_PROMPT =
 let statusItem;
 /** @type {PiManagerViewProvider | undefined} */
 let viewProvider;
+/** @type {import("vscode").OutputChannel | undefined} */
+let askOutput;
+let askRunning = false;
 
 function agentDir() {
   return path.join(os.homedir(), ".pi", "agent");
@@ -29,26 +45,17 @@ function managerConfigPath() {
 }
 
 function readJson(file, fallback) {
+  if (!fs.existsSync(file)) return fallback;
   try {
-    if (!fs.existsSync(file)) return fallback;
     return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch {
-    return fallback;
+  } catch (error) {
+    throw new Error(`配置文件损坏，已禁止覆盖：${file}: ${error.message}`);
   }
-}
-
-function writeJson(file, data) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8");
 }
 
 function readSettings() {
   const data = readJson(settingsPath(), {});
   return data && typeof data === "object" ? data : {};
-}
-
-function writeSettings(settings) {
-  writeJson(settingsPath(), settings || {});
 }
 
 function readModelsConfig() {
@@ -59,6 +66,12 @@ function readModelsConfig() {
 function readManagerConfig() {
   const data = readJson(managerConfigPath(), {});
   return data && typeof data === "object" ? data : {};
+}
+
+async function writeManagerConfig(manager) {
+  return invokeConfigBroker("set_manager_fields", {
+    fields: { failover_fail_counts: (manager && manager.failover_fail_counts) || {} },
+  });
 }
 
 function providerFromSettings(settings) {
@@ -153,58 +166,88 @@ function collectModelCatalog() {
 /**
  * 热切换默认模型：写 settings.json（+ 可选同步 enabledModels）
  */
-function setDefaultModel(provider, model, thinking) {
-  const p = String(provider || "").trim();
-  const m = String(model || "").trim();
-  if (!p || !m) throw new Error("Provider / 模型不能为空");
+async function setDefaultModel(provider, model, thinking) {
+  const [p, m] = normalizeModelPair(provider, model, { allowEmpty: false });
   const settings = readSettings();
-  settings.defaultProvider = p;
-  settings.defaultModel = m;
-  if (thinking) settings.defaultThinkingLevel = String(thinking);
   const cfg = vscode.workspace.getConfiguration("pi");
-  if (cfg.get("syncEnabledModelsOnSwitch") !== false) {
-    const mgr = readManagerConfig();
-    const favs = Array.isArray(mgr.favorites) ? mgr.favorites.map(String) : [];
-    const key = `${p}/${m}`;
-    const enabled = new Set(
-      (Array.isArray(settings.enabledModels) ? settings.enabledModels : []).map(String)
-    );
-    for (const f of favs) enabled.add(f);
-    enabled.add(key);
-    settings.enabledModels = [...enabled];
-  }
-  writeSettings(settings);
+  const mgr = readManagerConfig();
+  await invokeConfigBroker("set_default_model", {
+    provider: p,
+    model: m,
+    thinking: thinking ? String(thinking) : String(settings.defaultThinkingLevel || ""),
+    sync_enabled: cfg.get("syncEnabledModelsOnSwitch") !== false,
+    favorites: Array.isArray(mgr.favorites) ? mgr.favorites.map(String) : [],
+  });
   refreshStatusBar();
   if (viewProvider) viewProvider.refresh();
   return { provider: p, model: m, key: `${p}/${m}` };
 }
 
-function commandParts(command) {
-  const text = String(command || "").trim();
-  if (!text) return null;
-  const parts = [];
-  const re = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'|([^\s]+)/g;
-  let match;
-  while ((match = re.exec(text))) parts.push(match[1] || match[2] || match[3]);
-  return parts.length ? parts : null;
+function executableConfiguration(key, fallback = "") {
+  const cfg = vscode.workspace.getConfiguration("pi");
+  return trustedConfigurationValue(cfg, key, fallback);
+}
+
+function managerHelperCommand(mode) {
+  requireTrustedExecution(vscode.workspace);
+  const configured = String(
+    executableConfiguration("providerEnvCommand", "") || process.env.PI_MANAGER_ENV_HELPER || ""
+  ).trim();
+  if (configured) {
+    const parts = commandParts(configured);
+    const index = parts.findIndex((part) => part === "--print-provider-env" || part === "--provider-env");
+    if (index >= 0) parts[index] = mode;
+    else parts.push(mode);
+    return parts;
+  }
+
+  const repoMain = path.resolve(__dirname, "..", "..", "main.py");
+  if (fs.existsSync(repoMain)) {
+    return [process.env.PI_MANAGER_PYTHON || "python", repoMain, mode];
+  }
+  const siblingMain = path.resolve(__dirname, "..", "pi-manager", "main.py");
+  if (fs.existsSync(siblingMain)) {
+    return [process.env.PI_MANAGER_PYTHON || "python", siblingMain, mode];
+  }
+  return null;
 }
 
 function providerHelperCommand() {
-  const cfg = vscode.workspace.getConfiguration("pi");
-  const configured = String(cfg.get("providerEnvCommand") || process.env.PI_MANAGER_ENV_HELPER || "").trim();
-  if (configured) return commandParts(configured);
+  return managerHelperCommand("--print-provider-env");
+}
 
-  // monorepo: extensions/pi-cursor → repo root main.py
-  const repoMain = path.resolve(__dirname, "..", "..", "main.py");
-  if (fs.existsSync(repoMain)) {
-    return [process.env.PI_MANAGER_PYTHON || "python", repoMain, "--print-provider-env"];
+function invokeConfigBroker(operation, args) {
+  const command = managerHelperCommand("--config-mutate");
+  if (!command) return Promise.reject(new Error("未找到 Pi Manager Config Broker"));
+  const requestPath = path.join(
+    os.tmpdir(),
+    `pi-manager-config-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`
+  );
+  const request = {
+    schema_version: 1,
+    request_id: `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    operation,
+    arguments: args || {},
+  };
+  try {
+    fs.writeFileSync(requestPath, JSON.stringify(request), { encoding: "utf8", mode: 0o600, flag: "wx" });
+  } catch (error) {
+    return Promise.reject(new Error(`无法创建 Config Broker 请求：${error.message}`));
   }
-  // legacy layout
-  const siblingMain = path.resolve(__dirname, "..", "pi-manager", "main.py");
-  if (fs.existsSync(siblingMain)) {
-    return [process.env.PI_MANAGER_PYTHON || "python", siblingMain, "--print-provider-env"];
-  }
-  return null;
+  const [bin, ...baseArgs] = command;
+  return new Promise((resolve, reject) => {
+    execFile(bin, [...baseArgs, requestPath], { windowsHide: true, timeout: 20000 }, (error, stdout, stderr) => {
+      try {
+        const payload = JSON.parse(String(stdout || "{}"));
+        if (!payload.ok) throw new Error(payload.error || "Config Broker mutation failed");
+        resolve(payload);
+      } catch (parseError) {
+        reject(new Error(error ? `Config Broker 启动失败：${error.message}` : parseError.message));
+      } finally {
+        try { fs.unlinkSync(requestPath); } catch {}
+      }
+    });
+  });
 }
 
 function providerNeedsManagerEnv(provider) {
@@ -213,8 +256,7 @@ function providerNeedsManagerEnv(provider) {
   return /^\$\{PI_MANAGER_PROVIDER_[A-Z0-9_]+_API_KEY\}$/.test(key) || key.startsWith("__DPAPI__:");
 }
 
-function resolveProviderEnv(provider) {
-  if (!provider || !providerNeedsManagerEnv(provider)) return Promise.resolve({});
+function invokeProviderHelper(provider, helperArgs = []) {
   const command = providerHelperCommand();
   if (!command) {
     return Promise.reject(
@@ -236,7 +278,7 @@ function resolveProviderEnv(provider) {
     }
     execFile(
       bin,
-      [...baseArgs, "--output", output, provider],
+      [...baseArgs, "--output", output, ...helperArgs, provider],
       { windowsHide: true, timeout: 20000, cwd: path.dirname(command[1] || __dirname) },
       (err, stdout, stderr) => {
         let payload;
@@ -262,27 +304,49 @@ function resolveProviderEnv(provider) {
           reject(new Error(payload.error || String(stderr || "无法解析 Provider 密钥")));
           return;
         }
-        const env = payload.env && typeof payload.env === "object" ? payload.env : {};
-        resolve(env);
+        resolve(payload);
       }
     );
   });
 }
 
+function resolveProviderCredential(provider) {
+  if (!provider || !providerNeedsManagerEnv(provider)) {
+    return Promise.resolve({ env: {}, keyId: "" });
+  }
+  return invokeProviderHelper(provider).then((payload) => ({
+    env: payload.env && typeof payload.env === "object" ? payload.env : {},
+    keyId: String(payload.key_id || ""),
+  }));
+}
+
+function resolveProviderEnv(provider) {
+  return resolveProviderCredential(provider).then((credential) => credential.env);
+}
+
+function markProviderKeyFailed(provider, keyId, reason) {
+  if (!provider || !keyId) return Promise.resolve({ marked: false, hasAvailable: false });
+  return invokeProviderHelper(provider, [
+    "--mark-failed",
+    "--key-id",
+    String(keyId),
+    "--reason",
+    String(reason || "").slice(0, 200),
+  ]).then((payload) => ({
+    marked: Boolean(payload.marked),
+    status: String(payload.status || ""),
+    failureKind: String(payload.failure_kind || ""),
+    retryAt: String(payload.retry_at || ""),
+    hasAvailable: Boolean(payload.has_available),
+  }));
+}
+
 function findPiCommand() {
-  const cfg = vscode.workspace.getConfiguration("pi");
-  const custom = (cfg.get("command") || "pi").trim();
+  requireTrustedExecution(vscode.workspace);
+  const custom = String(executableConfiguration("command", "pi") || "pi").trim();
   if (custom && custom !== "pi") return custom;
 
   const appdata = process.env.APPDATA || "";
-  const candidates = [
-    path.join(appdata, "npm", "pi.cmd"),
-    path.join(appdata, "npm", "pi"),
-  ];
-  for (const c of candidates) {
-    if (c && fs.existsSync(c)) return c;
-  }
-
   const cliCandidates = [
     path.join(appdata, "npm", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
     path.join(appdata, "npm", "node_modules", "@mariozechner", "pi-coding-agent", "dist", "cli.js"),
@@ -292,7 +356,25 @@ function findPiCommand() {
       return { kind: "node-cli", cli };
     }
   }
+  const candidates = [
+    path.join(appdata, "npm", "pi.cmd"),
+    path.join(appdata, "npm", "pi"),
+  ];
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) return candidate;
+  }
   return "pi";
+}
+
+function nodeExecutable() {
+  return String(process.env.PI_MANAGER_NODE || "node");
+}
+
+function piInvocation(piCommand = findPiCommand()) {
+  if (typeof piCommand === "object" && piCommand.kind === "node-cli") {
+    return { bin: nodeExecutable(), args: [piCommand.cli] };
+  }
+  return resolveCommand(piCommand, (candidate) => fs.existsSync(candidate)) || { bin: "pi", args: [] };
 }
 
 function shellQuote(s) {
@@ -303,42 +385,27 @@ function shellQuote(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
 
-function buildLaunchCommand({ withDefaults = true, prompt = null, provider = null, model = null } = {}) {
+function buildLaunchSpec({ withDefaults = true, prompt = null, provider = null, model = null } = {}) {
+  requireTrustedExecution(vscode.workspace);
   const cfg = vscode.workspace.getConfiguration("pi");
   const settings = readSettings();
-  const piCmd = findPiCommand();
-  const extra = (cfg.get("extraArgs") || "").trim();
-  const parts = [];
+  const invocation = piInvocation(findPiCommand());
+  const args = [...invocation.args];
+  const extra = commandParts(executableConfiguration("extraArgs", ""));
 
-  if (typeof piCmd === "object" && piCmd.kind === "node-cli") {
-    parts.push(shellQuote(process.execPath || "node"), shellQuote(piCmd.cli));
-  } else if (String(piCmd).toLowerCase().endsWith(".cmd") || String(piCmd).toLowerCase().endsWith(".bat")) {
-    parts.push(shellQuote(piCmd));
-  } else {
-    parts.push(shellQuote(piCmd));
-  }
-
-  const useP = provider || (withDefaults && cfg.get("useDefaultModelFromSettings") !== false ? settings.defaultProvider : null);
-  const useM = model || (withDefaults && cfg.get("useDefaultModelFromSettings") !== false ? settings.defaultModel : null);
-  if (useP) parts.push("--provider", shellQuote(String(useP)));
-  if (useM) parts.push("--model", shellQuote(String(useM)));
+  const requestedPair = normalizeModelPair(provider, model);
+  const useDefaults = withDefaults && cfg.get("useDefaultModelFromSettings") !== false;
+  const pair = requestedPair || (useDefaults ? normalizeModelPair(settings.defaultProvider, settings.defaultModel) : null);
+  if (pair) args.push("--provider", pair[0], "--model", pair[1]);
   if (withDefaults && settings.defaultThinkingLevel) {
-    parts.push("--thinking", shellQuote(settings.defaultThinkingLevel));
+    args.push("--thinking", String(settings.defaultThinkingLevel));
   }
-
   if (cfg.get("appendChinesePrompt") !== false) {
-    parts.push("--append-system-prompt", shellQuote(ZH_PROMPT));
+    args.push("--append-system-prompt", ZH_PROMPT);
   }
-
-  if (extra) {
-    parts.push(extra);
-  }
-
-  if (prompt) {
-    parts.push("-p", "--approve", "--no-session", shellQuote(prompt));
-  }
-
-  return parts.join(" ");
+  args.push(...extra);
+  if (prompt) args.push("-p", "--approve", "--no-session", String(prompt));
+  return { executable: invocation.bin, args };
 }
 
 function resolveCwd(folderUri) {
@@ -348,14 +415,28 @@ function resolveCwd(folderUri) {
   return os.homedir();
 }
 
-function openPiTerminal(title, command, cwd, env = {}) {
+function terminalProcessSpec(spec) {
+  if (process.platform !== "win32" || !/\.(cmd|bat)$/i.test(String(spec.executable))) {
+    return spec;
+  }
+  const command = [shellQuote(String(spec.executable)), ...spec.args.map((arg) => shellQuote(String(arg)))].join(" ");
+  return {
+    executable: process.env.ComSpec || "cmd.exe",
+    args: ["/d", "/s", "/c", command],
+  };
+}
+
+function openPiTerminal(title, spec, cwd, env = {}) {
+  requireTrustedExecution(vscode.workspace);
+  const processSpec = terminalProcessSpec(spec);
   const term = vscode.window.createTerminal({
     name: title,
     cwd,
     env,
+    shellPath: processSpec.executable,
+    shellArgs: processSpec.args,
   });
   term.show(true);
-  setTimeout(() => term.sendText(command, true), 150);
   return term;
 }
 
@@ -379,8 +460,8 @@ async function cmdOpenTerminal(folderUri) {
   const settings = readSettings();
   try {
     const env = await resolveProviderEnv(providerFromSettings(settings));
-    const cmd = buildLaunchCommand({ withDefaults: false });
-    openPiTerminal("Pi", cmd, cwd, env);
+    const spec = buildLaunchSpec({ withDefaults: false });
+    openPiTerminal("Pi", spec, cwd, env);
   } catch (err) {
     vscode.window.showErrorMessage(err.message);
   }
@@ -391,29 +472,256 @@ async function cmdOpenWithDefault(folderUri) {
   const settings = readSettings();
   try {
     const env = await resolveProviderEnv(providerFromSettings(settings));
-    const cmd = buildLaunchCommand({ withDefaults: true });
-    openPiTerminal("Pi (default)", cmd, cwd, env);
+    const spec = buildLaunchSpec({ withDefaults: true });
+    openPiTerminal("Pi (default)", spec, cwd, env);
   } catch (err) {
     vscode.window.showErrorMessage(err.message);
   }
 }
 
 async function cmdAskPrompt() {
+  if (askRunning) {
+    vscode.window.showWarningMessage("Pi 快速提问仍在运行，请等待当前请求结束");
+    if (askOutput) askOutput.show(true);
+    return;
+  }
   const prompt = await vscode.window.showInputBox({
     title: "Pi 快速提问",
-    prompt: "输入问题（使用 pi -p 非交互模式）",
+    prompt: "输入问题（失败计数和自动换模与 Pi Manager 桌面端共享）",
     placeHolder: "例如：总结当前仓库结构",
   });
   if (!prompt) return;
   const cwd = resolveCwd();
   const settings = readSettings();
+  const provider = providerFromSettings(settings);
+  const model = modelFromSettings(settings);
+  askRunning = true;
+  askOutput = askOutput || vscode.window.createOutputChannel("Pi Ask");
+  askOutput.appendLine(`\n>>> ${prompt}`);
+  askOutput.appendLine(`[工作目录] ${cwd}`);
+  askOutput.show(true);
   try {
-    const env = await resolveProviderEnv(providerFromSettings(settings));
-    const cmd = buildLaunchCommand({ withDefaults: true, prompt });
-    openPiTerminal("Pi Ask", cmd, cwd, env);
+    const result = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "Pi 快速提问",
+        cancellable: false,
+      },
+      async (progress) => {
+        return chatWithFailover({
+          prompt,
+          provider,
+          model,
+          readManager: async () => readManagerConfig(),
+          writeManager: async (manager) => writeManagerConfig(manager),
+          readSettings: async () => readSettings(),
+          setDefaultModel: async (nextProvider, nextModel) => {
+            await setDefaultModel(nextProvider, nextModel);
+          },
+          runAttempt: (text, attemptProvider, attemptModel) =>
+            runPiPrompt(text, attemptProvider, attemptModel, cwd),
+          onAttempt: async (attempt) => {
+            const key = `${attempt.provider}/${attempt.model}`;
+            if (attempt.skipped) {
+              askOutput.appendLine(`[跳过] ${key}: ${attempt.reason}`);
+              return;
+            }
+            if (attempt.ok) {
+              progress.report({ message: `${key} 已完成` });
+              return;
+            }
+            const count = attempt.fail_count == null ? "?" : attempt.fail_count;
+            askOutput.appendLine(`[失败 ${count}] ${key}: ${attempt.error || `exit ${attempt.returncode}`}`);
+            progress.report({ message: `${key} 失败，计数 ${count}` });
+          },
+        });
+      }
+    );
+
+    const key = `${result.provider || "?"}/${result.model || "?"}`;
+    if (result.ok) {
+      if (result.switched) {
+        askOutput.appendLine(`[自动换模] ${result.switched_from || `${provider}/${model}`} -> ${key}`);
+        refreshStatusBar();
+        if (viewProvider) viewProvider.refresh();
+        vscode.window.setStatusBarMessage(`Pi 已自动切换模型 -> ${key}`, 5000);
+      }
+      const text = String(result.stdout || result.stderr || "").trim();
+      askOutput.appendLine(text || "[Pi 未返回文本]");
+      askOutput.appendLine(`[完成] ${key} · ${result.latency_ms || 0} ms`);
+    } else {
+      const error = String(result.error || result.stderr || `退出码 ${result.returncode}`).trim();
+      askOutput.appendLine(`[最终失败] ${key}: ${error}`);
+      vscode.window.showErrorMessage(`Pi 快速提问失败：${error.split(/\r?\n/, 1)[0]}`);
+    }
   } catch (err) {
-    vscode.window.showErrorMessage(err.message);
+    const message = err && err.message ? err.message : String(err);
+    askOutput.appendLine(`[错误] ${message}`);
+    vscode.window.showErrorMessage(message);
+  } finally {
+    askRunning = false;
   }
+}
+
+function runPiPrompt(prompt, provider, model, cwd) {
+  requireTrustedExecution(vscode.workspace);
+  const cfg = vscode.workspace.getConfiguration("pi");
+  const settings = readSettings();
+  const piCmd = findPiCommand();
+  const extra = commandParts(executableConfiguration("extraArgs", ""));
+  const invocation = piInvocation(piCmd);
+  const args = [...invocation.args];
+  let bin = invocation.bin;
+  const [attemptProvider, attemptModel] = normalizeModelPair(provider, model, { allowEmpty: false });
+  args.push("--provider", attemptProvider, "--model", attemptModel);
+  if (settings.defaultThinkingLevel) {
+    args.push("--thinking", String(settings.defaultThinkingLevel));
+  }
+  if (cfg.get("appendChinesePrompt") !== false) {
+    args.push("--append-system-prompt", ZH_PROMPT);
+  }
+  args.push(...extra, "-p", "--approve", "--no-session", prompt);
+
+  return runWithProviderKeyFailover({
+    resolveCredential: () => resolveProviderCredential(attemptProvider),
+    markFailed: (keyId, reason) => markProviderKeyFailed(attemptProvider, keyId, reason),
+    run: (providerEnv) =>
+      new Promise((resolve) => {
+        const manager = readManagerConfig();
+        const proxyEnv = {};
+        if (manager.proxy_enabled && manager.proxy_url) {
+          proxyEnv.HTTP_PROXY = String(manager.proxy_url);
+          proxyEnv.HTTPS_PROXY = String(manager.proxy_url);
+          proxyEnv.http_proxy = String(manager.proxy_url);
+          proxyEnv.https_proxy = String(manager.proxy_url);
+        }
+        const started = Date.now();
+        const options = {
+          cwd,
+          env: { ...process.env, ...proxyEnv, ...providerEnv },
+          windowsHide: true,
+          timeout: 180000,
+          maxBuffer: 16 * 1024 * 1024,
+          encoding: "utf8",
+        };
+        let runBin = bin;
+        let runArgs = [...args];
+        if (process.platform === "win32" && /\.(cmd|bat)$/i.test(String(runBin))) {
+          const command = [shellQuote(String(runBin)), ...runArgs.map((arg) => shellQuote(String(arg)))].join(" ");
+          runBin = process.env.ComSpec || "cmd.exe";
+          runArgs = ["/d", "/s", "/c", command];
+        }
+        execFile(runBin, runArgs, options, (error, stdout, stderr) => {
+          const text = String(stdout || "").trim();
+          const errorText = String(stderr || "").trim();
+          let ok = !error && Boolean(text);
+          let effectiveOutput = stdout || "";
+          if (!error && !text && errorText && !errorText.toLowerCase().includes("error")) {
+            ok = true;
+            effectiveOutput = stderr || "";
+          }
+          const returncode = error && Number.isInteger(error.code) ? error.code : ok ? 0 : -1;
+          resolve({
+            ok,
+            returncode,
+            stdout: effectiveOutput,
+            stderr: stderr || "",
+            latency_ms: Date.now() - started,
+            error: ok ? "" : errorText || text || (error && error.message) || `退出码 ${returncode}`,
+          });
+        });
+      }),
+  });
+}
+
+function getJson(url, redirects = 0, origin = "") {
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (error) {
+      reject(new Error(`无效 Release URL：${error.message}`));
+      return;
+    }
+    const trustedOrigin = origin || parsed.origin;
+    if (parsed.protocol !== "https:" || parsed.origin !== trustedOrigin || redirects > 3) {
+      reject(new Error("Release API 重定向违反 HTTPS/同源策略"));
+      return;
+    }
+    const request = https.get(
+      parsed,
+      {
+        headers: {
+          Accept: "application/vnd.github+json",
+          "User-Agent": "PiManager-Cursor-Extension",
+        },
+      },
+      (response) => {
+        if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+          response.resume();
+          const next = new URL(response.headers.location, parsed).toString();
+          getJson(next, redirects + 1, trustedOrigin).then(resolve, reject);
+          return;
+        }
+        let body = "";
+        let size = 0;
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          size += Buffer.byteLength(chunk, "utf8");
+          if (size > 1024 * 1024) request.destroy(new Error("Release API 响应超过 1 MiB"));
+          else body += chunk;
+        });
+        response.on("end", () => {
+          if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+            reject(new Error(`GitHub Release API 返回 HTTP ${response.statusCode || 0}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(body));
+          } catch (error) {
+            reject(new Error(`GitHub Release 响应无效：${error.message}`));
+          }
+        });
+      }
+    );
+    request.setTimeout(15000, () => request.destroy(new Error("检查 VSIX 更新超时")));
+    request.on("error", reject);
+  });
+}
+
+async function checkExtensionUpdate(context, silent = false) {
+  const localVersion = String(context.extension.packageJSON.version || "0.0.0");
+  try {
+    const release = await getJson(GITHUB_RELEASE_API);
+    const info = vsixUpdateInfo(localVersion, release);
+    await context.globalState.update("pi.lastVsixUpdateCheck", Date.now());
+    if (!info.hasUpdate) {
+      if (!silent) vscode.window.showInformationMessage(info.message);
+      return info;
+    }
+    const choice = await vscode.window.showInformationMessage(
+      `${info.message}。签名更新链完成前仅支持从官方 Release 页面手动安装。`,
+      "打开 Release",
+      "稍后"
+    );
+    if (choice === "打开 Release") {
+      await vscode.env.openExternal(vscode.Uri.parse(info.releaseUrl || RELEASE_PAGE));
+    }
+    return info;
+  } catch (error) {
+    if (!silent) {
+      vscode.window.showWarningMessage(`检查 VSIX 更新失败：${error.message || String(error)}`);
+    }
+    return { ok: false, error: error.message || String(error) };
+  }
+}
+
+function scheduleExtensionUpdateCheck(context) {
+  const cfg = vscode.workspace.getConfiguration("pi");
+  if (cfg.get("autoCheckExtensionUpdate") === false) return;
+  const last = Number(context.globalState.get("pi.lastVsixUpdateCheck", 0));
+  if (Date.now() - last < VSIX_CHECK_INTERVAL_MS) return;
+  setTimeout(() => checkExtensionUpdate(context, true), 3000);
 }
 
 async function cmdOpenConfig() {
@@ -424,15 +732,10 @@ async function cmdOpenConfig() {
 }
 
 function cmdCheckVersion() {
-  const piCmd = findPiCommand();
-  let bin = "pi";
-  let args = ["-v"];
-  if (typeof piCmd === "object" && piCmd.kind === "node-cli") {
-    bin = process.execPath || "node";
-    args = [piCmd.cli, "-v"];
-  } else {
-    bin = piCmd;
-  }
+  requireTrustedExecution(vscode.workspace);
+  const invocation = piInvocation();
+  const bin = invocation.bin;
+  const args = [...invocation.args, "-v"];
 
   execFile(bin, args, { windowsHide: true, timeout: 20000 }, (err, stdout, stderr) => {
     if (err) {
@@ -525,7 +828,7 @@ async function cmdSwitchModel() {
   }
 
   try {
-    const res = setDefaultModel(provider, model);
+    const res = await setDefaultModel(provider, model);
     const launch = await vscode.window.showInformationMessage(
       `已切换默认模型：${res.key}\n\n说明：已运行中的 Pi 会话不会自动换模型；新启动的会话会使用新默认。Pi 内可用 Ctrl+P 在 enabledModels 中循环。`,
       "立即启动 Pi",
@@ -569,7 +872,7 @@ class PiManagerViewProvider {
         if (msg.type === "ready" || msg.type === "refresh") {
           this.postCatalog();
         } else if (msg.type === "setDefault") {
-          const res = setDefaultModel(msg.provider, msg.model);
+          const res = await setDefaultModel(msg.provider, msg.model);
           this.postCatalog();
           vscode.window.showInformationMessage(`默认模型已切换：${res.key}`);
         } else if (msg.type === "launch") {
@@ -783,6 +1086,8 @@ class PiManagerViewProvider {
 }
 
 function activate(context) {
+  askOutput = vscode.window.createOutputChannel("Pi Ask");
+  context.subscriptions.push(askOutput);
   viewProvider = new PiManagerViewProvider(context.extensionUri);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider("pi.managerView", viewProvider)
@@ -794,6 +1099,7 @@ function activate(context) {
     vscode.commands.registerCommand("pi.askPrompt", cmdAskPrompt),
     vscode.commands.registerCommand("pi.openConfig", cmdOpenConfig),
     vscode.commands.registerCommand("pi.checkVersion", cmdCheckVersion),
+    vscode.commands.registerCommand("pi.checkExtensionUpdate", () => checkExtensionUpdate(context, false)),
     vscode.commands.registerCommand("pi.switchModel", cmdSwitchModel),
     vscode.commands.registerCommand("pi.openPanel", cmdOpenPanel),
     vscode.commands.registerCommand("pi.refreshModels", cmdRefreshModels)
@@ -821,6 +1127,7 @@ function activate(context) {
   } catch {
     // ignore if agent dir missing
   }
+  scheduleExtensionUpdateCheck(context);
 }
 
 function deactivate() {}
@@ -829,7 +1136,13 @@ module.exports = {
   activate,
   deactivate,
   providerHelperCommand,
+  invokeConfigBroker,
+  buildLaunchSpec,
+  resolveProviderCredential,
   resolveProviderEnv,
+  markProviderKeyFailed,
   collectModelCatalog,
   setDefaultModel,
+  runPiPrompt,
+  checkExtensionUpdate,
 };

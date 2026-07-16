@@ -23,12 +23,16 @@ def test_encrypted_secret_bundle_round_trip(isolated_home, tmp_path):
         api_key="secret-value-never-in-zip",
         models=[{"id": "m"}],
     )
+    second = core.add_provider_api_key("Demo", "second-secret-never-in-zip")
+    first_id = core.list_provider_api_keys("Demo")[0]["id"]
+    assert secretstore.mark_provider_key_failed("Demo", first_id, "HTTP 429")
     dest = tmp_path / "config.zip"
     extras.export_config_bundle(
         str(dest), include_secrets=True, password="correct horse battery"
     )
     raw = dest.read_bytes()
     assert b"secret-value-never-in-zip" not in raw
+    assert b"second-secret-never-in-zip" not in raw
     with zipfile.ZipFile(dest) as bundle:
         assert "secrets.enc.json" in bundle.namelist()
         assert "secrets.vault.json" not in bundle.namelist()
@@ -39,14 +43,19 @@ def test_encrypted_secret_bundle_round_trip(isolated_home, tmp_path):
     assert wrong["ok"] is False
     assert "密码错误" in wrong["error"]
 
-    secretstore.delete_secret(secretstore.provider_key_name("Demo"))
+    secretstore.delete_provider_api_keys("Demo")
     core.models_path().unlink()
     restored = extras.import_config_bundle(
         str(dest), restore_secrets=True, password="correct horse battery"
     )
     assert restored["ok"] is True
+    rows = core.list_provider_api_keys("Demo")
+    assert [(row["id"], row["status"]) for row in rows] == [
+        (first_id, "cooldown"),
+        (second["id"], "available"),
+    ]
     assert core.provider_runtime_env("Demo") == {
-        secretstore.provider_env_name("Demo"): "secret-value-never-in-zip"
+        secretstore.provider_env_name("Demo"): "second-secret-never-in-zip"
     }
 
 
@@ -93,25 +102,49 @@ def test_invalid_json_does_not_modify_existing_config(isolated_home, tmp_path):
     assert core.load_settings() == {"before": True}
 
 
-def test_command_keys_require_explicit_confirmation(isolated_home, tmp_path):
-    bundle = tmp_path / "command.zip"
-    models = {
-        "providers": {
-            "Command Provider": {
-                "baseUrl": "https://example.invalid/v1",
-                "apiKey": "!credential-helper get",
-                "models": [],
+def test_command_keys_are_permanently_rejected(isolated_home, tmp_path):
+    variants = [
+        "!credential-helper get",
+        '"!credential-helper get"',
+        "'!credential-helper get'",
+        "  \t !credential-helper get  ",
+        "\uff01credential-helper get",
+    ]
+    for index, value in enumerate(variants):
+        bundle = tmp_path / f"command-{index}.zip"
+        models = {
+            "providers": {
+                "Command Provider": {
+                    "baseUrl": "https://example.invalid/v1",
+                    "apiKey": value,
+                    "models": [],
+                }
             }
         }
-    }
-    _write_zip(bundle, {"models.json": json.dumps(models)})
-    rejected = extras.import_config_bundle(str(bundle))
-    assert rejected["ok"] is False
-    assert rejected["requires_command_confirmation"] is True
+        _write_zip(bundle, {"models.json": json.dumps(models)})
+        rejected = extras.import_config_bundle(str(bundle), allow_commands=True)
+        assert rejected["ok"] is False
+        assert "!command" in rejected["error"]
+        assert core.get_provider_config("Command Provider") is None
 
-    accepted = extras.import_config_bundle(str(bundle), allow_commands=True)
-    assert accepted["ok"] is True
-    assert core.get_provider_config("Command Provider")["apiKey"].startswith("!")
+
+def test_command_headers_and_non_string_headers_are_rejected(isolated_home, tmp_path):
+    for index, value in enumerate(['"!helper"', "' !helper '", {"command": "helper"}]):
+        bundle = tmp_path / f"header-command-{index}.zip"
+        models = {
+            "providers": {
+                "Command Provider": {
+                    "baseUrl": "https://example.invalid/v1",
+                    "apiKey": "${SAFE_KEY}",
+                    "headers": {"Authorization": value},
+                    "models": [],
+                }
+            }
+        }
+        _write_zip(bundle, {"models.json": json.dumps(models)})
+        rejected = extras.import_config_bundle(str(bundle))
+        assert rejected["ok"] is False
+        assert core.get_provider_config("Command Provider") is None
 
 
 def test_normal_export_removes_proxy_credentials(isolated_home, tmp_path):
