@@ -788,7 +788,13 @@ class SetupWizardDialog(QDialog):
 
 
 class MainWindow(FeatureMixin, QMainWindow):
-    def __init__(self):
+    def __init__(self, *, start_background: bool = True):
+        """Create the window.
+
+        ``start_background=False`` is intentionally supported for offscreen UI
+        tests and embedders: construction then has no network workers, tray icon,
+        update prompt, or startup timer side effects.
+        """
         super().__init__()
         self.setWindowTitle("Pi Manager — 简化配置 · 跨平台 Pi 启动器")
         try:
@@ -805,13 +811,15 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.setAcceptDrops(True)
         self.init_feature_state()
         self._build_ui()
-        self.refresh_all()
-        self.setup_system_tray()
-        # defer first-run / update checks so UI shows first
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(400, self._startup_checks)
-        if bool(self.mgr.get("start_minimized")) and self.tray:
-            QTimer.singleShot(0, self.hide)
+        self._background_enabled = bool(start_background)
+        if self._background_enabled:
+            self.refresh_all()
+            self.setup_system_tray()
+            # Defer first-run / update checks so the shell paints first.
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(400, self._startup_checks)
+            if bool(self.mgr.get("start_minimized")) and self.tray:
+                QTimer.singleShot(0, self.hide)
 
     def _build_ui(self):
         """Sidebar-first layout (no redundant top toolbar)."""
@@ -3212,7 +3220,14 @@ def run_app():
     pal.setColor(QPalette.ToolTipBase, QColor(cols["window"]))
     pal.setColor(QPalette.ToolTipText, QColor(cols["text"]))
     app.setPalette(pal)
-    app.setStyleSheet(ui_theme.build_stylesheet(ut.get("mode"), ut.get("accent")))
-    win = MainWindow()
+    try:
+        from .presentation.design import build_stylesheet as build_modern_stylesheet
+        app.setStyleSheet(build_modern_stylesheet(ut.get("mode"), ut.get("accent")))
+    except Exception:
+        app.setStyleSheet(ui_theme.build_stylesheet(ut.get("mode"), ut.get("accent")))
+    # Runtime import keeps the stable behavior module independent from the
+    # presentation package and avoids a module-load circular dependency.
+    from .presentation.main_window import ModernMainWindow
+    win = ModernMainWindow()
     win.show()
     return app.exec()

@@ -18,7 +18,7 @@ from . import core
 from . import secrets as secretstore
 from . import storage
 
-APP_VERSION = "1.6.5"
+APP_VERSION = "1.7.0"
 APP_NAME = "Pi Manager"
 # Optional remote version manifest (JSON: {"version":"x.y.z","notes":"...","url":"..."})
 # 未配置时自动回退 GitHub Releases API

@@ -30,7 +30,22 @@ hiddenimports = [
     "pi_manager.builtin_themes",
     "pi_manager.core",
     "pi_manager.ui",
+    "pi_manager.presentation",
+    "pi_manager.presentation.main_window",
+    "pi_manager.presentation.design.stylesheet",
+    "pi_manager.presentation.components.navigation",
+    "pi_manager.presentation.pages.dashboard",
+    "pi_manager.presentation.pages.models",
+    "pi_manager.presentation.pages.providers",
+    "pi_manager.presentation.pages.chat",
+    "pi_manager.presentation.pages.sessions",
+    "pi_manager.presentation.pages.diagnostics",
+    "pi_manager.presentation.pages.settings",
+    "pi_manager.presentation.pages.help",
 ]
+
+# Include every modular presentation page in frozen builds.
+hiddenimports += collect_submodules("pi_manager.presentation")
 try:
     hiddenimports += collect_submodules("keyring.backends")
 except Exception:

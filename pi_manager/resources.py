@@ -118,12 +118,17 @@ def self_check() -> list[str]:
 
     try:
         from pi_manager import core, extras, secrets, platform_util, provider_env  # noqa: F401
+        from pi_manager.presentation import ModernMainWindow  # noqa: F401
     except Exception as exc:
         errors.append(f"pi_manager package import failed: {exc}")
 
     icon = asset_path("icon.png") or asset_path("logo-256.png") or asset_path("pi-manager.ico")
     if icon is None:
         errors.append("bundled assets missing (icon.png / logo-256.png / pi-manager.ico)")
+    required_ui_icons = ("home.svg", "models.svg", "providers.svg", "settings.svg")
+    missing_ui_icons = [name for name in required_ui_icons if asset_path("icons", name) is None]
+    if missing_ui_icons:
+        errors.append(f"modern UI icons missing: {', '.join(missing_ui_icons)}")
 
     # Offscreen Qt app creation proves plugins are loadable without a display server
     # when QT_QPA_PLATFORM=offscreen (set by CI smoke tests).

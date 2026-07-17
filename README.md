@@ -12,6 +12,7 @@
 
 ## 功能概览
 
+- 全新现代化 UI：分组可折叠导航、深浅主题、统一卡片/表格/对话框与本地 SVG 图标
 - 自定义 Provider / 模型配置、从 API 拉取模型、批量可用性测试
 - Provider 支持多 API Key：鉴权、限流或额度错误时先在同一接口内热切 Key，失败 Key 暂存失效池并可手动恢复
 - Provider API Key 安全存储：OS keyring 优先，当前用户 AES-GCM 文件库回退
@@ -112,7 +113,7 @@ pi.providerEnvCommand = python /path/to/PiManager/main.py --print-provider-env
 python -m pip install -r requirements.txt pyinstaller
 python -m PyInstaller --noconfirm --clean PiManager.spec
 python scripts/smoke_test_dist.py
-python scripts/package_release.py --version 1.6.5
+python scripts/package_release.py --version 1.7.0
 ```
 
 跨平台（Windows / macOS / Linux）推荐用 GitHub Actions：

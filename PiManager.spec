@@ -36,7 +36,22 @@ hiddenimports = [
     "pi_manager.builtin_themes",
     "pi_manager.core",
     "pi_manager.ui",
+    "pi_manager.presentation",
+    "pi_manager.presentation.main_window",
+    "pi_manager.presentation.design.stylesheet",
+    "pi_manager.presentation.components.navigation",
+    "pi_manager.presentation.pages.dashboard",
+    "pi_manager.presentation.pages.models",
+    "pi_manager.presentation.pages.providers",
+    "pi_manager.presentation.pages.chat",
+    "pi_manager.presentation.pages.sessions",
+    "pi_manager.presentation.pages.diagnostics",
+    "pi_manager.presentation.pages.settings",
+    "pi_manager.presentation.pages.help",
 ]
+
+# Include every modular presentation page in frozen builds.
+hiddenimports += collect_submodules("pi_manager.presentation")
 
 # Pull all keyring backends so frozen apps do not miss platform providers.
 try:
@@ -125,8 +140,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "PiManager",
             "CFBundleDisplayName": "PiManager",
-            "CFBundleShortVersionString": "1.6.5",
-            "CFBundleVersion": "1.6.5",
+            "CFBundleShortVersionString": "1.7.0",
+            "CFBundleVersion": "1.7.0",
             "CFBundlePackageType": "APPL",
             "CFBundleExecutable": "PiManager",
             "LSMinimumSystemVersion": "12.0",

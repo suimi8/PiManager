@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version label (e.g. 1.6.5)"
+        description: "Release version label (e.g. 1.7.0)"
         required: true
-        default: "1.6.5"
+        default: "1.7.0"
       upload_to_release:
-        description: "Existing GitHub Release tag to upload into (e.g. v1.6.5). Leave empty for artifacts only."
+        description: "Existing GitHub Release tag to upload into (e.g. v1.7.0). Leave empty for artifacts only."
         required: false
         default: ""
   push:
@@ -88,7 +88,7 @@ jobs:
           elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=1.6.5" >> "$GITHUB_OUTPUT"
+            echo "version=1.7.0" >> "$GITHUB_OUTPUT"
           fi
 
       - name: PyInstaller (directory / app)
