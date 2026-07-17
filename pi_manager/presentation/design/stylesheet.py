@@ -14,14 +14,14 @@ def build_stylesheet(mode: str = "night", accent: str = "blue") -> str:
 * {{
     font-family: {font};
 }}
-QMainWindow, QDialog {{
-    background: {c.window};
-    color: {c.text};
-}}
 QWidget {{
     background: transparent;
     color: {c.text};
     font-size: 13px;
+}}
+QMainWindow, QDialog, QMessageBox, QFileDialog, QInputDialog {{
+    background: {c.window};
+    color: {c.text};
 }}
 QWidget#appRoot, QFrame#contentShell, QStackedWidget#pages {{
     background: {c.window};
@@ -32,6 +32,14 @@ QToolTip {{
     border: 1px solid {c.border_strong};
     border-radius: 7px;
     padding: 6px 9px;
+}}
+QDialogButtonBox, QMessageBox QLabel, QFileDialog QLabel {{
+    background: transparent;
+    color: {c.text};
+}}
+QDialogButtonBox {{
+    border-top: 1px solid {c.border};
+    padding-top: 10px;
 }}
 
 /* Navigation */
@@ -326,7 +334,7 @@ QToolButton::menu-indicator {{
 }}
 
 /* Inputs */
-QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QSpinBox {{
+QLineEdit, QPlainTextEdit, QTextEdit, QTextBrowser, QComboBox, QSpinBox, QDoubleSpinBox {{
     background: {c.input};
     color: {c.text};
     border: 1px solid {c.border};
@@ -334,17 +342,17 @@ QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QSpinBox {{
     selection-background-color: {c.accent};
     selection-color: {c.selection_text};
 }}
-QLineEdit, QComboBox, QSpinBox {{
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
     min-height: 32px;
     padding: 0 10px;
 }}
-QPlainTextEdit, QTextEdit {{
+QPlainTextEdit, QTextEdit, QTextBrowser {{
     padding: 9px;
 }}
-QLineEdit:hover, QPlainTextEdit:hover, QTextEdit:hover, QComboBox:hover, QSpinBox:hover {{
+QLineEdit:hover, QPlainTextEdit:hover, QTextEdit:hover, QTextBrowser:hover, QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover {{
     border-color: {c.border_strong};
 }}
-QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QComboBox:focus, QSpinBox:focus {{
+QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QTextBrowser:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {{
     border: 1px solid {c.accent};
 }}
 QComboBox::drop-down {{
@@ -358,6 +366,16 @@ QComboBox QAbstractItemView {{
     selection-background-color: {c.accent_soft};
     selection-color: {c.accent_text};
     outline: none;
+}}
+QLineEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled, QTextBrowser:disabled,
+QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {{
+    background: {c.surface};
+    color: {c.text_muted};
+    border-color: {c.border};
+}}
+QPlainTextEdit:read-only, QTextEdit:read-only, QTextBrowser:read-only {{
+    background: {c.input};
+    color: {c.text_secondary};
 }}
 QCheckBox, QRadioButton {{
     color: {c.text_secondary};
@@ -385,9 +403,16 @@ QRadioButton::indicator:checked {{
     background: {c.accent};
     border: 4px solid {c.input};
 }}
+QCheckBox:disabled, QRadioButton:disabled {{
+    color: {c.text_muted};
+}}
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
+    background: {c.surface};
+    border-color: {c.border};
+}}
 
 /* Lists and tables */
-QListWidget, QTreeWidget, QTableWidget {{
+QAbstractItemView, QListWidget, QListView, QTreeWidget, QTreeView, QTableWidget, QTableView {{
     background: {c.surface};
     color: {c.text_secondary};
     border: 1px solid {c.border};
@@ -396,28 +421,31 @@ QListWidget, QTreeWidget, QTableWidget {{
     alternate-background-color: {c.surface_raised};
     gridline-color: transparent;
 }}
-QListWidget::item {{
+QAbstractItemView::item {{
+    color: {c.text_secondary};
+}}
+QListWidget::item, QListView::item, QTreeView::item {{
     min-height: 34px;
     padding: 4px 9px;
     border-radius: 6px;
     margin: 2px 4px;
 }}
-QListWidget::item:hover {{
+QListWidget::item:hover, QListView::item:hover, QTreeView::item:hover {{
     background: {c.surface_hover};
     color: {c.text};
 }}
-QListWidget::item:selected {{
+QListWidget::item:selected, QListView::item:selected, QTreeView::item:selected {{
     background: {c.accent_soft};
     color: {c.accent_text};
 }}
-QTableWidget::item {{
+QTableWidget::item, QTableView::item {{
     border-bottom: 1px solid {c.border};
     padding: 6px 9px;
 }}
-QTableWidget::item:hover {{
+QTableWidget::item:hover, QTableView::item:hover {{
     background: {c.surface_hover};
 }}
-QTableWidget::item:selected {{
+QTableWidget::item:selected, QTableView::item:selected {{
     background: {c.accent_soft};
     color: {c.text};
 }}
@@ -450,6 +478,9 @@ QMenu::item {{
 QMenu::item:selected {{
     background: {c.accent_soft};
     color: {c.accent_text};
+}}
+QMenu::item:disabled {{
+    color: {c.text_muted};
 }}
 QMenu::separator {{
     height: 1px;
@@ -504,11 +535,28 @@ QScrollBar::handle:horizontal {{
     min-width: 28px;
     border-radius: 4px;
 }}
+QScrollBar::handle:horizontal:hover {{
+    background: {c.text_muted};
+}}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal,
 QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
     background: transparent;
     border: none;
     width: 0;
+}}
+
+QAbstractScrollArea#qt_scrollarea_viewport, QScrollArea QWidget#qt_scrollarea_viewport {{
+    background: transparent;
+}}
+QFileDialog QListView, QFileDialog QTreeView {{
+    background: {c.surface};
+    color: {c.text};
+    border: 1px solid {c.border};
+}}
+QPushButton:disabled, QToolButton:disabled {{
+    background: {c.surface};
+    color: {c.text_muted};
+    border-color: {c.border};
 }}
 
 /* Specialized legacy-compatible widgets */

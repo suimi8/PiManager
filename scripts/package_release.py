@@ -2,7 +2,7 @@
 """Package PyInstaller dist/ output into standalone release archives.
 
 Usage (after pyinstaller):
-  python scripts/package_release.py --platform windows|macos|linux --version 1.7.0
+  python scripts/package_release.py --platform windows|macos|linux --version 1.7.1
 """
 from __future__ import annotations
 
@@ -138,7 +138,7 @@ def write_run_notes(out_dir: Path, plat: str, version: str) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--platform", default=detect_platform())
-    parser.add_argument("--version", default="1.7.0")
+    parser.add_argument("--version", default="1.7.1")
     parser.add_argument("--dist", default="dist")
     parser.add_argument("--out", default="release-assets")
     args = parser.parse_args()

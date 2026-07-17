@@ -7,7 +7,7 @@ import re
 
 HELP_MARKDOWN = r'''# Pi Manager 使用教程与常见问题
 
-> 版本 1.7.0 · 跨平台 GUI 管理官方 Pi Coding Agent（Windows / macOS / Linux）
+> 版本 1.7.1 · 跨平台 GUI 管理官方 Pi Coding Agent（Windows / macOS / Linux）
 > 完整 agent 能力始终由官方 `pi` 提供，本工具负责配置、切换、测试与启动。
 
 ---
@@ -191,8 +191,8 @@ A：`%USERPROFILE%\.pi\agent\`
 **Q14：Cursor 里怎么用 Pi？**  
 A：若已装本地扩展 `pi-manager.pi-cursor`，命令面板搜 Pi；否则用本 GUI 启动终端 Pi。
 
-**Q15：界面主题与 Pi CLI 主题区别？**  
-A：界面主题=本 GUI 昼夜/强调色；CLI 主题=官方 Pi 终端配色。
+**Q15：昼夜模式会同步到 Pi CLI 吗？**
+A：会。全局白天模式会让管理器、弹窗、帮助页与 Pi CLI 同步使用浅色；全局夜间模式会同步使用深色。Pi CLI 不再单独配置主题。
 
 **Q16：Provider 里的「兼容选项」是什么？**  
 A：写进 `models.json` 的 `compat` 字段，告诉官方 Pi 这个接口支持哪些能力：  

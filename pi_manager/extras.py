@@ -9,7 +9,7 @@ import os
 import time
 import zipfile
 from contextlib import ExitStack
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
@@ -18,7 +18,7 @@ from . import core
 from . import secrets as secretstore
 from . import storage
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 APP_NAME = "Pi Manager"
 # Optional remote version manifest (JSON: {"version":"x.y.z","notes":"...","url":"..."})
 # 未配置时自动回退 GitHub Releases API
@@ -635,10 +635,14 @@ def run_self_check() -> list[dict[str, Any]]:
     # update available?
     try:
         info = core.needs_pi_install_or_update()
-        if info.get("missing") or info.get("outdated"):
-            add("Pi 更新", False, info.get("message") or "建议更新", "warn")
+        needs_attention = any(
+            info.get(key)
+            for key in ("missing", "outdated", "repair_required", "blocked", "check_failed")
+        )
+        if needs_attention:
+            add("Pi \u66f4\u65b0", False, info.get("message") or "\u9700\u8981\u5904\u7406", "warn")
         else:
-            add("Pi 更新", True, "已是较新版本或无法检查线上版本")
+            add("Pi \u66f4\u65b0", True, info.get("message") or "\u5df2\u662f\u517c\u5bb9\u901a\u9053\u6700\u65b0\u7248")
     except Exception as e:
         add("Pi 更新", True, f"跳过：{e}")
 
@@ -1031,7 +1035,6 @@ def apply_manager_update_inplace(archive_path: str | Path) -> dict[str, Any]:
 def _legacy_apply_manager_update_inplace(archive_path: str | Path) -> dict[str, Any]:
     """Legacy updater retained temporarily but unreachable from product code."""
     import sys
-    import shutil
     import subprocess
 
     archive = Path(archive_path).resolve()

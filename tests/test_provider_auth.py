@@ -206,11 +206,23 @@ def test_npm_commands_do_not_invoke_a_shell(monkeypatch):
         lambda argv, **kwargs: calls.append((argv, kwargs)) or Result(),
     )
 
-    assert core.get_latest_pi_version() == "1.2.3"
-    assert core.install_or_update_pi() == (0, "1.2.3\n", "")
+    assert core.get_latest_pi_version(tag="latest") == "1.2.3"
+    monkeypatch.setattr(core, "get_node_version", lambda timeout=20: "22.20.0")
+    monkeypatch.setattr(core, "get_npm_version", lambda timeout=20: "11.0.0")
+    monkeypatch.setattr(core, "get_latest_pi_version", lambda timeout=20, tag=None: "1.2.3")
+    monkeypatch.setattr(
+        core,
+        "get_pi_runtime_status",
+        lambda: {"ok": True, "installed": "1.2.3", "error": ""},
+    )
+    code, out, err = core.install_or_update_pi()
+    assert code == 0
+    assert "1.2.3" in out
+    assert err == ""
     assert len(calls) == 2
     assert all(kwargs["shell"] is False for _argv, kwargs in calls)
     assert all(isinstance(argv, list) for argv, _kwargs in calls)
+    assert calls[-1][0][-1] == "@earendil-works/pi-coding-agent@latest"
     if sys.platform == "win32":
         assert all(argv[0].endswith("npm.cmd") for argv, _kwargs in calls)
 

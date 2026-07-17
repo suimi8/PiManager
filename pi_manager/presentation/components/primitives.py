@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..design.icons import icon
+from ..design.tokens import tokens_for
 
 
 class SurfaceCard(QFrame):
@@ -100,10 +102,24 @@ class AppButton(QPushButton):
         self.setProperty("danger", danger)
         self.setProperty("success", success)
         self.setProperty("ghost", ghost)
+        self.setProperty("iconName", icon_name or "")
         if icon_name:
             self.setIcon(icon(icon_name, icon_color, 17))
         if callback is not None:
             self.clicked.connect(callback)
+
+    def refresh_theme(self, mode: str, accent: str) -> None:
+        icon_name = str(self.property("iconName") or "")
+        if not icon_name:
+            return
+        colors = tokens_for(mode, accent)
+        if self.property("danger") and not self.property("secondary"):
+            color = colors.danger
+        elif self.property("secondary") or self.property("ghost"):
+            color = colors.text_muted
+        else:
+            color = "#FFFFFF"
+        self.setIcon(icon(icon_name, color, 17))
 
 
 class MetricCard(QFrame):
@@ -196,4 +212,12 @@ class CollapsibleSection(QFrame):
         self.header.setChecked(bool(expanded))
         self.body.setVisible(bool(expanded))
         self.description.setVisible(bool(self.description.text()))
-        self.header.setIcon(icon("chevron-down" if expanded else "chevron-right", "#7C8799", 17))
+        self.refresh_theme()
+
+    def refresh_theme(self, mode: str | None = None, accent: str | None = None) -> None:
+        if mode is None:
+            color = self.palette().color(QPalette.PlaceholderText).name()
+        else:
+            color = tokens_for(mode, accent).text_muted
+        name = "chevron-down" if self.header.isChecked() else "chevron-right"
+        self.header.setIcon(icon(name, color, 17))

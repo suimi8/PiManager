@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ... import core, ui_theme
+from ... import ui_theme
 from ..components import CollapsibleSection, SectionHeading, StatusBadge, SurfaceCard
 
 
@@ -74,32 +74,24 @@ def build_settings_page(window) -> QWidget:
     layout.addWidget(model_section)
 
     appearance = CollapsibleSection(
-        "主题与显示",
-        "Pi CLI 主题与管理器界面主题相互独立，切换界面不会覆盖 CLI 配色。",
+        "\u5168\u5c40\u4e3b\u9898\u4e0e\u663e\u793a",
+        "\u663c\u591c\u6a21\u5f0f\u5c06\u540c\u65f6\u5e94\u7528\u5230\u7ba1\u7406\u5668\u3001\u6240\u6709\u5f39\u7a97\u3001\u5e2e\u52a9\u9875\u4e0e Pi CLI\uff0c\u4e0d\u518d\u5206\u5f00\u8bbe\u7f6e\u3002",
         expanded=True,
     )
     appearance_form = _form()
-    window.set_theme = QComboBox()
-    for key, label in core.list_themes():
-        window.set_theme.addItem(label, key)
-    window.set_cli_theme = QComboBox()
-    for key, label in core.list_themes():
-        window.set_cli_theme.addItem(label, key)
     window.set_ui_mode = QComboBox()
-    window.set_ui_mode.addItem("夜间模式", "night")
-    window.set_ui_mode.addItem("白天模式", "day")
+    window.set_ui_mode.addItem("\u591c\u95f4\u6a21\u5f0f\uff08\u5168\u5c40\uff09", "night")
+    window.set_ui_mode.addItem("\u767d\u5929\u6a21\u5f0f\uff08\u5168\u5c40\uff09", "day")
     window.set_ui_accent = QComboBox()
     for key, label in ui_theme.ACCENT_LABELS.items():
         window.set_ui_accent.addItem(label, key)
-    appearance_form.addRow("Pi CLI 主题", window.set_theme)
-    appearance_form.addRow("CLI 配色同步", window.set_cli_theme)
-    appearance_form.addRow("界面模式", window.set_ui_mode)
-    appearance_form.addRow("界面主题色", window.set_ui_accent)
+    appearance_form.addRow("\u5168\u5c40\u663c\u591c\u6a21\u5f0f", window.set_ui_mode)
+    appearance_form.addRow("\u5168\u5c40\u4e3b\u9898\u8272", window.set_ui_accent)
     appearance.body_layout.addLayout(appearance_form)
     theme_actions = QHBoxLayout()
     theme_actions.setSpacing(8)
-    theme_actions.addWidget(window._btn("应用界面主题", window.apply_ui_theme_from_settings, success=True))
-    theme_actions.addWidget(window._btn("切换昼夜", window.toggle_ui_mode, secondary=True))
+    theme_actions.addWidget(window._btn("\u5e94\u7528\u5168\u5c40\u4e3b\u9898", window.apply_ui_theme_from_settings, success=True))
+    theme_actions.addWidget(window._btn("\u5207\u6362\u663c\u591c", window.toggle_ui_mode, secondary=True))
     theme_actions.addStretch(1)
     appearance.body_layout.addLayout(theme_actions)
     layout.addWidget(appearance)

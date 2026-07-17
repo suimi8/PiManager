@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QUrl
-from PySide6.QtGui import QAction, QColor, QIcon, QPixmap, QPalette, QDragEnterEvent, QDropEvent, QDragMoveEvent
+from PySide6.QtGui import QColor, QPixmap, QDragEnterEvent, QDropEvent, QDragMoveEvent
 from PySide6.QtWidgets import (
     QMenu,
     QToolButton,
@@ -31,17 +30,12 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QProgressBar,
     QScrollArea,
     QSpinBox,
-    QRadioButton,
-    QSizePolicy,
     QStackedWidget,
     QStatusBar,
-    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
-    QToolBar,
     QVBoxLayout,
     QWidget,
     QGroupBox,
@@ -625,35 +619,49 @@ def _nav_label(key: str, title: str) -> str:
 
 
 class InstallPiDialog(QDialog):
-    """Install or upgrade official pi via npm."""
+    """Install or upgrade the Node-compatible official Pi npm channel."""
 
     def __init__(self, parent=None, status: dict | None = None):
         super().__init__(parent)
-        self.setWindowTitle("安装 / 升级 Pi")
-        self.resize(560, 420)
+        self.setWindowTitle("\u5b89\u88c5 / \u5347\u7ea7 Pi")
+        self.resize(620, 460)
         self._worker = None
         self.install_succeeded = False
+        self.status_info = dict(status or {})
+        node_version = self.status_info.get("node_version") or core.get_node_version()
+        npm_version = self.status_info.get("npm_version") or core.get_npm_version()
+        channel = self.status_info.get("channel") or core.select_pi_install_channel(node_version)
+        self.package_spec = self.status_info.get("package_spec") or core.pi_package_spec(channel)
+        target = self.status_info.get("latest") or "\u68c0\u67e5\u540e\u786e\u5b9a"
+        command_text = (
+            f"npm install -g {self.package_spec}"
+            if self.package_spec
+            else "npm install -g <\u9700\u5148\u5347\u7ea7 Node.js>"
+        )
+
         layout = QVBoxLayout(self)
         tip = QLabel(
-            "将通过 npm 全局安装最新版：\n"
-            "npm install -g @earendil-works/pi-coding-agent@latest\n\n"
-            "需要本机已安装 Node.js / npm，并具备网络访问。"
+            f"\u5b89\u88c5\u547d\u4ee4\uff1a\n{command_text}\n\n"
+            f"Node.js\uff1a{node_version or '\u672a\u68c0\u6d4b\u5230'}    "
+            f"npm\uff1a{npm_version or '\u672a\u68c0\u6d4b\u5230'}\n"
+            f"\u517c\u5bb9\u901a\u9053\uff1a{channel or '\u4e0d\u53ef\u7528'}    "
+            f"\u76ee\u6807\u7248\u672c\uff1a{target}"
         )
         tip.setObjectName("subtitle")
         tip.setWordWrap(True)
         layout.addWidget(tip)
-        if status:
-            st = QLabel(str(status.get("message") or ""))
-            st.setWordWrap(True)
-            layout.addWidget(st)
+        if self.status_info:
+            status_label = QLabel(str(self.status_info.get("message") or ""))
+            status_label.setWordWrap(True)
+            layout.addWidget(status_label)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         layout.addWidget(self.log, 1)
         row = QHBoxLayout()
-        self.btn_install = QPushButton("开始安装/升级")
+        self.btn_install = QPushButton("\u5f00\u59cb\u5b89\u88c5/\u5347\u7ea7")
         self.btn_install.setProperty("success", True)
         self.btn_install.clicked.connect(self._run)
-        self.btn_close = QPushButton("关闭")
+        self.btn_close = QPushButton("\u5173\u95ed")
         self.btn_close.setProperty("secondary", True)
         self.btn_close.clicked.connect(self.accept)
         row.addWidget(self.btn_install)
@@ -661,10 +669,18 @@ class InstallPiDialog(QDialog):
         row.addWidget(self.btn_close)
         layout.addLayout(row)
 
+        blocked = bool(self.status_info.get("blocked")) or not self.package_spec or not npm_version
+        if blocked:
+            self.btn_install.setEnabled(False)
+            self.btn_install.setToolTip(
+                str(self.status_info.get("error") or "\u8bf7\u5148\u4fee\u590d Node.js/npm \u73af\u5883\u3002")
+            )
+
     def _run(self):
         self.install_succeeded = False
         self.btn_install.setEnabled(False)
-        self.log.appendPlainText("正在执行 npm install -g …")
+        command_text = f"npm install -g {self.package_spec}" if self.package_spec else "npm install -g"
+        self.log.appendPlainText(f"\u6b63\u5728\u6267\u884c {command_text} ...")
         self._worker = Worker(core.install_or_update_pi)
         self._worker.done.connect(self._done)
         self._worker.failed.connect(self._fail)
@@ -679,17 +695,21 @@ class InstallPiDialog(QDialog):
         self.btn_install.setEnabled(True)
         if code == 0:
             self.install_succeeded = True
-            self.log.appendPlainText("\n完成：安装/升级成功，正在返回管理器面板。")
-            # 结束模态对话框，避免安装成功后主面板仍被更新界面阻塞。
+            self.log.appendPlainText("\n\u5b8c\u6210\uff1a\u5b89\u88c5/\u5347\u7ea7\u5df2\u9a8c\u8bc1\uff0c\u6b63\u5728\u8fd4\u56de\u7ba1\u7406\u5668\u9762\u677f\u3002")
             self.accept()
         else:
-            self.log.appendPlainText(f"\n失败：退出码 {code}")
-            QMessageBox.warning(self, "失败", f"安装失败（code={code}）。请检查 Node/npm 与网络。")
+            self.log.appendPlainText(f"\n\u5931\u8d25\uff1a\u9000\u51fa\u7801 {code}")
+            detail = str(err or out or "\u672a\u77e5\u9519\u8bef")[-1200:]
+            QMessageBox.warning(
+                self,
+                "\u5b89\u88c5\u5931\u8d25",
+                f"Pi \u5b89\u88c5\u6216\u9a8c\u8bc1\u5931\u8d25\uff08code={code}\uff09\u3002\n\n{detail}",
+            )
 
     def _fail(self, err: str):
         self.btn_install.setEnabled(True)
-        self.log.appendPlainText(f"失败：{err}")
-        QMessageBox.warning(self, "失败", err)
+        self.log.appendPlainText(f"\u5931\u8d25\uff1a{err}")
+        QMessageBox.warning(self, "\u5931\u8d25", err)
 
 
 class SetupWizardDialog(QDialog):
@@ -720,8 +740,8 @@ class SetupWizardDialog(QDialog):
                 break
 
         self.ui_mode = QComboBox()
-        self.ui_mode.addItem("夜间模式", "night")
-        self.ui_mode.addItem("白天模式", "day")
+        self.ui_mode.addItem("夜间模式（全局）", "night")
+        self.ui_mode.addItem("白天模式（全局）", "day")
         ut = core.get_ui_theme()
         for i in range(self.ui_mode.count()):
             if self.ui_mode.itemData(i) == ut.get("mode"):
@@ -736,9 +756,6 @@ class SetupWizardDialog(QDialog):
                 self.ui_accent.setCurrentIndex(i)
                 break
 
-        self.cli_theme = QComboBox()
-        for key, label in core.list_themes():
-            self.cli_theme.addItem(label, key)
 
         self.secure = QCheckBox("保存 Provider 时加密 API Key（系统密钥库 / 安全保险库）")
         self.secure.setChecked(True)
@@ -746,9 +763,8 @@ class SetupWizardDialog(QDialog):
         self.auto_update.setChecked(True)
 
         form.addRow("默认语言（Pi 回复）", self.lang)
-        form.addRow("界面模式", self.ui_mode)
-        form.addRow("界面主题色", self.ui_accent)
-        form.addRow("Pi CLI 配色", self.cli_theme)
+        form.addRow("全局昼夜模式", self.ui_mode)
+        form.addRow("全局主题色", self.ui_accent)
         form.addRow("", self.secure)
         form.addRow("", self.auto_update)
         layout.addLayout(form)
@@ -773,8 +789,6 @@ class SetupWizardDialog(QDialog):
             mode=self.ui_mode.currentData() or "night",
             accent=self.ui_accent.currentData() or "blue",
         )
-        theme = self.cli_theme.currentData() or "dark"
-        core.apply_theme(str(theme))
         cfg = core.load_manager_config()
         cfg["secure_keys"] = self.secure.isChecked()
         cfg["auto_check_update"] = self.auto_update.isChecked()
@@ -1442,42 +1456,49 @@ class MainWindow(FeatureMixin, QMainWindow):
         return " ".join(parts) if parts else "—"
 
     def _model_status_cells(self, m: core.ModelInfo) -> tuple[QTableWidgetItem, QTableWidgetItem]:
-        """状态 / 延迟：短文案 + 着色。"""
+        """状态 / 延迟：短文案 + 当前全局主题的语义色。"""
+        from .presentation.design import tokens_for
+
+        theme = core.get_ui_theme()
+        colors = tokens_for(theme.get("mode"), theme.get("accent"))
         res = self.test_results.get(m.key)
         st = QTableWidgetItem("—")
         lat_item = QTableWidgetItem("—")
         st.setTextAlignment(Qt.AlignCenter)
         lat_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         if not res:
-            st.setForeground(QColor("#8b98a8"))
-            lat_item.setForeground(QColor("#8b98a8"))
+            st.setForeground(QColor(colors.text_muted))
+            lat_item.setForeground(QColor(colors.text_muted))
             return st, lat_item
         if res.get("pending"):
             st.setText("…")
-            st.setForeground(QColor("#fbbf24"))
+            st.setForeground(QColor(colors.warning))
             lat_item.setText("…")
+            lat_item.setForeground(QColor(colors.warning))
             return st, lat_item
         if res.get("available") is True:
             st.setText("✓")
             st.setToolTip("可用")
-            st.setForeground(QColor("#34d399"))
+            st.setForeground(QColor(colors.success))
         elif res.get("available") is False:
             st.setText("✗")
             err = str(res.get("error") or res.get("preview") or "不可用")
             st.setToolTip(err[:300])
-            st.setForeground(QColor("#f87171"))
+            st.setForeground(QColor(colors.danger))
         else:
             st.setText("?")
-            st.setForeground(QColor("#8b98a8"))
+            st.setForeground(QColor(colors.text_muted))
         lat = res.get("latency_ms")
         if isinstance(lat, (int, float)):
             lat_item.setText(f"{lat:.0f}ms")
             if lat < 800:
-                lat_item.setForeground(QColor("#34d399"))
+                lat_item.setForeground(QColor(colors.success))
             elif lat < 2000:
-                lat_item.setForeground(QColor("#fbbf24"))
+                lat_item.setForeground(QColor(colors.warning))
             else:
-                lat_item.setForeground(QColor("#f87171"))
+                lat_item.setForeground(QColor(colors.danger))
+        else:
+            lat_item.setForeground(QColor(colors.text_muted))
         return st, lat_item
 
     def _model_row_key(self, row: int) -> tuple[str, str] | None:
@@ -1683,9 +1704,6 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.set_model = QLineEdit()
         self.set_thinking = QComboBox()
         self.set_thinking.addItems(["off", "minimal", "low", "medium", "high", "xhigh", "max"])
-        self.set_theme = QComboBox()
-        for key, label in core.list_themes():
-            self.set_theme.addItem(label, key)
         self.set_enabled = QPlainTextEdit()
         self.set_enabled.setPlaceholderText("每行一个，如 openai-codex/gpt-5.4")
         self.set_enabled.setFixedHeight(80)
@@ -1695,13 +1713,10 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.set_language.addItem("English", "en")
         self.set_language.addItem("不附加语言偏好", "auto")
 
-        self.set_cli_theme = QComboBox()
-        for key, label in core.list_themes():
-            self.set_cli_theme.addItem(label, key)
 
         self.set_ui_mode = QComboBox()
-        self.set_ui_mode.addItem("夜间模式", "night")
-        self.set_ui_mode.addItem("白天模式", "day")
+        self.set_ui_mode.addItem("夜间模式（全局）", "night")
+        self.set_ui_mode.addItem("白天模式（全局）", "day")
 
         self.set_ui_accent = QComboBox()
         for key, label in ui_theme.ACCENT_LABELS.items():
@@ -1710,12 +1725,10 @@ class MainWindow(FeatureMixin, QMainWindow):
         form.addRow("默认 Provider", self.set_provider)
         form.addRow("默认模型", self.set_model)
         form.addRow("默认 Thinking 级别", self.set_thinking)
-        form.addRow("Pi CLI 主题", self.set_theme)
         form.addRow("启用模型列表（enabledModels）", self.set_enabled)
         form.addRow("默认语言（Pi 回复）", self.set_language)
-        form.addRow("CLI 配色（同 theme）", self.set_cli_theme)
-        form.addRow("界面模式", self.set_ui_mode)
-        form.addRow("界面主题色", self.set_ui_accent)
+        form.addRow("全局昼夜模式", self.set_ui_mode)
+        form.addRow("全局主题色", self.set_ui_accent)
 
         self.proxy_enabled = QCheckBox("启用全局代理（拉取模型/测试/子进程）")
         self.proxy_url = QLineEdit()
@@ -2344,6 +2357,10 @@ class MainWindow(FeatureMixin, QMainWindow):
         if self.models_table.columnCount() >= 2:
             self.models_table.setColumnHidden(1, hide_provider_col)
 
+        from .presentation.design import tokens_for
+
+        theme = core.get_ui_theme()
+        colors = tokens_for(theme.get("mode"), theme.get("accent"))
         self.models_table.setRowCount(len(rows))
         for i, m in enumerate(rows):
             is_default = m.key == default_key
@@ -2362,12 +2379,12 @@ class MainWindow(FeatureMixin, QMainWindow):
                 tip_bits.append("已收藏")
             name_item.setToolTip(" · ".join(tip_bits))
             if is_default:
-                name_item.setForeground(QColor("#60a5fa"))
+                name_item.setForeground(QColor(colors.accent_text))
             self.models_table.setItem(i, 0, name_item)
 
             prov_item = QTableWidgetItem(m.provider)
             prov_item.setToolTip(m.provider)
-            prov_item.setForeground(QColor("#8b98a8"))
+            prov_item.setForeground(QColor(colors.text_muted))
             self.models_table.setItem(i, 1, prov_item)
 
             cap = QTableWidgetItem(self._model_capability_text(m))
@@ -2965,50 +2982,36 @@ class MainWindow(FeatureMixin, QMainWindow):
 
 
     def apply_ui_theme(self, mode: str | None = None, accent: str | None = None):
-        ut = core.get_ui_theme()
-        mode = mode or ut.get("mode") or "night"
-        accent = accent or ut.get("accent") or "blue"
-        mode = ui_theme.normalize_mode(mode)
-        accent = ui_theme.normalize_accent(accent)
-        self.setStyleSheet(ui_theme.build_stylesheet(mode, accent))
-        cols = ui_theme.palette_colors(mode, accent)
-        pal = QPalette()
-        pal.setColor(QPalette.Window, QColor(cols["window"]))
-        pal.setColor(QPalette.WindowText, QColor(cols["text"]))
-        pal.setColor(QPalette.Base, QColor(cols["base"]))
-        pal.setColor(QPalette.Text, QColor(cols["text"]))
-        pal.setColor(QPalette.Button, QColor(cols["button"]))
-        pal.setColor(QPalette.ButtonText, QColor(cols["button_text"]))
-        pal.setColor(QPalette.Highlight, QColor(cols["highlight"]))
-        pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
-        self.setPalette(pal)
-        # hero / drop titles use objectName styles from stylesheet; force polish after theme switch
-        for name in ("lbl_current", "drop_title", "version_pill", "page_heading", "page_subheading"):
-            w = getattr(self, name, None)
-            if w is not None:
-                try:
-                    w.style().unpolish(w)
-                    w.style().polish(w)
-                    w.update()
-                except Exception:
-                    pass
+        stored = core.get_ui_theme()
+        mode_name = ui_theme.normalize_mode(mode or stored.get("mode"))
+        accent_name = ui_theme.normalize_accent(accent or stored.get("accent"))
+        if mode is not None or accent is not None:
+            persisted = core.set_ui_theme(mode_name, accent_name)
+            mode_name = ui_theme.normalize_mode(persisted.get("mode"))
+            accent_name = ui_theme.normalize_accent(persisted.get("accent"))
+        app = QApplication.instance()
+        if app is not None:
+            from .presentation.design import apply_application_theme
+
+            apply_application_theme(app, mode_name, accent_name)
         if hasattr(self, "set_ui_mode"):
-            for i in range(self.set_ui_mode.count()):
-                if self.set_ui_mode.itemData(i) == mode:
-                    self.set_ui_mode.setCurrentIndex(i)
+            for index in range(self.set_ui_mode.count()):
+                if self.set_ui_mode.itemData(index) == mode_name:
+                    self.set_ui_mode.setCurrentIndex(index)
                     break
-            for i in range(self.set_ui_accent.count()):
-                if self.set_ui_accent.itemData(i) == accent:
-                    self.set_ui_accent.setCurrentIndex(i)
+            for index in range(self.set_ui_accent.count()):
+                if self.set_ui_accent.itemData(index) == accent_name:
+                    self.set_ui_accent.setCurrentIndex(index)
                     break
-        # 帮助页 HTML 内联色需跟随昼夜，否则白天模式会浅底浅字
         try:
-            self.refresh_help_theme(mode)
+            self.refresh_help_theme(mode_name)
         except Exception:
             pass
         if hasattr(self, "status") and self.status is not None:
             self.status.showMessage(
-                f"界面主题：{ui_theme.MODE_LABELS.get(mode, mode)} / {ui_theme.ACCENT_LABELS.get(accent, accent)}"
+                f"\u5168\u5c40\u4e3b\u9898\uff1a{ui_theme.MODE_LABELS.get(mode_name, mode_name)} / "
+                f"{ui_theme.ACCENT_LABELS.get(accent_name, accent_name)}\uff1b"
+                f"Pi CLI {core.cli_theme_for_ui_mode(mode_name)}"
             )
 
     def apply_ui_theme_from_settings(self):
@@ -3049,11 +3052,15 @@ class MainWindow(FeatureMixin, QMainWindow):
 
     def _on_update_status(self, st: dict):
         self.status.showMessage(st.get("message") or "")
-        if st.get("missing") or st.get("outdated"):
+        if st.get("blocked") or st.get("check_failed"):
+            return
+        needs_action = st.get("missing") or st.get("outdated") or st.get("repair_required")
+        if needs_action and st.get("installable"):
             ret = QMessageBox.question(
                 self,
-                "Pi 安装 / 更新",
-                f"{st.get('message')}\n\n是否现在安装或升级到最新版？\n（也可稍后在侧边栏「设置」中操作）",
+                "Pi \u5b89\u88c5 / \u66f4\u65b0",
+                f"{st.get('message')}\n\n\u662f\u5426\u73b0\u5728\u6267\u884c\u517c\u5bb9\u901a\u9053\u7684\u5b89\u88c5/\u4fee\u590d\uff1f\n"
+                "\uff08\u4e5f\u53ef\u7a0d\u540e\u5728\u4fa7\u8fb9\u680f\u300c\u8bbe\u7f6e\u300d\u4e2d\u64cd\u4f5c\uff09",
             )
             if ret == QMessageBox.Yes:
                 self.open_install_dialog(st)
@@ -3062,6 +3069,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         dlg = SetupWizardDialog(self)
         if dlg.exec() == QDialog.Accepted:
             self.settings_load()
+            self.apply_ui_theme()
             self.refresh_dashboard()
             self.status.showMessage("基础配置已保存")
         elif force:
@@ -3085,13 +3093,28 @@ class MainWindow(FeatureMixin, QMainWindow):
         w.start()
 
     def _on_manual_update_status(self, st: dict):
-        self.status.showMessage(st.get("message") or "")
+        message = st.get("message") or ""
+        self.status.showMessage(message)
+        if st.get("check_failed"):
+            QMessageBox.warning(self, "Pi \u7248\u672c\u68c0\u67e5\u5931\u8d25", message)
+            return
+        if st.get("blocked"):
+            QMessageBox.warning(self, "Pi \u66f4\u65b0\u73af\u5883\u4e0d\u517c\u5bb9", message)
+            return
         if st.get("ok"):
-            QMessageBox.information(self, "Pi 状态", st.get("message") or "已是最新")
-        else:
-            ret = QMessageBox.question(self, "Pi 状态", f"{st.get('message')}\n\n是否安装/升级？")
+            QMessageBox.information(self, "Pi \u72b6\u6001", message or "\u5df2\u662f\u517c\u5bb9\u901a\u9053\u6700\u65b0\u7248")
+            return
+        needs_action = st.get("missing") or st.get("outdated") or st.get("repair_required")
+        if needs_action and st.get("installable"):
+            ret = QMessageBox.question(
+                self,
+                "Pi \u72b6\u6001",
+                f"{message}\n\n\u662f\u5426\u6267\u884c\u5b89\u88c5/\u5347\u7ea7/\u4fee\u590d\uff1f",
+            )
             if ret == QMessageBox.Yes:
                 self.open_install_dialog(st)
+            return
+        QMessageBox.warning(self, "Pi \u72b6\u6001", message or "\u65e0\u6cd5\u5b8c\u6210 Pi \u7248\u672c\u68c0\u67e5\u3002")
 
     def settings_load(self):
         s = core.load_settings()
@@ -3101,30 +3124,13 @@ class MainWindow(FeatureMixin, QMainWindow):
         i = self.set_thinking.findText(th)
         if i >= 0:
             self.set_thinking.setCurrentIndex(i)
-        theme = str(s.get("theme") or "dark")
-        # prefer itemData match
-        matched = False
-        for i in range(self.set_theme.count()):
-            if self.set_theme.itemData(i) == theme or self.set_theme.itemText(i) == theme:
-                self.set_theme.setCurrentIndex(i)
-                matched = True
-                break
-        if not matched:
-            # legacy text-only
-            i = self.set_theme.findText(theme)
-            if i >= 0:
-                self.set_theme.setCurrentIndex(i)
-        # language + cli theme combos
+        # The Pi CLI theme is derived from the global day/night mode and has
+        # no independent setting control.
         if hasattr(self, "set_language"):
             lang = core.get_language()
             for i in range(self.set_language.count()):
                 if self.set_language.itemData(i) == lang:
                     self.set_language.setCurrentIndex(i)
-                    break
-        if hasattr(self, "set_cli_theme"):
-            for i in range(self.set_cli_theme.count()):
-                if self.set_cli_theme.itemData(i) == theme:
-                    self.set_cli_theme.setCurrentIndex(i)
                     break
         enabled = s.get("enabledModels") or []
         if isinstance(enabled, list):
@@ -3146,49 +3152,55 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.load_feature_settings_fields()
 
     def settings_save(self):
-        s = core.load_settings()
-        s["defaultProvider"] = self.set_provider.text().strip()
-        s["defaultModel"] = self.set_model.text().strip()
-        s["defaultThinkingLevel"] = self.set_thinking.currentText()
-        theme_val = self.set_theme.currentData() or self.set_theme.currentText()
-        if hasattr(self, "set_cli_theme"):
-            theme_val = self.set_cli_theme.currentData() or theme_val
-            # keep both combos in sync
-            t = self.set_cli_theme.currentData()
-            for i in range(self.set_theme.count()):
-                if self.set_theme.itemData(i) == t:
-                    self.set_theme.setCurrentIndex(i)
-                    break
-        s["theme"] = theme_val
+        current_theme = core.get_ui_theme()
+        mode = (
+            self.set_ui_mode.currentData()
+            if hasattr(self, "set_ui_mode")
+            else current_theme.get("mode")
+        ) or "night"
+        accent = (
+            self.set_ui_accent.currentData()
+            if hasattr(self, "set_ui_accent")
+            else current_theme.get("accent")
+        ) or "blue"
+        core.set_ui_theme(mode=mode, accent=accent)
+        settings = core.load_settings()
+        settings["defaultProvider"] = self.set_provider.text().strip()
+        settings["defaultModel"] = self.set_model.text().strip()
+        settings["defaultThinkingLevel"] = self.set_thinking.currentText()
+        settings["theme"] = core.cli_theme_for_ui_mode(mode)
         if hasattr(self, "set_language"):
             core.set_language(self.set_language.currentData() or "zh-CN")
-        core.apply_theme(str(theme_val))
-        if hasattr(self, "set_ui_mode"):
-            core.set_ui_theme(
-                mode=self.set_ui_mode.currentData() or "night",
-                accent=self.set_ui_accent.currentData() or "blue",
-            )
-            self.apply_ui_theme()
         lines = [x.strip() for x in self.set_enabled.toPlainText().splitlines() if x.strip()]
         if lines:
-            s["enabledModels"] = lines
-        elif "enabledModels" in s:
-            del s["enabledModels"]
-        core.save_settings(s)
+            settings["enabledModels"] = lines
+        elif "enabledModels" in settings:
+            del settings["enabledModels"]
+        core.save_settings(settings)
         self.save_feature_settings_fields()
-        self.settings_raw.setPlainText(json.dumps(s, ensure_ascii=False, indent=2))
+        self.apply_ui_theme(mode, accent)
+        final_settings = core.load_settings()
+        self.settings_raw.setPlainText(json.dumps(final_settings, ensure_ascii=False, indent=2))
         self.refresh_dashboard()
-        self.status.showMessage("设置已保存")
-        QMessageBox.information(self, "已保存", "settings.json 与 Pi Manager 偏好已更新")
+        self.status.showMessage("\u8bbe\u7f6e\u5df2\u4fdd\u5b58\uff0c\u7ba1\u7406\u5668\u4e0e Pi CLI \u5df2\u540c\u6b65\u4e3b\u9898")
+        QMessageBox.information(
+            self,
+            "\u5df2\u4fdd\u5b58",
+            "\u5168\u5c40\u663c\u591c\u4e3b\u9898\u3001settings.json \u4e0e Pi Manager \u504f\u597d\u5df2\u540c\u6b65\u3002",
+        )
 
 
 def run_app():
     import sys
-    # Better text/DPI rendering on Windows & high-DPI screens.
+
     try:
         QApplication.setHighDpiScaleFactorRoundingPolicy(
             Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
         )
+    except Exception:
+        pass
+    try:
+        QApplication.setAttribute(Qt.AA_DontUseNativeDialogs, True)
     except Exception:
         pass
     app = QApplication(sys.argv)
@@ -3205,29 +3217,13 @@ def run_app():
         app.setWindowIcon(app_icon())
     except Exception:
         pass
-    ut = core.get_ui_theme()
-    cols = ui_theme.palette_colors(ut.get("mode"), ut.get("accent"))
-    pal = QPalette()
-    pal.setColor(QPalette.Window, QColor(cols["window"]))
-    pal.setColor(QPalette.WindowText, QColor(cols["text"]))
-    pal.setColor(QPalette.Base, QColor(cols["base"]))
-    pal.setColor(QPalette.Text, QColor(cols["text"]))
-    pal.setColor(QPalette.Button, QColor(cols["button"]))
-    pal.setColor(QPalette.ButtonText, QColor(cols["button_text"]))
-    pal.setColor(QPalette.Highlight, QColor(cols["highlight"]))
-    pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
-    pal.setColor(QPalette.AlternateBase, QColor(cols["base"]))
-    pal.setColor(QPalette.ToolTipBase, QColor(cols["window"]))
-    pal.setColor(QPalette.ToolTipText, QColor(cols["text"]))
-    app.setPalette(pal)
-    try:
-        from .presentation.design import build_stylesheet as build_modern_stylesheet
-        app.setStyleSheet(build_modern_stylesheet(ut.get("mode"), ut.get("accent")))
-    except Exception:
-        app.setStyleSheet(ui_theme.build_stylesheet(ut.get("mode"), ut.get("accent")))
-    # Runtime import keeps the stable behavior module independent from the
-    # presentation package and avoids a module-load circular dependency.
+    theme = core.get_ui_theme()
+    core.sync_cli_theme_with_ui(theme.get("mode"))
+    from .presentation.design import apply_application_theme
+
+    apply_application_theme(app, theme.get("mode"), theme.get("accent"))
     from .presentation.main_window import ModernMainWindow
+
     win = ModernMainWindow()
     win.show()
     return app.exec()

@@ -10,7 +10,7 @@ import json
 from typing import Any
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -24,9 +24,9 @@ from PySide6.QtWidgets import (
 from .. import core, ui_theme
 from ..ui import MainWindow as LegacyMainWindow
 from ..ui import NAV_PAGES, Worker
-from .components import AppButton, NavigationRail, PageHeader
+from .components import AppButton, CollapsibleSection, NavigationRail, PageHeader
 from .components.navigation import NavPage
-from .design import build_stylesheet, normalize_accent, normalize_mode, palette_colors, tokens_for
+from .design import apply_application_theme, normalize_accent, normalize_mode, tokens_for
 from .design.icons import clear_icon_cache, icon
 from .pages import (
     build_chat_page,
@@ -267,34 +267,25 @@ class ModernMainWindow(LegacyMainWindow):
         stored = core.get_ui_theme()
         mode_name = normalize_mode(mode or stored.get("mode"))
         accent_name = normalize_accent(accent or stored.get("accent"))
+        if mode is not None or accent is not None:
+            persisted = core.set_ui_theme(mode_name, accent_name)
+            mode_name = normalize_mode(persisted.get("mode"))
+            accent_name = normalize_accent(persisted.get("accent"))
         clear_icon_cache()
         app = QApplication.instance()
-        stylesheet = build_stylesheet(mode_name, accent_name)
         if app is not None:
-            app.setStyleSheet(stylesheet)
-        self.setStyleSheet(stylesheet)
-        colors = palette_colors(mode_name, accent_name)
-        palette = QPalette()
-        palette.setColor(QPalette.Window, QColor(colors["window"]))
-        palette.setColor(QPalette.WindowText, QColor(colors["text"]))
-        palette.setColor(QPalette.Base, QColor(colors["base"]))
-        palette.setColor(QPalette.AlternateBase, QColor(colors["alternate_base"]))
-        palette.setColor(QPalette.Text, QColor(colors["text"]))
-        palette.setColor(QPalette.Button, QColor(colors["button"]))
-        palette.setColor(QPalette.ButtonText, QColor(colors["button_text"]))
-        palette.setColor(QPalette.Highlight, QColor(colors["highlight"]))
-        palette.setColor(QPalette.HighlightedText, QColor("#FFFFFF"))
-        palette.setColor(QPalette.ToolTipBase, QColor(colors["tooltip_base"]))
-        palette.setColor(QPalette.ToolTipText, QColor(colors["tooltip_text"]))
-        if app is not None:
-            app.setPalette(palette)
-        self.setPalette(palette)
+            apply_application_theme(app, mode_name, accent_name)
         if hasattr(self, "nav"):
             self.nav.update_icons(mode_name, accent_name)
         self._refresh_dynamic_button_icons(mode_name, accent_name)
+        for section in self.findChildren(CollapsibleSection):
+            section.refresh_theme(mode_name, accent_name)
         if hasattr(self, "model_more_button"):
             colors = tokens_for(mode_name, accent_name)
             self.model_more_button.setIcon(icon("ellipsis", colors.text_muted, 17))
+        if hasattr(self, "models_table"):
+            self._apply_model_table_colors()
+            self._refresh_model_status_colors()
         if hasattr(self, "set_ui_mode"):
             for index in range(self.set_ui_mode.count()):
                 if self.set_ui_mode.itemData(index) == mode_name:
@@ -309,24 +300,15 @@ class ModernMainWindow(LegacyMainWindow):
         except Exception:
             pass
         if hasattr(self, "status") and self.status is not None:
+            cli_theme = core.cli_theme_for_ui_mode(mode_name)
             self.status.showMessage(
-                f"界面主题：{ui_theme.MODE_LABELS.get(mode_name, mode_name)} / "
-                f"{ui_theme.ACCENT_LABELS.get(accent_name, accent_name)}"
+                f"\u5168\u5c40\u4e3b\u9898\uff1a{ui_theme.MODE_LABELS.get(mode_name, mode_name)} / "
+                f"{ui_theme.ACCENT_LABELS.get(accent_name, accent_name)}\uff1bPi CLI {cli_theme}"
             )
 
     def _refresh_dynamic_button_icons(self, mode: str, accent: str) -> None:
-        colors = tokens_for(mode, accent)
         for button in self.findChildren(AppButton):
-            icon_name = self._button_icon(button.text())
-            if not icon_name:
-                continue
-            if button.property("danger") and not button.property("secondary"):
-                color = colors.danger
-            elif button.property("secondary") or button.property("ghost"):
-                color = colors.text_muted
-            else:
-                color = "#FFFFFF"
-            button.setIcon(icon(icon_name, color, 17))
+            button.refresh_theme(mode, accent)
 
     # ---- dashboard view model adapters -------------------------------------------
     def refresh_dashboard(self) -> None:
@@ -390,6 +372,63 @@ class ModernMainWindow(LegacyMainWindow):
                 name_item.setForeground(QColor(colors.accent_text if key == default_key else colors.text))
             if provider_item is not None:
                 provider_item.setForeground(QColor(colors.text_muted))
+
+    def _model_status_cells(self, m: core.ModelInfo):
+        status_item, latency_item = super()._model_status_cells(m)
+        colors = tokens_for(*self._theme_pair())
+        result = self.test_results.get(m.key)
+        if not result:
+            status_item.setForeground(QColor(colors.text_muted))
+            latency_item.setForeground(QColor(colors.text_muted))
+            return status_item, latency_item
+        if result.get("pending"):
+            status_item.setForeground(QColor(colors.warning))
+            latency_item.setForeground(QColor(colors.warning))
+            return status_item, latency_item
+        available = result.get("available")
+        status_item.setForeground(
+            QColor(
+                colors.success
+                if available is True
+                else colors.danger
+                if available is False
+                else colors.text_muted
+            )
+        )
+        latency = result.get("latency_ms")
+        if isinstance(latency, (int, float)):
+            latency_item.setForeground(
+                QColor(
+                    colors.success
+                    if latency < 800
+                    else colors.warning
+                    if latency < 2000
+                    else colors.danger
+                )
+            )
+        else:
+            latency_item.setForeground(QColor(colors.text_muted))
+        return status_item, latency_item
+
+    def _refresh_model_status_colors(self) -> None:
+        if not hasattr(self, "models_table"):
+            return
+        by_key = {model.key: model for model in self.models}
+        for row in range(self.models_table.rowCount()):
+            name_item = self.models_table.item(row, 0)
+            data = name_item.data(Qt.UserRole) if name_item is not None else None
+            if not isinstance(data, (list, tuple)) or len(data) < 2:
+                continue
+            model = by_key.get(f"{data[0]}/{data[1]}")
+            if model is None:
+                continue
+            status_color, latency_color = self._model_status_cells(model)
+            current_status = self.models_table.item(row, 3)
+            current_latency = self.models_table.item(row, 4)
+            if current_status is not None:
+                current_status.setForeground(status_color.foreground())
+            if current_latency is not None:
+                current_latency.setForeground(latency_color.foreground())
 
     def _on_model_selection_changed(self) -> None:
         if not hasattr(self, "model_detail_title"):

@@ -5,10 +5,12 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QPalette
+from PySide6.QtWidgets import QApplication, QDialog
 
 from pi_manager import core
 from pi_manager.presentation.main_window import ModernMainWindow
+from pi_manager.ui import InstallPiDialog
 
 
 @pytest.fixture(scope="module")
@@ -128,5 +130,91 @@ def test_chat_selection_stays_independent_until_failover_switches_the_pair(qapp,
         )
         assert window._chat_combo_text(window.chat_provider) == "provider-b"
         assert window._chat_combo_text(window.chat_model) == "model-two"
+    finally:
+        _dispose(window, qapp)
+
+
+
+def test_global_ui_mode_persists_matching_pi_cli_theme(isolated_home):
+    core.set_ui_theme("day", "blue")
+    assert core.get_ui_theme()["mode"] == "day"
+    assert core.load_settings()["theme"] == "light"
+
+    core.set_ui_theme("night", "purple")
+    assert core.get_ui_theme()["mode"] == "night"
+    assert core.load_settings()["theme"] == "dark"
+
+
+def test_settings_page_has_no_independent_cli_theme_controls(qapp, isolated_home):
+    window = ModernMainWindow(start_background=False)
+    try:
+        assert hasattr(window, "set_ui_mode")
+        assert not hasattr(window, "set_theme")
+        assert not hasattr(window, "set_cli_theme")
+    finally:
+        _dispose(window, qapp)
+
+
+def test_open_dialogs_and_install_dialog_follow_application_theme(qapp, isolated_home):
+    window = ModernMainWindow(start_background=False)
+    plain_dialog = QDialog()
+    plain_dialog.resize(220, 120)
+    install_dialog = InstallPiDialog(
+        status={
+            "node_version": "22.20.0",
+            "npm_version": "11.0.0",
+            "channel": "latest",
+            "package_spec": "@earendil-works/pi-coding-agent@latest",
+            "latest": "0.80.10",
+        },
+    )
+    plain_dialog.show()
+    install_dialog.show()
+    try:
+        window.apply_ui_theme("day", "blue")
+        qapp.processEvents()
+        assert qapp.palette().color(QPalette.Window).name().upper() == "#F4F6F8"
+        assert plain_dialog.grab().toImage().pixelColor(10, 10).name().upper() == "#F4F6F8"
+        assert install_dialog.grab().toImage().pixelColor(10, 10).name().upper() == "#F4F6F8"
+
+        window.apply_ui_theme("night", "blue")
+        qapp.processEvents()
+        assert qapp.palette().color(QPalette.Window).name().upper() == "#090C10"
+        assert plain_dialog.grab().toImage().pixelColor(10, 10).name().upper() == "#090C10"
+        assert install_dialog.grab().toImage().pixelColor(10, 10).name().upper() == "#090C10"
+    finally:
+        install_dialog.close()
+        plain_dialog.close()
+        install_dialog.deleteLater()
+        plain_dialog.deleteLater()
+        _dispose(window, qapp)
+
+
+def test_dynamic_theme_refreshes_model_status_and_help_html(qapp, isolated_home):
+    window = ModernMainWindow(start_background=False)
+    try:
+        model = core.ModelInfo("provider-a", "model-one")
+        window.models = [model]
+        window.test_results = {
+            model.key: {"available": True, "latency_ms": 120, "pending": False}
+        }
+        window.fill_models_table()
+
+        window.apply_ui_theme("day", "blue")
+        qapp.processEvents()
+        day_status = window.models_table.item(0, 3).foreground().color().name().upper()
+        day_html = window.help_browser.toHtml().lower()
+
+        window.apply_ui_theme("night", "blue")
+        qapp.processEvents()
+        night_status = window.models_table.item(0, 3).foreground().color().name().upper()
+        night_html = window.help_browser.toHtml().lower()
+
+        assert day_status == "#16A34A"
+        assert night_status == "#35C56F"
+        assert day_status != night_status
+        assert "#f3f4f6" in day_html
+        assert "#1a222d" in night_html
+        assert day_html != night_html
     finally:
         _dispose(window, qapp)

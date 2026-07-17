@@ -5,30 +5,21 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QIcon, QPixmap, QPainter, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QTabWidget,
-    QCheckBox,
     QComboBox,
-    QDialog,
-    QDialogButtonBox,
     QFileDialog,
-    QFormLayout,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMenu,
     QMessageBox,
-    QPlainTextEdit,
-    QPushButton,
     QSpinBox,
     QSystemTrayIcon,
     QTableWidget,
