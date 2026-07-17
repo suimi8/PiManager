@@ -24,7 +24,7 @@ python -m pip install -r requirements.txt pyinstaller
 # bash scripts/make_icns.sh
 python -m PyInstaller --noconfirm --clean PiManager.spec
 python scripts/smoke_test_dist.py
-python scripts/package_release.py --version 1.6.4
+python scripts/package_release.py --version 1.6.5
 ```
 
 Windows 还可打单文件：
@@ -81,14 +81,14 @@ python scripts/package_extension.py
 4. 可选上传到 GitHub Release
 
 手动触发：Actions → **Build** → **Run workflow**  
-- `version`：`1.6.4`  
-- `upload_to_release`：`v1.6.4`（可选）
+- `version`：`1.6.5`
+- `upload_to_release`：`v1.6.5`（可选）
 
 打 tag 也会触发：
 
 ```bash
-git tag v1.6.4
-git push origin v1.6.4
+git tag v1.6.5
+git push origin v1.6.5
 ```
 
 ## 平台能力表

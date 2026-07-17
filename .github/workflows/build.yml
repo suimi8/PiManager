@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version label (e.g. 1.6.4)"
+        description: "Release version label (e.g. 1.6.5)"
         required: true
-        default: "1.6.4"
+        default: "1.6.5"
       upload_to_release:
-        description: "Existing GitHub Release tag to upload into (e.g. v1.6.4). Leave empty for artifacts only."
+        description: "Existing GitHub Release tag to upload into (e.g. v1.6.5). Leave empty for artifacts only."
         required: false
         default: ""
   push:
@@ -88,7 +88,7 @@ jobs:
           elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=1.6.4" >> "$GITHUB_OUTPUT"
+            echo "version=1.6.5" >> "$GITHUB_OUTPUT"
           fi
 
       - name: PyInstaller (directory / app)
@@ -102,7 +102,10 @@ jobs:
         shell: bash
         run: |
           export QT_QPA_PLATFORM=offscreen
-          python scripts/smoke_test_dist.py --platform "${{ matrix.platform }}" --dist dist
+          python scripts/smoke_test_dist.py \
+            --platform "${{ matrix.platform }}" \
+            --dist dist \
+            --expected-version "${{ steps.ver.outputs.version }}"
 
       - name: Package release archives
         shell: bash

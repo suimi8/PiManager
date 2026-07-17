@@ -58,6 +58,7 @@ def main():
         print(json.dumps(result, ensure_ascii=False))
         return 0 if result.get("ok") else 2
     if len(sys.argv) >= 2 and sys.argv[1] in {"--self-check", "--smoke-test"}:
+        from pi_manager.extras import APP_VERSION
         from pi_manager.resources import self_check
 
         errors = self_check()
@@ -67,6 +68,7 @@ def main():
             print("self-check: FAILED", file=sys.stderr)
             return 1
         print("self-check: OK")
+        print(f"version={APP_VERSION}")
         print(f"frozen={bool(getattr(sys, 'frozen', False))}")
         print(f"executable={sys.executable}")
         print(f"platform={sys.platform}")

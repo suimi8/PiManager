@@ -125,8 +125,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "PiManager",
             "CFBundleDisplayName": "PiManager",
-            "CFBundleShortVersionString": "1.6.4",
-            "CFBundleVersion": "1.6.4",
+            "CFBundleShortVersionString": "1.6.5",
+            "CFBundleVersion": "1.6.5",
             "CFBundlePackageType": "APPL",
             "CFBundleExecutable": "PiManager",
             "LSMinimumSystemVersion": "12.0",

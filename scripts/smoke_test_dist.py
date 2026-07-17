@@ -53,6 +53,7 @@ def main() -> int:
     parser.add_argument("--platform", default=detect_platform())
     parser.add_argument("--dist", default="dist")
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--expected-version", default="")
     args = parser.parse_args()
 
     plat = args.platform.lower()
@@ -85,6 +86,7 @@ def main() -> int:
         env=env,
         capture_output=True,
         text=True,
+        errors="replace",
         timeout=args.timeout,
         check=False,
     )
@@ -98,6 +100,14 @@ def main() -> int:
         print(proc.stderr)
     if proc.returncode != 0:
         return proc.returncode
+    if args.expected_version:
+        marker = f"version={args.expected_version}"
+        if marker not in (proc.stdout or ""):
+            print(
+                f"FAIL: packaged version mismatch; expected {marker!r}",
+                file=sys.stderr,
+            )
+            return 2
 
     # Basic layout checks
     if plat == "windows":

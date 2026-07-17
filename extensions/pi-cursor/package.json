@@ -2,7 +2,7 @@
   "name": "pi-cursor",
   "displayName": "Pi Coding Agent",
   "description": "在 Cursor 中启动 Pi、切换 Provider/模型、快速提问（读取 ~/.pi/agent 配置）",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "pi-manager",
   "license": "Apache-2.0",
   "repository": {
