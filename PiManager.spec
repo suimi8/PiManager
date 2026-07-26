@@ -35,7 +35,6 @@ hiddenimports = [
     "pi_manager.rpc_session",
     "pi_manager.ui_features",
     "pi_manager.help_docs",
-    "pi_manager.ui_theme",
     "pi_manager.builtin_themes",
     "pi_manager.core",
     "pi_manager.ui",
@@ -99,10 +98,59 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[str(project_root / "scripts" / "pyi_rth_pimanager.py")],
-    excludes=[],
+    excludes=[
+        "PySide6.QtQml",
+        "PySide6.QtQuick",
+        "PySide6.QtQuickWidgets",
+        "PySide6.QtQuick3D",
+        "PySide6.QtPdf",
+        "PySide6.QtPdfWidgets",
+        "PySide6.QtVirtualKeyboard",
+        "PySide6.QtWebEngineCore",
+        "PySide6.QtWebEngineWidgets",
+        "PySide6.QtCharts",
+        "PySide6.QtMultimedia",
+        "PySide6.QtMultimediaWidgets",
+    ],
     noarchive=False,
     optimize=0,
 )
+
+# This is a Widgets-only app: drop the QtQml/Quick chain, Pdf and
+# VirtualKeyboard runtimes the PySide6 hook still bundles, and keep only
+# Chinese/English Qt translations. opengl32sw.dll stays (software-GL
+# fallback for VMs/remote desktops).
+_QT_TRIM_TAGS = (
+    "Qt6Pdf",
+    "Qt6Qml",
+    "Qt6Quick",
+    "Qt6VirtualKeyboard",
+    "QtPdf",
+    "QtQml",
+    "QtQuick",
+    "QtVirtualKeyboard",
+    "qtvirtualkeyboard",
+)
+_QM_KEEP_SUFFIXES = ("_zh_CN.qm", "_zh_TW.qm", "_en.qm")
+
+
+def _trim_qt(toc):
+    kept = []
+    for entry in toc:
+        name = str(entry[0]).replace("\\", "/")
+        base = name.rsplit("/", 1)[-1]
+        if any(tag in base for tag in _QT_TRIM_TAGS):
+            continue
+        if "translations/" in name and base.endswith(".qm"):
+            if not base.endswith(_QM_KEEP_SUFFIXES):
+                continue
+        kept.append(entry)
+    return kept
+
+
+a.binaries = _trim_qt(a.binaries)
+a.datas = _trim_qt(a.datas)
+
 pyz = PYZ(a.pure)
 
 exe = EXE(

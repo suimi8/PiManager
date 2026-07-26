@@ -21,12 +21,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import core, ui_theme
+from .. import core
 from ..ui import MainWindow as LegacyMainWindow
 from ..ui import NAV_PAGES, Worker
 from .components import AppButton, CollapsibleSection, NavigationRail, PageHeader
 from .components.navigation import NavPage
-from .design import apply_application_theme, normalize_accent, normalize_mode, tokens_for
+from .design import (
+    ACCENT_LABELS,
+    MODE_LABELS,
+    apply_application_theme,
+    normalize_accent,
+    normalize_mode,
+    tokens_for,
+)
 from .design.icons import clear_icon_cache, icon
 from .pages import (
     build_chat_page,
@@ -302,8 +309,8 @@ class ModernMainWindow(LegacyMainWindow):
         if hasattr(self, "status") and self.status is not None:
             cli_theme = core.cli_theme_for_ui_mode(mode_name)
             self.status.showMessage(
-                f"\u5168\u5c40\u4e3b\u9898\uff1a{ui_theme.MODE_LABELS.get(mode_name, mode_name)} / "
-                f"{ui_theme.ACCENT_LABELS.get(accent_name, accent_name)}\uff1bPi CLI {cli_theme}"
+                f"\u5168\u5c40\u4e3b\u9898\uff1a{MODE_LABELS.get(mode_name, mode_name)} / "
+                f"{ACCENT_LABELS.get(accent_name, accent_name)}\uff1bPi CLI {cli_theme}"
             )
 
     def _refresh_dynamic_button_icons(self, mode: str, accent: str) -> None:
@@ -331,9 +338,32 @@ class ModernMainWindow(LegacyMainWindow):
         try:
             providers = (core.load_models_config().get("providers") or {})
             self.dashboard_provider_metric.value_label.setText(str(len(providers)))
+            self._refresh_key_health(list(providers))
         except Exception:
             self.dashboard_provider_metric.value_label.setText("—")
         self.fill_favorites()
+
+    def _refresh_key_health(self, provider_names: list[str]) -> None:
+        """Surface silently-disabled API keys so users know to restore them."""
+        invalid = 0
+        for name in provider_names:
+            try:
+                for row in core.list_provider_api_keys(name):
+                    if str(row.get("status") or "available") != "available":
+                        invalid += 1
+            except Exception:
+                continue
+        if not hasattr(self, "dashboard_provider_metric"):
+            return
+        label = self.dashboard_provider_metric.label_label
+        if invalid > 0:
+            label.setText(f"自定义 Provider · ⚠ {invalid} 个密钥失效")
+            label.setToolTip("有 API Key 处于失效池；在 Provider 管理 → API Keys 可恢复")
+            if hasattr(self, "status") and self.status is not None:
+                self.status.showMessage(f"⚠ {invalid} 个 API Key 已失效，可在 Provider 管理中恢复", 8000)
+        else:
+            label.setText("自定义 Provider")
+            label.setToolTip("")
 
     def _set_pi_version(self, value: Any, *, failed: bool = False) -> None:
         text = str(value or "未知")

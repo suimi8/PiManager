@@ -9,25 +9,13 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QIcon, QPixmap, QPainter, QColor
 from PySide6.QtWidgets import (
-    QAbstractItemView,
-    QTabWidget,
-    QComboBox,
     QFileDialog,
-    QHBoxLayout,
-    QHeaderView,
     QInputDialog,
-    QLabel,
     QLineEdit,
     QMenu,
     QMessageBox,
-    QSpinBox,
     QSystemTrayIcon,
-    QTableWidget,
     QTableWidgetItem,
-    QTextBrowser,
-    QVBoxLayout,
-    QWidget,
-    QGroupBox,
 )
 
 from . import core
@@ -205,103 +193,6 @@ class FeatureMixin:
             self.health_timer.start()
 
     # ---- tabs ----
-    def _build_health_tab(self) -> QWidget:
-        w = QWidget()
-        layout = QVBoxLayout(w)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
-        tip = QLabel("批量巡检可用性/延迟。启动时会自动加载上次结果；点「立即健康检查」才会重新探测。范围若选「收藏」，只会测收藏里的模型（OAuth 未登录会失败）。")
-        tip.setObjectName("subtitle")
-        tip.setWordWrap(True)
-        layout.addWidget(tip)
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        self.health_scope = QComboBox()
-        self.health_scope.addItem("收藏列表", "favorites")
-        self.health_scope.addItem("默认模型", "default")
-        self.health_scope.addItem("自定义 Provider", "custom")
-        self.health_scope.addItem("全部已加载模型", "all_listed")
-        self.health_scope.addItem("模型页当前选中", "selected")
-        # default to custom if user mostly uses custom providers
-        self.health_scope.setCurrentIndex(2)
-        row.addWidget(QLabel("检查范围"))
-        row.addWidget(self.health_scope)
-        row.addWidget(self._btn("立即健康检查", self.health_run_now, success=True))
-        row.addWidget(self._btn("刷新显示", self.health_refresh_table, secondary=True))
-        self.health_interval = QSpinBox()
-        self.health_interval.setRange(0, 1440)
-        self.health_interval.setSuffix(" 分钟（0=关）")
-        self.health_interval.setValue(int((self.mgr or {}).get("health_interval_min") or 0))
-        row.addWidget(QLabel("定时"))
-        row.addWidget(self.health_interval)
-        row.addWidget(self._btn("保存定时", self.health_save_interval, secondary=True))
-        row.addStretch(1)
-        layout.addLayout(row)
-        self.health_table = QTableWidget(0, 6)
-        self.health_table.setHorizontalHeaderLabels(["模型", "状态", "延迟", "方式", "检查时间", "错误/预览"])
-        self.health_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        if hasattr(self, "_polish_table"):
-            self._polish_table(self.health_table)
-        else:
-            self.health_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-            self.health_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-            self.health_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-            self.health_table.setShowGrid(False)
-            self.health_table.setAlternatingRowColors(True)
-            self.health_table.verticalHeader().setVisible(False)
-        layout.addWidget(self.health_table, 1)
-        brow = QHBoxLayout()
-        brow.setSpacing(8)
-        brow.addWidget(self._btn("将可用项加入收藏", self.health_add_ok_to_favorites, success=True))
-        brow.addWidget(self._btn("重测表格选中", self.health_retest_selected, secondary=True))
-        brow.addStretch(1)
-        layout.addLayout(brow)
-        self.health_status = QLabel("尚未检查 — 建议范围选「自定义 Provider」或「默认模型」")
-        self.health_status.setObjectName("subtitle")
-        self.health_status.setWordWrap(True)
-        layout.addWidget(self.health_status)
-        return w
-
-    def _build_help_tab(self) -> QWidget:
-        w = QWidget()
-        layout = QVBoxLayout(w)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
-        top = QHBoxLayout()
-        top.setSpacing(8)
-        help_title = QLabel("使用教程（分类 Tab）· 内置 Markdown")
-        help_title.setObjectName("sectionTitle")
-        top.addWidget(help_title)
-        top.addStretch(1)
-        top.addWidget(self._btn("复制全部 Markdown", self.help_copy_md, secondary=True))
-        top.addWidget(self._btn("导出为 .md 文件", self.help_export_md, secondary=True))
-        layout.addLayout(top)
-
-        self.help_tabs = QTabWidget()
-        self.help_browsers: list[QTextBrowser] = []
-        self._help_section_mds: list[str] = []
-        sections = help_docs.help_sections()
-        mode = "night"
-        try:
-            mode = str(core.get_ui_theme().get("mode") or "night")
-        except Exception:
-            pass
-        for title, md in sections:
-            page = QWidget()
-            pl = QVBoxLayout(page)
-            pl.setContentsMargins(4, 8, 4, 4)
-            browser = QTextBrowser()
-            browser.setOpenExternalLinks(True)
-            browser.setHtml(help_docs.help_section_html(md, mode=mode))
-            pl.addWidget(browser, 1)
-            self.help_browsers.append(browser)
-            self._help_section_mds.append(md)
-            self.help_tabs.addTab(page, title)
-        # keep first browser as help_browser for any legacy refs
-        self.help_browser = self.help_browsers[0] if self.help_browsers else QTextBrowser()
-        layout.addWidget(self.help_tabs, 1)
-        return w
-
     def refresh_help_theme(self, mode: str | None = None) -> None:
         """昼夜切换后重渲帮助 HTML，避免白天模式浅底深色字看不清。"""
         if not getattr(self, "help_browsers", None):
@@ -335,104 +226,6 @@ class FeatureMixin:
         Path(path).write_text(help_docs.HELP_MARKDOWN, encoding="utf-8")
         QMessageBox.information(self, "已导出", path)
 
-    def _build_history_tab(self) -> QWidget:
-        w = QWidget()
-        layout = QVBoxLayout(w)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
-        hist_tip = QLabel("模型测试历史（启动时自动加载本地记录，也可手动刷新）")
-        hist_tip.setObjectName("subtitle")
-        hist_tip.setWordWrap(True)
-        layout.addWidget(hist_tip)
-        filt = QHBoxLayout()
-        filt.setSpacing(8)
-        self.history_filter = QLineEdit()
-        self.history_filter.setPlaceholderText("过滤 provider/model…")
-        self.history_filter.setMinimumHeight(34)
-        try:
-            self.history_filter.setClearButtonEnabled(True)
-        except Exception:
-            pass
-        self.history_filter.textChanged.connect(self.history_refresh)
-        filt.addWidget(self.history_filter, 1)
-        filt.addWidget(self._btn("刷新", self.history_refresh, secondary=True))
-        filt.addWidget(self._btn("清空历史", self.history_clear, danger=True))
-        layout.addLayout(filt)
-        self.history_table = QTableWidget(0, 6)
-        self.history_table.setHorizontalHeaderLabels(["时间", "模型", "可用", "延迟", "方式", "错误/预览"])
-        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        if hasattr(self, "_polish_table"):
-            self._polish_table(self.history_table)
-        else:
-            self.history_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-            self.history_table.setShowGrid(False)
-            self.history_table.setAlternatingRowColors(True)
-            self.history_table.verticalHeader().setVisible(False)
-        layout.addWidget(self.history_table, 1)
-        return w
-
-    def _build_tools_tab(self) -> QWidget:
-        """Self-check + export/import + secure keys."""
-        w = QWidget()
-        layout = QVBoxLayout(w)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
-
-        box1 = QGroupBox("启动自检")
-        l1 = QVBoxLayout(box1)
-        l1.setSpacing(10)
-        l1.addWidget(self._btn("运行自检", self.self_check_run, success=True))
-        self.selfcheck_table = QTableWidget(0, 3)
-        self.selfcheck_table.setHorizontalHeaderLabels(["项目", "状态", "详情"])
-        self.selfcheck_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        if hasattr(self, "_polish_table"):
-            self._polish_table(self.selfcheck_table)
-        else:
-            self.selfcheck_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-            self.selfcheck_table.setShowGrid(False)
-            self.selfcheck_table.setAlternatingRowColors(True)
-            self.selfcheck_table.verticalHeader().setVisible(False)
-        l1.addWidget(self.selfcheck_table)
-        layout.addWidget(box1, 1)
-
-        box2 = QGroupBox("配置导入/导出")
-        l2 = QHBoxLayout(box2)
-        l2.setSpacing(8)
-        l2.addWidget(self._btn("导出配置包", self.export_config, success=True))
-        l2.addWidget(self._btn("导出（含密钥）", self.export_config_with_secrets, secondary=True))
-        l2.addWidget(self._btn("导入配置包", self.import_config))
-        l2.addWidget(self._btn("加密现有明文 Key", self.secure_keys_now, secondary=True))
-        l2.addStretch(1)
-        layout.addWidget(box2)
-
-        box3 = QGroupBox("Pi Manager 更新")
-        l3 = QVBoxLayout(box3)
-        l3.setSpacing(10)
-        self.mgr_version_lbl = QLabel(f"当前版本：v{extras.APP_VERSION}")
-        l3.addWidget(self.mgr_version_lbl)
-        tip_upd = QLabel(
-            "默认从 GitHub Releases 检查更新；也可自定义版本清单 URL（JSON: version/notes/url）。"
-            "检测到新版本可下载安装包，需手动替换运行中的程序。"
-        )
-        tip_upd.setObjectName("subtitle")
-        tip_upd.setWordWrap(True)
-        l3.addWidget(tip_upd)
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        self.update_url_edit = QLineEdit(str((self.mgr or {}).get("update_manifest_url") or ""))
-        self.update_url_edit.setPlaceholderText("可选：自定义 manifest URL（留空=GitHub Releases）")
-        row.addWidget(self.update_url_edit, 1)
-        row.addWidget(self._btn("检查更新", self.check_manager_update, success=True))
-        l3.addLayout(row)
-        self.update_status = QLabel("")
-        self.update_status.setObjectName("subtitle")
-        self.update_status.setWordWrap(True)
-        l3.addWidget(self.update_status)
-        self._last_manager_update: dict = {}
-        layout.addWidget(box3)
-        return w
-
-    # ---- health ----
     def health_save_interval(self):
         self.mgr["health_interval_min"] = int(self.health_interval.value())
         self.persist_mgr()
@@ -968,6 +761,11 @@ class FeatureMixin:
             encoded = full.encode("utf-8")
             if len(encoded) > 128 * 1024:
                 full = encoded[-128 * 1024 :].decode("utf-8", errors="ignore")
+        if hasattr(self, "chat_context_badge") and self.chat_context_badge is not None:
+            if use_rpc:
+                self.chat_context_badge.set_status("success", "常驻会话 · 上下文保留")
+            else:
+                self.chat_context_badge.set_status("info", "一次性模式")
         self.chat_output.appendPlainText(f"\n你: {prompt}\n…思考中…")
         self.chat_input.setEnabled(False)
         workdir = self.workdir_edit.text().strip() or str(core.user_home())
@@ -1048,6 +846,8 @@ class FeatureMixin:
             self.failover_threshold.setValue(int(mgr.get("failover_fail_threshold") or 3))
         if hasattr(self, "failover_silent"):
             self.failover_silent.setChecked(bool(mgr.get("failover_silent", True)))
+        if hasattr(self, "chat_persistent_session"):
+            self.chat_persistent_session.setChecked(bool(mgr.get("chat_persistent_session", True)))
         if hasattr(self, "minimize_to_tray"):
             self.minimize_to_tray.setChecked(bool(mgr.get("minimize_to_tray", True)))
         if hasattr(self, "start_minimized"):
@@ -1072,6 +872,8 @@ class FeatureMixin:
             self.mgr["failover_fail_threshold"] = int(self.failover_threshold.value())
         if hasattr(self, "failover_silent"):
             self.mgr["failover_silent"] = self.failover_silent.isChecked()
+        if hasattr(self, "chat_persistent_session"):
+            self.mgr["chat_persistent_session"] = self.chat_persistent_session.isChecked()
         if hasattr(self, "minimize_to_tray"):
             self.mgr["minimize_to_tray"] = self.minimize_to_tray.isChecked()
         if hasattr(self, "start_minimized"):

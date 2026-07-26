@@ -18,3 +18,25 @@ def mono_font_family() -> str:
     if sys.platform == "win32":
         return '"Cascadia Mono", Consolas, monospace'
     return '"JetBrains Mono", "DejaVu Sans Mono", monospace'
+
+
+def apply_app_font(app) -> None:
+    """Set application-wide QFont with platform-friendly defaults."""
+    try:
+        from PySide6.QtGui import QFont
+
+        if sys.platform == "darwin":
+            family = ".AppleSystemUIFont"
+            size = 13
+        elif sys.platform == "win32":
+            family = "Segoe UI"
+            size = 10  # Windows point size ~ visual 13px
+        else:
+            family = "Noto Sans"
+            size = 10
+        font = QFont(family, size)
+        font.setStyleHint(QFont.SansSerif)
+        font.setHintingPreference(QFont.PreferDefaultHinting)
+        app.setFont(font)
+    except Exception:
+        pass

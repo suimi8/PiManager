@@ -218,3 +218,37 @@ def test_dynamic_theme_refreshes_model_status_and_help_html(qapp, isolated_home)
         assert day_html != night_html
     finally:
         _dispose(window, qapp)
+
+
+def test_legacy_ui_theme_module_is_gone():
+    import importlib
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("pi_manager.ui_theme")
+
+
+def test_chat_persistent_toggle_and_key_health_surface(qapp, isolated_home):
+    core.upsert_custom_provider(
+        "KH", base_url="https://kh.example/v1", api_key="sk-good", models=[{"id": "m"}]
+    )
+    core.add_provider_api_key("KH", "sk-second")
+    rows = core.list_provider_api_keys("KH")
+    from pi_manager import secrets as secretstore
+
+    secretstore.mark_provider_key_failed("KH", rows[0]["id"], "HTTP 401")
+
+    window = ModernMainWindow(start_background=False)
+    try:
+        # New persistent-session toggle is wired to manager config.
+        assert hasattr(window, "chat_persistent_session")
+        window.chat_persistent_session.setChecked(False)
+        window.save_feature_settings_fields()
+        assert core.load_manager_config()["chat_persistent_session"] is False
+        window.settings_load()
+        assert window.chat_persistent_session.isChecked() is False
+
+        # Failed key is surfaced on the dashboard provider metric.
+        window.refresh_dashboard()
+        assert "密钥失效" in window.dashboard_provider_metric.label_label.text()
+    finally:
+        _dispose(window, qapp)

@@ -45,6 +45,16 @@ class DesignTokens:
     shadow: str
 
 
+MODE_LABELS = {"night": "夜间模式", "day": "白天模式"}
+ACCENT_LABELS = {
+    "blue": "蓝色",
+    "green": "绿色",
+    "purple": "紫色",
+    "orange": "橙色",
+    "cyan": "青色",
+}
+
+
 def normalize_mode(mode: str | None) -> str:
     value = str(mode or "night").strip().lower()
     return "day" if value in {"day", "light", "白天"} else "night"

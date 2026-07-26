@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ... import ui_theme
+from ..design import ACCENT_LABELS
 from ..components import CollapsibleSection, SectionHeading, StatusBadge, SurfaceCard
 
 
@@ -83,7 +83,7 @@ def build_settings_page(window) -> QWidget:
     window.set_ui_mode.addItem("\u591c\u95f4\u6a21\u5f0f\uff08\u5168\u5c40\uff09", "night")
     window.set_ui_mode.addItem("\u767d\u5929\u6a21\u5f0f\uff08\u5168\u5c40\uff09", "day")
     window.set_ui_accent = QComboBox()
-    for key, label in ui_theme.ACCENT_LABELS.items():
+    for key, label in ACCENT_LABELS.items():
         window.set_ui_accent.addItem(label, key)
     appearance_form.addRow("\u5168\u5c40\u663c\u591c\u6a21\u5f0f", window.set_ui_mode)
     appearance_form.addRow("\u5168\u5c40\u4e3b\u9898\u8272", window.set_ui_accent)
@@ -115,12 +115,17 @@ def build_settings_page(window) -> QWidget:
     window.failover_threshold.setValue(3)
     window.failover_silent = QCheckBox("无感切换，仅在状态栏提示")
     window.failover_silent.setChecked(True)
+    window.chat_persistent_session = QCheckBox(
+        "快速提问使用常驻会话（多轮上下文 + 会话内热切模型）"
+    )
+    window.chat_persistent_session.setChecked(True)
     reliability_form.addRow("全局代理", window.proxy_enabled)
     reliability_form.addRow("代理地址", window.proxy_url)
     reliability_form.addRow("批量测试并发", window.test_concurrency)
     reliability_form.addRow("故障切换", window.failover_enabled)
     reliability_form.addRow("连续失败阈值", window.failover_threshold)
     reliability_form.addRow("", window.failover_silent)
+    reliability_form.addRow("", window.chat_persistent_session)
     reliability.body_layout.addLayout(reliability_form)
     layout.addWidget(reliability)
 
