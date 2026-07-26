@@ -186,6 +186,37 @@ test("rpc manager hot-switches models in-process and respawns only on credential
   assert.deepEqual(sessions[2].spec.env, { KEY_A: "a2", KEY_B: "b1" });
 });
 
+test("idle sessions are reclaimed and busy sessions get a grace period", async () => {
+  const sessions = [];
+  const manager = new RpcChatManager({
+    createSession: fakeSessionFactory(sessions),
+    idleTimeoutMs: 25,
+  });
+  const buildSpawn = ({ env, cwd }) => ({ executable: "pi", args: [], env, cwd });
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  await manager.ensure({ cwd: "/w", provider: "P", model: "m", providerEnv: {}, buildSpawn });
+  sessions[0].busy = true;
+  sessions[0].isBusy = function () {
+    return this.busy;
+  };
+  manager.touch("/w");
+  await sleep(45);
+  assert.equal(sessions[0].alive, true, "busy session survives the idle window");
+  sessions[0].busy = false;
+  await sleep(45);
+  assert.equal(sessions[0].alive, false, "idle session is reclaimed");
+  assert.equal(manager.entryFor("/w"), null);
+
+  // idleTimeoutMs 0 disables reclamation
+  const noReap = new RpcChatManager({ createSession: fakeSessionFactory(sessions), idleTimeoutMs: 0 });
+  await noReap.ensure({ cwd: "/w2", provider: "P", model: "m", providerEnv: {}, buildSpawn });
+  noReap.touch("/w2");
+  await sleep(40);
+  assert.equal(sessions[1].alive, true);
+  noReap.disposeAll();
+});
+
 test("env comparison and text extraction helpers", () => {
   assert.equal(sameEnv({ A: "1" }, { A: "1" }), true);
   assert.equal(sameEnv({ A: "1" }, { A: "2" }), false);

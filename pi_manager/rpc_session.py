@@ -78,6 +78,10 @@ class PiRpcSession:
         with self._state_lock:
             return self._alive
 
+    def is_busy(self) -> bool:
+        with self._state_lock:
+            return self._turn is not None
+
     def close(self) -> None:
         try:
             self._proc.kill()
@@ -270,6 +274,51 @@ class PiRpcSession:
 _manager_lock = threading.Lock()
 _entry: dict[str, Any] | None = None
 _runtime_disabled = False
+_idle_timer: threading.Timer | None = None
+
+
+def _idle_ttl_seconds() -> float:
+    """Idle minutes before the persistent pi process is reclaimed (0 = never)."""
+    try:
+        minutes = float(core.load_manager_config().get("chat_session_idle_min") or 10)
+    except Exception:
+        minutes = 10.0
+    return max(0.0, minutes) * 60.0
+
+
+def _schedule_idle_reaper() -> None:
+    """(Re)arm the idle reaper. Caller must hold _manager_lock."""
+    global _idle_timer
+    if _idle_timer is not None:
+        _idle_timer.cancel()
+        _idle_timer = None
+    ttl = _idle_ttl_seconds()
+    if ttl <= 0 or _entry is None:
+        return
+    timer = threading.Timer(ttl, _reap_idle_session)
+    timer.daemon = True
+    _idle_timer = timer
+    timer.start()
+
+
+def _reap_idle_session() -> None:
+    """Close the persistent session once it has sat idle for a full TTL.
+
+    The sticky --session-id means a later prompt transparently reloads the
+    same conversation, so reclaiming the process costs nothing but latency.
+    """
+    global _entry, _idle_timer
+    with _manager_lock:
+        entry = _entry
+        _idle_timer = None
+        if entry is None:
+            return
+        session = entry["session"]
+        if session.is_busy() or time.monotonic() - entry.get("last_used", 0.0) < _idle_ttl_seconds() - 1:
+            _schedule_idle_reaper()
+            return
+        _entry = None
+    session.close()
 
 
 def rpc_chat_enabled() -> bool:
@@ -284,10 +333,13 @@ def rpc_chat_enabled() -> bool:
 
 def reset_chat_session() -> None:
     """Drop the persistent conversation (new session id on next prompt)."""
-    global _entry
+    global _entry, _idle_timer
     with _manager_lock:
         entry = _entry
         _entry = None
+        if _idle_timer is not None:
+            _idle_timer.cancel()
+            _idle_timer = None
     if entry is not None:
         entry["session"].close()
 
@@ -399,6 +451,10 @@ def rpc_chat_once(
         except FileNotFoundError as exc:
             _runtime_disabled = True
             return _failed(provider, model, str(exc))
+        with _manager_lock:
+            if _entry is not None:
+                _entry["last_used"] = time.monotonic()
+                _schedule_idle_reaper()
         result["provider"], result["model"] = provider, model
         if result.get("ok") or not key_id:
             return result

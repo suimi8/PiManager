@@ -41,6 +41,49 @@ def test_chat_attempt_falls_back_when_rpc_runtime_disabled(isolated_home, monkey
     assert calls == ["hello"]
 
 
+def test_idle_reaper_closes_idle_session_but_spares_busy_one(isolated_home, monkeypatch):
+    import time
+
+    class FakeSession:
+        def __init__(self):
+            self.alive = True
+            self.busy = False
+
+        def is_alive(self):
+            return self.alive
+
+        def is_busy(self):
+            return self.busy
+
+        def close(self):
+            self.alive = False
+
+    monkeypatch.setattr(rpc_session, "_idle_ttl_seconds", lambda: 0.05)
+    session = FakeSession()
+    with rpc_session._manager_lock:
+        rpc_session._entry = {
+            "session": session,
+            "session_id": "sid",
+            "env_by_provider": {},
+            "current": ("P", "m"),
+            "workdir": "",
+            "thinking": "off",
+            "last_used": time.monotonic(),
+        }
+        session.busy = True
+        rpc_session._schedule_idle_reaper()
+    time.sleep(0.15)
+    assert session.alive is True, "busy session must not be reaped"
+
+    session.busy = False
+    with rpc_session._manager_lock:
+        rpc_session._entry["last_used"] = time.monotonic() - 10
+        rpc_session._schedule_idle_reaper()
+    time.sleep(0.15)
+    assert session.alive is False
+    assert rpc_session._entry is None
+
+
 def _sse_payload(text: str, model: str) -> bytes:
     chunks = [
         {

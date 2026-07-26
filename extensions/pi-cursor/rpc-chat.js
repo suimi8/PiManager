@@ -17,9 +17,12 @@ function sameEnv(a, b) {
   return leftKeys.every((key) => left[key] === right[key]);
 }
 
+const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+
 class RpcChatManager {
-  constructor({ createSession = (spec) => new PiRpcSession(spec) } = {}) {
+  constructor({ createSession = (spec) => new PiRpcSession(spec), idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS } = {}) {
     this._createSession = createSession;
+    this._idleTimeoutMs = idleTimeoutMs;
     this._entries = new Map();
   }
 
@@ -27,8 +30,48 @@ class RpcChatManager {
     return this._entries.get(String(cwd || "")) || null;
   }
 
+  _idleTimeout() {
+    const value = typeof this._idleTimeoutMs === "function" ? this._idleTimeoutMs() : this._idleTimeoutMs;
+    const ms = Number(value);
+    return Number.isFinite(ms) && ms > 0 ? ms : 0;
+  }
+
+  // A quick-ask should not leave a pi process (and its context) resident
+  // forever: reclaim after idling. The sticky session id restores the
+  // conversation transparently on the next prompt.
+  touch(cwd) {
+    const key = String(cwd || "");
+    const entry = this._entries.get(key);
+    if (!entry) return;
+    if (entry.idleTimer) clearTimeout(entry.idleTimer);
+    const timeoutMs = this._idleTimeout();
+    if (!timeoutMs) return;
+    entry.idleTimer = setTimeout(() => {
+      if (this._entries.get(key) !== entry) return;
+      if (entry.session.isBusy && entry.session.isBusy()) {
+        this.touch(key);
+        return;
+      }
+      this._entries.delete(key);
+      try {
+        entry.session.dispose();
+      } catch {
+        // best effort
+      }
+    }, timeoutMs);
+    if (entry.idleTimer.unref) entry.idleTimer.unref();
+  }
+
+  _clearTimer(entry) {
+    if (entry && entry.idleTimer) {
+      clearTimeout(entry.idleTimer);
+      entry.idleTimer = null;
+    }
+  }
+
   disposeAll() {
     for (const entry of this._entries.values()) {
+      this._clearTimer(entry);
       try {
         entry.session.dispose();
       } catch {
@@ -42,6 +85,7 @@ class RpcChatManager {
     const key = String(cwd || "");
     const entry = this._entries.get(key);
     if (!entry) return;
+    this._clearTimer(entry);
     try {
       entry.session.dispose();
     } catch {
@@ -70,6 +114,7 @@ class RpcChatManager {
       const envByProvider = new Map(entry ? entry.envByProvider : []);
       envByProvider.set(provider, { ...(providerEnv || {}) });
       if (entry) {
+        this._clearTimer(entry);
         try {
           entry.session.dispose();
         } catch {

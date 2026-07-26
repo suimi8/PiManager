@@ -76,6 +76,10 @@ class PiRpcSession {
     return this._alive;
   }
 
+  isBusy() {
+    return this._turn !== null;
+  }
+
   everResponded() {
     return this._everResponded;
   }

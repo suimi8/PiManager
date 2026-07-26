@@ -202,6 +202,16 @@
           "type": "boolean",
           "default": true,
           "description": "快速提问使用常驻 pi --mode rpc 会话：多轮上下文保留，失败换模走 set_model 热切换；不可用时自动回退一次性模式"
+        },
+        "pi.rpcPromptTimeoutMs": {
+          "type": "number",
+          "default": 180000,
+          "description": "快速提问单次回答的超时（毫秒）。慢模型或长任务可调大"
+        },
+        "pi.rpcSessionIdleTimeoutMs": {
+          "type": "number",
+          "default": 300000,
+          "description": "常驻会话空闲多久后回收 pi 进程（毫秒，0=不回收）。固定会话 ID 保证下次提问自动恢复上下文"
         }
       }
     }
