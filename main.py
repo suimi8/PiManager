@@ -50,13 +50,32 @@ def main():
         import json
 
         from pi_manager.config_broker import mutate_file
+        from pi_manager.provider_env import _emit
 
-        if len(sys.argv) != 3:
-            print(json.dumps({"ok": False, "error": "request file is required"}))
+        output_path = ""
+        if len(sys.argv) == 5 and sys.argv[3] == "--output":
+            output_path = sys.argv[4]
+        elif len(sys.argv) != 3:
+            result = {"ok": False, "error": "request file is required"}
+            print(json.dumps(result))
             return 2
         result = mutate_file(sys.argv[2])
-        print(json.dumps(result, ensure_ascii=False))
+        encoded = json.dumps(result, ensure_ascii=False)
+        if output_path:
+            try:
+                # Same hardened write as provider-env responses (pre-created
+                # file only, no symlink following); stdout below remains the
+                # fallback channel the extension already reads.
+                _emit(result, output_path)
+            except (ValueError, OSError):
+                pass
+        print(encoded)
         return 0 if result.get("ok") else 2
+    # Helper subcommands above are the extension's hot path and must not
+    # rewrite the registry on every call; publish it when the app itself runs.
+    from pi_manager.helper_registry import register_current_helper_best_effort
+
+    register_current_helper_best_effort()
     if len(sys.argv) >= 2 and sys.argv[1] in {"--self-check", "--smoke-test"}:
         from pi_manager.extras import APP_VERSION
         from pi_manager.resources import self_check

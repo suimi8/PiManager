@@ -98,7 +98,7 @@ python -m pytest tests -q
 2. 在 Cursor 中安装 VSIX
 3. 命令面板搜索 `Pi:` 即可启动会话
 
-若扩展与 PiManager 不在相邻目录，请在设置中配置：
+正常情况下先启动一次 PiManager，扩展会自动发现安全 helper 与 Config Broker。若自动发现不可用，可在设置中手工配置：
 
 ```text
 pi.providerEnvCommand = python /path/to/PiManager/main.py --print-provider-env

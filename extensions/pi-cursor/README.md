@@ -9,7 +9,7 @@
 - 状态栏显示当前默认模型，点击即可切换
 - 终端启动完整 Pi 会话；快速提问先轮换同 Provider 的可用 Key，再复用 Pi Manager 的失败计数与自动换模
 - 启动后每天检查 PiManager Release 中的 VSIX 更新，也可从命令面板手动检查
-- 支持 Pi Manager 安全密钥 helper（`pi.providerEnvCommand`）
+- 启动一次 Pi Manager 后自动发现安全密钥 helper / Config Broker；也可用 `pi.providerEnvCommand` 手工覆盖
 
 ## 快捷键
 
@@ -23,6 +23,7 @@
 
 - **能做的**：立即改写 `settings.json` 的 `defaultProvider` / `defaultModel`（可选同步 `enabledModels`）
 - **不能做的**：无法注入已在运行的 Pi 交互会话内部状态；已开会话需在 Pi 内 `Ctrl+P` 循环，或重新启动会话
+- **可升级方向**：Pi `--mode rpc` 支持 `set_model`，由扩展托管 RPC 会话后可实现真正的会话内切换；普通集成终端无法获得其 stdin 控制权
 - 模型列表来源：`pi-manager.json` 收藏、`settings.enabledModels`、`models.json` providers
 - 快速提问：单模型失败次数会写入 `pi-manager.json`，达到桌面端相同阈值后按当前模型 → 收藏 → 启用模型 → 默认模型重试；成功后同步新的默认模型
 

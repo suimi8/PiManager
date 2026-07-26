@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import threading
 import uuid
 from contextlib import contextmanager
@@ -120,7 +121,7 @@ def load_json(path: Path, default: Any) -> Any:
     return result.data
 
 
-def _rotate_backups(path: Path) -> None:
+def _rotate_backups(path: Path, *, private: bool = False) -> None:
     if not path.exists() or not path.is_file():
         return
     first = path.with_name(f"{path.name}.bak.1")
@@ -134,12 +135,22 @@ def _rotate_backups(path: Path) -> None:
                 target.write(chunk)
             target.flush()
             os.fsync(target.fileno())
+        # Backups must never be more readable than the file they copy — and a
+        # private write must clamp the backup even when the previous on-disk
+        # file was still world-readable.
+        try:
+            os.chmod(
+                backup_temp,
+                0o600 if private else stat.S_IMODE(path.stat().st_mode),
+            )
+        except OSError:
+            pass
         os.replace(backup_temp, first)
     finally:
         backup_temp.unlink(missing_ok=True)
 
 
-def _write_unlocked(path: Path, data: Any) -> None:
+def _write_unlocked(path: Path, data: Any, *, private: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     current = _read_result_unlocked(path, None)
     if current.status in {"corrupt", "unsupported"}:
@@ -149,14 +160,37 @@ def _write_unlocked(path: Path, data: Any) -> None:
     temp = path.with_name(
         f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
     )
+    # A rewrite must not silently widen permissions a previous writer set:
+    # remember the current mode and restore it after the atomic replace.
+    previous_mode: int | None = None
+    if not private:
+        try:
+            previous_mode = stat.S_IMODE(path.stat().st_mode)
+        except OSError:
+            previous_mode = None
     try:
-        with temp.open("w", encoding="utf-8", newline="\n") as handle:
+        if private:
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            handle = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        else:
+            handle = temp.open("w", encoding="utf-8", newline="\n")
+        with handle:
             json.dump(data, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        _rotate_backups(path)
+        if previous_mode is not None:
+            try:
+                os.chmod(temp, previous_mode)
+            except OSError:
+                pass
+        _rotate_backups(path, private=private)
         os.replace(temp, path)
+        if private:
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
     finally:
         try:
             temp.unlink(missing_ok=True)
@@ -164,10 +198,10 @@ def _write_unlocked(path: Path, data: Any) -> None:
             pass
 
 
-def save_json(path: Path, data: Any) -> None:
+def save_json(path: Path, data: Any, *, private: bool = False) -> None:
     path = Path(path)
     with locked(path):
-        _write_unlocked(path, data)
+        _write_unlocked(path, data, private=private)
 
 
 def update_json(path: Path, default: Any, updater: Callable[[Any], Any]) -> Any:

@@ -5,6 +5,9 @@ const test = require("node:test");
 
 const { chatWithFailover, failoverChain, normalizeModelPair } = require("../failover");
 const { resolveCommand } = require("../invocation");
+const path = require("node:path");
+const { helperRegistryPath, registeredHelperCommand, withHelperMode } = require("../helper-discovery");
+const { proxyEnvFromManagerConfig } = require("../proxy-env");
 const { runWithProviderKeyFailover } = require("../provider-keys");
 const { compareVersions, findVsixAsset, vsixUpdateInfo } = require("../release");
 const {
@@ -48,6 +51,89 @@ test("managed ask resolves configured Pi commands without shell interpolation", 
     bin: "C:\\Program Files\\Pi\\pi.exe",
     args: [],
   });
+});
+
+test("registered Pi Manager helper is validated and supports both modes", () => {
+  const fs = require("node:fs");
+  const originalRead = fs.readFileSync;
+  const executable = path.resolve("PiManager-test");
+  fs.readFileSync = () => JSON.stringify({
+    schema_version: 1,
+    command: [executable],
+  });
+  try {
+    const command = registeredHelperCommand({
+      home: path.resolve("test-home"),
+      pathExists: (candidate) => candidate === executable,
+    });
+    assert.deepEqual(withHelperMode(command, "--print-provider-env"), [
+      executable,
+      "--print-provider-env",
+    ]);
+    assert.deepEqual(
+      withHelperMode([...command, "--print-provider-env"], "--config-mutate"),
+      [executable, "--config-mutate"]
+    );
+  } finally {
+    fs.readFileSync = originalRead;
+  }
+});
+
+test("registered helper is rejected when ownership or permissions look wrong", () => {
+  const fs = require("node:fs");
+  const originalRead = fs.readFileSync;
+  const home = path.resolve("test-home");
+  const registryFile = helperRegistryPath(home);
+  const executable = path.resolve("PiManager-test");
+  fs.readFileSync = () => JSON.stringify({ schema_version: 1, command: [executable] });
+  const stats = new Map([
+    [registryFile, { uid: 1000, mode: 0o600 }],
+    [executable, { uid: 1000, mode: 0o755 }],
+  ]);
+  const options = {
+    home,
+    pathExists: (candidate) => candidate === executable,
+    statFile: (target) => stats.get(target),
+    uid: 1000,
+    platform: "linux",
+  };
+  try {
+    assert.deepEqual(registeredHelperCommand(options), [executable]);
+
+    stats.set(registryFile, { uid: 1001, mode: 0o600 });
+    assert.equal(registeredHelperCommand(options), null, "foreign-owned registry is rejected");
+
+    stats.set(registryFile, { uid: 1000, mode: 0o666 });
+    assert.equal(registeredHelperCommand(options), null, "other-writable registry is rejected");
+
+    stats.set(registryFile, { uid: 1000, mode: 0o600 });
+    stats.set(executable, { uid: 0, mode: 0o755 });
+    assert.deepEqual(registeredHelperCommand(options), [executable], "root-owned interpreter is allowed");
+
+    stats.set(executable, { uid: 1000, mode: 0o777 });
+    assert.equal(registeredHelperCommand(options), null, "other-writable executable is rejected");
+
+    stats.set(executable, { uid: 1000, mode: 0o755 });
+    assert.deepEqual(registeredHelperCommand({ ...options, platform: "win32" }), [executable]);
+  } finally {
+    fs.readFileSync = originalRead;
+  }
+});
+
+test("proxy env is derived from the desktop manager config", () => {
+  assert.deepEqual(proxyEnvFromManagerConfig(null), {});
+  assert.deepEqual(proxyEnvFromManagerConfig({}), {});
+  assert.deepEqual(proxyEnvFromManagerConfig({ proxy_enabled: true, proxy_url: "" }), {});
+  assert.deepEqual(proxyEnvFromManagerConfig({ proxy_enabled: false, proxy_url: "http://p" }), {});
+  assert.deepEqual(
+    proxyEnvFromManagerConfig({ proxy_enabled: true, proxy_url: "http://127.0.0.1:7890" }),
+    {
+      HTTP_PROXY: "http://127.0.0.1:7890",
+      HTTPS_PROXY: "http://127.0.0.1:7890",
+      http_proxy: "http://127.0.0.1:7890",
+      https_proxy: "http://127.0.0.1:7890",
+    }
+  );
 });
 
 test("Provider and Model are normalized as one atomic pair", () => {

@@ -6,6 +6,8 @@ const https = require("https");
 const { execFile } = require("child_process");
 const { chatWithFailover, normalizeModelPair } = require("./failover");
 const { commandParts, resolveCommand } = require("./invocation");
+const { registeredHelperCommand, withHelperMode } = require("./helper-discovery");
+const { proxyEnvFromManagerConfig } = require("./proxy-env");
 const { runWithProviderKeyFailover } = require("./provider-keys");
 const { vsixUpdateInfo } = require("./release");
 const {
@@ -66,6 +68,16 @@ function readModelsConfig() {
 function readManagerConfig() {
   const data = readJson(managerConfigPath(), {});
   return data && typeof data === "object" ? data : {};
+}
+
+// The proxy is a launch enhancement, never a prerequisite: a corrupt
+// pi-manager.json must not block opening a terminal.
+function managerProxyEnvSafe() {
+  try {
+    return proxyEnvFromManagerConfig(readManagerConfig());
+  } catch {
+    return {};
+  }
 }
 
 async function writeManagerConfig(manager) {
@@ -194,12 +206,11 @@ function managerHelperCommand(mode) {
     executableConfiguration("providerEnvCommand", "") || process.env.PI_MANAGER_ENV_HELPER || ""
   ).trim();
   if (configured) {
-    const parts = commandParts(configured);
-    const index = parts.findIndex((part) => part === "--print-provider-env" || part === "--provider-env");
-    if (index >= 0) parts[index] = mode;
-    else parts.push(mode);
-    return parts;
+    return withHelperMode(commandParts(configured), mode);
   }
+
+  const registered = registeredHelperCommand();
+  if (registered) return withHelperMode(registered, mode);
 
   const repoMain = path.resolve(__dirname, "..", "..", "main.py");
   if (fs.existsSync(repoMain)) {
@@ -218,7 +229,11 @@ function providerHelperCommand() {
 
 function invokeConfigBroker(operation, args) {
   const command = managerHelperCommand("--config-mutate");
-  if (!command) return Promise.reject(new Error("未找到 Pi Manager Config Broker"));
+  if (!command) {
+    return Promise.reject(
+      new Error("未找到 Pi Manager Config Broker。请先启动一次 Pi Manager，或设置 pi.providerEnvCommand。")
+    );
+  }
   const requestPath = path.join(
     os.tmpdir(),
     `pi-manager-config-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`
@@ -234,19 +249,37 @@ function invokeConfigBroker(operation, args) {
   } catch (error) {
     return Promise.reject(new Error(`无法创建 Config Broker 请求：${error.message}`));
   }
+  const responsePath = path.join(
+    os.tmpdir(),
+    `pi-manager-config-response-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`
+  );
+  try {
+    const fd = fs.openSync(responsePath, "wx", 0o600);
+    fs.closeSync(fd);
+  } catch (error) {
+    try { fs.unlinkSync(requestPath); } catch {}
+    return Promise.reject(new Error(`无法创建 Config Broker 响应文件：${error.message}`));
+  }
   const [bin, ...baseArgs] = command;
   return new Promise((resolve, reject) => {
-    execFile(bin, [...baseArgs, requestPath], { windowsHide: true, timeout: 20000 }, (error, stdout, stderr) => {
-      try {
-        const payload = JSON.parse(String(stdout || "{}"));
-        if (!payload.ok) throw new Error(payload.error || "Config Broker mutation failed");
-        resolve(payload);
-      } catch (parseError) {
-        reject(new Error(error ? `Config Broker 启动失败：${error.message}` : parseError.message));
-      } finally {
-        try { fs.unlinkSync(requestPath); } catch {}
+    execFile(
+      bin,
+      [...baseArgs, requestPath, "--output", responsePath],
+      { windowsHide: true, timeout: 20000 },
+      (error, stdout) => {
+        try {
+          const text = fs.readFileSync(responsePath, "utf8") || String(stdout || "{}");
+          const payload = JSON.parse(text);
+          if (!payload.ok) throw new Error(payload.error || "Config Broker mutation failed");
+          resolve(payload);
+        } catch (parseError) {
+          reject(new Error(error ? `Config Broker 启动失败：${error.message}` : parseError.message));
+        } finally {
+          try { fs.unlinkSync(requestPath); } catch {}
+          try { fs.unlinkSync(responsePath); } catch {}
+        }
       }
-    });
+    );
   });
 }
 
@@ -260,7 +293,7 @@ function invokeProviderHelper(provider, helperArgs = []) {
   const command = providerHelperCommand();
   if (!command) {
     return Promise.reject(
-      new Error("当前 Provider 使用 Pi Manager 安全密钥，但未找到 Pi Manager 环境 helper。请设置 pi.providerEnvCommand。")
+      new Error("当前 Provider 使用 Pi Manager 安全密钥，但未找到 Pi Manager 环境 helper。请先启动一次 Pi Manager，或设置 pi.providerEnvCommand。")
     );
   }
   const [bin, ...baseArgs] = command;
@@ -461,7 +494,7 @@ async function cmdOpenTerminal(folderUri) {
   try {
     const env = await resolveProviderEnv(providerFromSettings(settings));
     const spec = buildLaunchSpec({ withDefaults: false });
-    openPiTerminal("Pi", spec, cwd, env);
+    openPiTerminal("Pi", spec, cwd, { ...managerProxyEnvSafe(), ...env });
   } catch (err) {
     vscode.window.showErrorMessage(err.message);
   }
@@ -473,7 +506,7 @@ async function cmdOpenWithDefault(folderUri) {
   try {
     const env = await resolveProviderEnv(providerFromSettings(settings));
     const spec = buildLaunchSpec({ withDefaults: true });
-    openPiTerminal("Pi (default)", spec, cwd, env);
+    openPiTerminal("Pi (default)", spec, cwd, { ...managerProxyEnvSafe(), ...env });
   } catch (err) {
     vscode.window.showErrorMessage(err.message);
   }
@@ -587,14 +620,7 @@ function runPiPrompt(prompt, provider, model, cwd) {
     markFailed: (keyId, reason) => markProviderKeyFailed(attemptProvider, keyId, reason),
     run: (providerEnv) =>
       new Promise((resolve) => {
-        const manager = readManagerConfig();
-        const proxyEnv = {};
-        if (manager.proxy_enabled && manager.proxy_url) {
-          proxyEnv.HTTP_PROXY = String(manager.proxy_url);
-          proxyEnv.HTTPS_PROXY = String(manager.proxy_url);
-          proxyEnv.http_proxy = String(manager.proxy_url);
-          proxyEnv.https_proxy = String(manager.proxy_url);
-        }
+        const proxyEnv = proxyEnvFromManagerConfig(readManagerConfig());
         const started = Date.now();
         const options = {
           cwd,

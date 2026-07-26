@@ -2,7 +2,7 @@
   "name": "pi-cursor",
   "displayName": "Pi Coding Agent",
   "description": "在 Cursor 中启动 Pi、切换 Provider/模型、快速提问（读取 ~/.pi/agent 配置）",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "publisher": "pi-manager",
   "license": "Apache-2.0",
   "repository": {
@@ -27,6 +27,7 @@
     "onCommand:pi.checkExtensionUpdate",
     "onCommand:pi.switchModel",
     "onCommand:pi.openPanel",
+    "onCommand:pi.refreshModels",
     "onView:pi.managerView"
   ],
   "main": "./extension.js",
@@ -185,7 +186,7 @@
           "type": "string",
           "scope": "machine",
           "default": "",
-          "description": "Pi Manager 环境 helper 命令，仅接受用户级设置"
+          "description": "Pi Manager helper 命令（同时提供安全密钥和配置 Broker）；通常启动一次 Pi Manager 后自动发现，仅接受用户级设置"
         },
         "pi.syncEnabledModelsOnSwitch": {
           "type": "boolean",
