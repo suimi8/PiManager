@@ -62,3 +62,25 @@ def test_health_results_are_committed_together(isolated_home, monkeypatch):
     assert result["ok"] is True
     assert len(result["health"]["models"]) == 32
     assert len(core.load_json(extras.health_path(), {})["models"]) == 32
+
+
+def test_config_cache_invalidates_on_write_and_copies_are_isolated(isolated_home):
+    from pi_manager import core
+
+    mgr = core.load_manager_config()
+    mgr["proxy_enabled"] = False
+    core.save_manager_config(mgr)
+    assert core.load_manager_config()["proxy_enabled"] is False
+
+    mgr = core.load_manager_config()
+    mgr["proxy_enabled"] = True
+    core.save_manager_config(mgr)
+    assert core.load_manager_config()["proxy_enabled"] is True
+
+    # Mutating a returned copy must never leak into later reads.
+    leaked = core.load_manager_config()
+    leaked["proxy_enabled"] = "mutated"
+    leaked["favorites"].append("Evil/model")
+    fresh = core.load_manager_config()
+    assert fresh["proxy_enabled"] is True
+    assert "Evil/model" not in fresh["favorites"]

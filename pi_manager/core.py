@@ -5,6 +5,7 @@ providers/models/settings and launches full Pi sessions.
 """
 from __future__ import annotations
 
+import copy
 import heapq
 import json
 import logging
@@ -325,8 +326,44 @@ def list_models(search: str | None = None) -> list[ModelInfo]:
     return uniq
 
 
+_CONFIG_CACHE: dict[str, tuple[int, int, Any]] = {}
+_CONFIG_CACHE_LOCK = threading.Lock()
+
+
+def _load_json_cached(path: Path, default: Any) -> Any:
+    """load_json with an (mtime_ns, size)-keyed cache for hot-path configs.
+
+    A quick-ask reads pi-manager.json many times per prompt; one os.stat is
+    far cheaper than the full file-lock + parse round trip. Writers (this
+    process, the pi CLI, the extension's broker) all replace the file, so a
+    changed signature naturally invalidates the entry.
+    """
+    key = str(path)
+    try:
+        stat_before = os.stat(path)
+        signature = (stat_before.st_mtime_ns, stat_before.st_size)
+    except OSError:
+        signature = None
+    if signature is not None:
+        with _CONFIG_CACHE_LOCK:
+            cached = _CONFIG_CACHE.get(key)
+        if cached is not None and (cached[0], cached[1]) == signature:
+            return copy.deepcopy(cached[2])
+    data = load_json(path, default)
+    # Only cache when the file did not change while we were reading it.
+    try:
+        stat_after = os.stat(path)
+        after = (stat_after.st_mtime_ns, stat_after.st_size)
+    except OSError:
+        after = None
+    if after is not None and after == signature:
+        with _CONFIG_CACHE_LOCK:
+            _CONFIG_CACHE[key] = (after[0], after[1], copy.deepcopy(data))
+    return data
+
+
 def load_settings() -> dict[str, Any]:
-    return load_json(settings_path(), {})
+    return _load_json_cached(settings_path(), {})
 
 
 def save_settings(data: dict[str, Any]) -> None:
@@ -358,7 +395,7 @@ def _openai_compat_headers(
 
 
 def load_models_config() -> dict[str, Any]:
-    cfg = load_json(models_path(), {"providers": {}})
+    cfg = _load_json_cached(models_path(), {"providers": {}})
     if not isinstance(cfg, dict):
         cfg = {"providers": {}}
     providers = cfg.get("providers")
@@ -456,7 +493,7 @@ def auth_summary() -> list[dict[str, str]]:
 
 
 def load_manager_config() -> dict[str, Any]:
-    data = load_json(
+    data = _load_json_cached(
         manager_config_path(),
         {
             "favorites": [],
@@ -484,6 +521,9 @@ def load_manager_config() -> dict[str, Any]:
             "failover_fail_threshold": 3,
             "failover_fail_counts": {},
             "failover_silent": True,
+            # 快速提问：常驻 pi --mode rpc 会话（多轮上下文 + set_model 会话内热切）
+            "chat_persistent_session": True,
+            "chat_session_idle_min": 10,
         },
     )
     # merge missing keys for upgrades
@@ -506,6 +546,8 @@ def load_manager_config() -> dict[str, Any]:
         "failover_fail_threshold": 3,
         "failover_fail_counts": {},
         "failover_silent": True,
+        "chat_persistent_session": True,
+        "chat_session_idle_min": 10,
     }
     if not isinstance(data, dict):
         data = {}
