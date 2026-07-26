@@ -15,6 +15,7 @@
 - 全新现代化 UI：分组可折叠导航、全局昼夜主题、统一卡片/表格/对话框与本地 SVG 图标；Pi CLI 自动同步浅色/深色模式
 - 自定义 Provider / 模型配置、从 API 拉取模型、批量可用性测试
 - Provider 支持多 API Key：鉴权、限流或额度错误时先在同一接口内热切 Key，失败 Key 暂存失效池并可手动恢复
+- 快速提问（桌面 Chat 页与 Cursor 扩展）默认走常驻 `pi --mode rpc` 会话：多轮上下文保留在会话内，failover 换模用 `set_model` 会话内热切不丢上下文；`pi --mode rpc` 不可用时自动回退一次性模式
 - Provider API Key 安全存储：OS keyring 优先，当前用户 AES-GCM 文件库回退
 - 启动官方 Pi 时仅向子进程注入密钥（`models.json` 只存环境变量引用）
 - 全局代理、健康监控、测试历史、并发测试

@@ -21,9 +21,9 @@
 
 ## 热切换说明
 
-- **能做的**：立即改写 `settings.json` 的 `defaultProvider` / `defaultModel`（可选同步 `enabledModels`）
-- **不能做的**：无法注入已在运行的 Pi 交互会话内部状态；已开会话需在 Pi 内 `Ctrl+P` 循环，或重新启动会话
-- **可升级方向**：Pi `--mode rpc` 支持 `set_model`，由扩展托管 RPC 会话后可实现真正的会话内切换；普通集成终端无法获得其 stdin 控制权
+- **快速提问（默认）**：由扩展托管一个常驻 `pi --mode rpc` 会话——多轮上下文保留在会话内，failover 换模走 `set_model` **真·会话内热切**（不重启、不丢上下文）；换 API Key 需重启子进程，但固定 `--session-id` 会让 pi 重新加载同一会话文件，上下文同样保留。`pi.persistentRpcSession` 可关闭；`--mode rpc` 不可用时自动回退一次性模式
+- **切换默认模型**：立即改写 `settings.json` 的 `defaultProvider` / `defaultModel`（可选同步 `enabledModels`），对新启动的会话生效
+- **不能做的**：无法注入已在终端里运行的 Pi 交互 TUI 会话（上游无对外控制通道）；已开终端会话需在 Pi 内 `Ctrl+P` 循环，或重新启动会话
 - 模型列表来源：`pi-manager.json` 收藏、`settings.enabledModels`、`models.json` providers
 - 快速提问：单模型失败次数会写入 `pi-manager.json`，达到桌面端相同阈值后按当前模型 → 收藏 → 启用模型 → 默认模型重试；成功后同步新的默认模型
 

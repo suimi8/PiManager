@@ -2,7 +2,7 @@
   "name": "pi-cursor",
   "displayName": "Pi Coding Agent",
   "description": "在 Cursor 中启动 Pi、切换 Provider/模型、快速提问（读取 ~/.pi/agent 配置）",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "publisher": "pi-manager",
   "license": "Apache-2.0",
   "repository": {
@@ -197,6 +197,11 @@
           "type": "boolean",
           "default": true,
           "description": "启动后每天检查 PiManager Release 中是否有新版 Cursor VSIX"
+        },
+        "pi.persistentRpcSession": {
+          "type": "boolean",
+          "default": true,
+          "description": "快速提问使用常驻 pi --mode rpc 会话：多轮上下文保留，失败换模走 set_model 热切换；不可用时自动回退一次性模式"
         }
       }
     }

@@ -1489,6 +1489,47 @@ def should_failover(provider: str, model: str) -> bool:
     return bool(key) and int(_fail_counts().get(key) or 0) >= thr
 
 
+def _chat_attempt(
+    prompt: str,
+    *,
+    provider: str | None,
+    model: str | None,
+    workdir: str | None,
+    timeout: float,
+    thinking: str | None,
+) -> dict[str, Any]:
+    """One chat attempt: persistent RPC session when available, else one-shot.
+
+    The RPC session keeps conversation context in-process and lets failover
+    hot-switch models via set_model; when `pi --mode rpc` is unusable the
+    session layer disables itself for the rest of the run and every attempt
+    falls back to the classic one-shot `pi -p` path.
+    """
+    from . import rpc_session
+
+    apply_proxy_env()
+    if rpc_session.rpc_chat_enabled():
+        result = rpc_session.rpc_chat_once(
+            prompt,
+            provider=provider,
+            model=model,
+            workdir=workdir,
+            timeout=timeout,
+            thinking=thinking,
+        )
+        if result.get("ok") or rpc_session.rpc_chat_enabled():
+            return result
+        # rpc became unavailable during this attempt — retry one-shot
+    return chat_once(
+        prompt,
+        provider=provider,
+        model=model,
+        workdir=workdir,
+        timeout=timeout,
+        thinking=thinking,
+    )
+
+
 def chat_with_failover(
     prompt: str,
     *,
@@ -1567,7 +1608,7 @@ def chat_with_failover(
             attempts.append({"provider": p, "model": m, "skipped": True, "reason": f"已连续失败≥{thr}"})
             continue
 
-        result = chat_once(
+        result = _chat_attempt(
             prompt,
             provider=p,
             model=m,

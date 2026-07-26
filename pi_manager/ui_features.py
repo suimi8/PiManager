@@ -911,11 +911,17 @@ class FeatureMixin:
             self.sessions_table.setItem(i, 1, QTableWidgetItem(r.get("cwd") or r.get("folder") or ""))
             self.sessions_table.setItem(i, 2, QTableWidgetItem(r.get("model") or r.get("path") or ""))
 
-    # ---- chat multi-turn (context via prompt assembly) ----
+    # ---- chat multi-turn (context via persistent RPC session, else prompt assembly) ----
     def chat_clear_history(self):
         self.chat_history = []
         if hasattr(self, "chat_output"):
             self.chat_output.setPlainText("")
+        try:
+            from . import rpc_session
+
+            rpc_session.reset_chat_session()
+        except Exception:
+            pass
         self.status.showMessage("已清空对话历史")
 
     def chat_send_enhanced(self):
@@ -930,26 +936,38 @@ class FeatureMixin:
             model = self.chat_model.currentText().strip() if hasattr(self.chat_model, "currentText") else self.chat_model.text().strip()
             provider = provider or None
             model = model or None
-        # Keep the request context within both turn and byte budgets.
-        history_lines = []
-        context_bytes = 0
-        for turn in reversed(self.chat_history[-6:]):
-            lines = [
-                f"User: {turn.get('user', '')}",
-                f"Assistant: {turn.get('assistant', '')}",
-            ]
-            size = len("\n".join(lines).encode("utf-8"))
-            if context_bytes + size > 128 * 1024:
-                break
-            history_lines[0:0] = lines
-            context_bytes += size
-        if history_lines:
-            full = "以下是近期对话，请承接上下文简要回答。\n" + "\n".join(history_lines) + f"\nUser: {prompt}\nAssistant:"
-        else:
+        # A persistent RPC session already holds the conversation in-process;
+        # only the legacy one-shot path needs history stitched into the prompt.
+        use_rpc = False
+        try:
+            from . import rpc_session
+
+            use_rpc = rpc_session.rpc_chat_enabled()
+        except Exception:
+            use_rpc = False
+        if use_rpc:
             full = prompt
-        encoded = full.encode("utf-8")
-        if len(encoded) > 128 * 1024:
-            full = encoded[-128 * 1024 :].decode("utf-8", errors="ignore")
+        else:
+            # Keep the request context within both turn and byte budgets.
+            history_lines = []
+            context_bytes = 0
+            for turn in reversed(self.chat_history[-6:]):
+                lines = [
+                    f"User: {turn.get('user', '')}",
+                    f"Assistant: {turn.get('assistant', '')}",
+                ]
+                size = len("\n".join(lines).encode("utf-8"))
+                if context_bytes + size > 128 * 1024:
+                    break
+                history_lines[0:0] = lines
+                context_bytes += size
+            if history_lines:
+                full = "以下是近期对话，请承接上下文简要回答。\n" + "\n".join(history_lines) + f"\nUser: {prompt}\nAssistant:"
+            else:
+                full = prompt
+            encoded = full.encode("utf-8")
+            if len(encoded) > 128 * 1024:
+                full = encoded[-128 * 1024 :].decode("utf-8", errors="ignore")
         self.chat_output.appendPlainText(f"\n你: {prompt}\n…思考中…")
         self.chat_input.setEnabled(False)
         workdir = self.workdir_edit.text().strip() or str(core.user_home())

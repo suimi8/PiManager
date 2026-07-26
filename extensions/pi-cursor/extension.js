@@ -9,6 +9,7 @@ const { commandParts, resolveCommand } = require("./invocation");
 const { registeredHelperCommand, withHelperMode } = require("./helper-discovery");
 const { proxyEnvFromManagerConfig } = require("./proxy-env");
 const { runWithProviderKeyFailover } = require("./provider-keys");
+const { RpcChatManager } = require("./rpc-chat");
 const { vsixUpdateInfo } = require("./release");
 const {
   requireTrustedExecution,
@@ -551,8 +552,14 @@ async function cmdAskPrompt() {
           setDefaultModel: async (nextProvider, nextModel) => {
             await setDefaultModel(nextProvider, nextModel);
           },
-          runAttempt: (text, attemptProvider, attemptModel) =>
-            runPiPrompt(text, attemptProvider, attemptModel, cwd),
+          runAttempt: async (text, attemptProvider, attemptModel) => {
+            if (rpcSessionEnabled()) {
+              const rpcResult = await runPiPromptRpc(text, attemptProvider, attemptModel, cwd);
+              if (rpcResult.ok || !rpcRuntimeDisabled) return rpcResult;
+              askOutput.appendLine("[会话] 持久 RPC 会话不可用，回退到一次性模式");
+            }
+            return runPiPrompt(text, attemptProvider, attemptModel, cwd);
+          },
           onAttempt: async (attempt) => {
             const key = `${attempt.provider}/${attempt.model}`;
             if (attempt.skipped) {
@@ -594,6 +601,82 @@ async function cmdAskPrompt() {
   } finally {
     askRunning = false;
   }
+}
+
+const rpcChatManager = new RpcChatManager();
+let rpcRuntimeDisabled = false;
+
+function rpcSessionEnabled() {
+  const cfg = vscode.workspace.getConfiguration("pi");
+  return cfg.get("persistentRpcSession") !== false && !rpcRuntimeDisabled;
+}
+
+function buildRpcSpawnSpec({ env, provider, model, sessionId, cwd }) {
+  const cfg = vscode.workspace.getConfiguration("pi");
+  const settings = readSettings();
+  const invocation = piInvocation(findPiCommand());
+  let bin = invocation.bin;
+  let args = [...invocation.args, "--mode", "rpc"];
+  const pair = normalizeModelPair(provider, model, { allowEmpty: false });
+  args.push("--provider", pair[0], "--model", pair[1]);
+  if (settings.defaultThinkingLevel) {
+    args.push("--thinking", String(settings.defaultThinkingLevel));
+  }
+  if (cfg.get("appendChinesePrompt") !== false) {
+    args.push("--append-system-prompt", ZH_PROMPT);
+  }
+  args.push(...commandParts(executableConfiguration("extraArgs", "")));
+  args.push("--session-id", sessionId, "-n", "Cursor 快速提问");
+  if (process.platform === "win32" && /\.(cmd|bat)$/i.test(String(bin))) {
+    const command = [shellQuote(String(bin)), ...args.map((arg) => shellQuote(String(arg)))].join(" ");
+    bin = process.env.ComSpec || "cmd.exe";
+    args = ["/d", "/s", "/c", command];
+  }
+  return {
+    executable: bin,
+    args,
+    cwd,
+    env: { ...process.env, ...managerProxyEnvSafe(), ...env },
+  };
+}
+
+// Persistent-session variant of runPiPrompt: same result shape, same key
+// failover, but prompts run inside one long-lived `pi --mode rpc` process —
+// model switches are applied hot via set_model and conversation context is
+// preserved (the sticky --session-id also survives key-rotation respawns).
+function runPiPromptRpc(prompt, provider, model, cwd) {
+  requireTrustedExecution(vscode.workspace);
+  const [attemptProvider, attemptModel] = normalizeModelPair(provider, model, { allowEmpty: false });
+  return runWithProviderKeyFailover({
+    resolveCredential: () => resolveProviderCredential(attemptProvider),
+    markFailed: (keyId, reason) => markProviderKeyFailed(attemptProvider, keyId, reason),
+    run: async (providerEnv) => {
+      const started = Date.now();
+      try {
+        const entry = await rpcChatManager.ensure({
+          cwd,
+          provider: attemptProvider,
+          model: attemptModel,
+          providerEnv,
+          buildSpawn: buildRpcSpawnSpec,
+        });
+        return await entry.session.prompt(String(prompt));
+      } catch (error) {
+        rpcChatManager.disposeFor(cwd);
+        if (error && error.rpcUnavailable) {
+          rpcRuntimeDisabled = true;
+        }
+        return {
+          ok: false,
+          returncode: -1,
+          stdout: "",
+          stderr: "",
+          latency_ms: Date.now() - started,
+          error: (error && error.message) || String(error),
+        };
+      }
+    },
+  });
 }
 
 function runPiPrompt(prompt, provider, model, cwd) {
@@ -1156,7 +1239,9 @@ function activate(context) {
   scheduleExtensionUpdateCheck(context);
 }
 
-function deactivate() {}
+function deactivate() {
+  rpcChatManager.disposeAll();
+}
 
 module.exports = {
   activate,

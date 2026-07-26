@@ -32,6 +32,7 @@ hiddenimports = [
     "pi_manager.provider_env",
     "pi_manager.config_broker",
     "pi_manager.helper_registry",
+    "pi_manager.rpc_session",
     "pi_manager.ui_features",
     "pi_manager.help_docs",
     "pi_manager.ui_theme",
