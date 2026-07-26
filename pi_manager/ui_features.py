@@ -432,10 +432,6 @@ class FeatureMixin:
         layout.addWidget(box3)
         return w
 
-    def enhance_sessions_tab_widgets(self, layout: QVBoxLayout):
-        # called if we rebuild sessions - instead patch methods only
-        pass
-
     # ---- health ----
     def health_save_interval(self):
         self.mgr["health_interval_min"] = int(self.health_interval.value())

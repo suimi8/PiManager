@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import logging
 import os
 import re
 import shutil
@@ -58,16 +59,18 @@ def load_json(path: Path, default: Any) -> Any:
     return storage.load_json(path, default)
 
 
-def save_json(path: Path, data: Any) -> None:
+def save_json(path: Path, data: Any, *, private: bool = False) -> None:
     ensure_agent_dir()
-    storage.save_json(path, data)
+    storage.save_json(path, data, private=private)
 
 
 def mask_secret(value: str | None, keep: int = 4) -> str:
     if not value:
         return ""
     s = str(value)
-    if s.startswith(("!", "$")) or s.isupper() and "_" in s and not s.startswith("sk") and not s.startswith("tp-"):
+    if s.startswith(("!", "$")) or (
+        s.isupper() and "_" in s and not s.startswith(("sk", "tp-"))
+    ):
         # env var name or shell command
         return s
     if len(s) <= keep * 2:
@@ -385,9 +388,13 @@ def load_models_config() -> dict[str, Any]:
                 migrated_cfg["providers"] = migrated
                 save_models_config(migrated_cfg)
                 cfg = migrated_cfg
-    except Exception:
-        # Keep configuration readable even if the platform keyring is broken.
-        pass
+    except Exception as exc:
+        # Keep configuration readable even if the platform keyring is broken,
+        # but leave a trace: a failed migration means plaintext keys may still
+        # sit in models.json and must not disappear silently.
+        logging.getLogger(__name__).warning(
+            "models.json 密钥迁移失败，明文引用可能仍保留在配置中: %s", exc
+        )
 
     # OpenAI's Node SDK UA may be blocked by some compatible-provider WAFs.
     # Persist the safe default so upgraded, existing providers behave like new ones.
@@ -508,7 +515,8 @@ def load_manager_config() -> dict[str, Any]:
 
 
 def save_manager_config(data: dict[str, Any]) -> None:
-    save_json(manager_config_path(), data)
+    # pi-manager.json may hold a proxy URL with embedded credentials.
+    save_json(manager_config_path(), data, private=True)
 
 
 def normalize_model_pair(

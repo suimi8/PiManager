@@ -6,6 +6,7 @@ import concurrent.futures
 import base64
 import json
 import os
+import stat
 import time
 import zipfile
 from contextlib import ExitStack
@@ -481,15 +482,36 @@ def _parse_bundle_json(files: dict[str, bytes], name: str) -> dict[str, Any] | N
     return value
 
 
-def _atomic_replace_bytes(path: Path, content: bytes) -> None:
+def _atomic_replace_bytes(path: Path, content: bytes, *, private: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    previous_mode: int | None = None
+    if not private:
+        try:
+            previous_mode = stat.S_IMODE(path.stat().st_mode)
+        except OSError:
+            previous_mode = None
     temp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     try:
-        with temp.open("wb") as handle:
+        if private:
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            handle = os.fdopen(fd, "wb")
+        else:
+            handle = temp.open("wb")
+        with handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+        if previous_mode is not None:
+            try:
+                os.chmod(temp, previous_mode)
+            except OSError:
+                pass
         os.replace(temp, path)
+        if private:
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
     finally:
         temp.unlink(missing_ok=True)
 
@@ -597,7 +619,11 @@ def import_config_bundle(
                     )
                     writes[core.models_path()] = _json_bytes(models)
                 for path, content in writes.items():
-                    _atomic_replace_bytes(path, content)
+                    _atomic_replace_bytes(
+                        path,
+                        content,
+                        private=(path == core.manager_config_path()),
+                    )
                 restored = [
                     name
                     for name in ("settings.json", "models.json", "pi-manager.json", "AGENTS.md")
@@ -679,18 +705,37 @@ def run_self_check() -> list[dict[str, Any]]:
     wd = mgr.get("last_workdir") or ""
     add("最近工作目录", bool(wd), str(wd) or "—")
 
-    # network quick (optional lightweight)
-    try:
-        import urllib.request
+    # network quick (optional lightweight); several endpoints so users outside
+    # mainland China are not misreported as offline. Consistent HTTP policy:
+    # no redirects, status only, body never read.
+    import urllib.parse
+    import urllib.request
 
-        t0 = time.perf_counter()
-        req = urllib.request.Request("https://www.baidu.com", method="GET", headers={"User-Agent": "PiManager"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            _ = resp.status
-        ms = round((time.perf_counter() - t0) * 1000)
-        add("基础网络", True, f"连通，延迟约 {ms} ms")
-    except Exception as e:
-        add("基础网络", False, f"异常：{e}", "warn")
+    from . import http_client
+
+    probe_urls = (
+        "https://www.baidu.com",
+        "https://www.gstatic.com/generate_204",
+        "https://api.github.com",
+    )
+    probe_error = ""
+    for probe_url in probe_urls:
+        try:
+            t0 = time.perf_counter()
+            req = urllib.request.Request(
+                probe_url, method="GET", headers={"User-Agent": "PiManager"}
+            )
+            opener = urllib.request.build_opener(http_client.DenyRedirectHandler())
+            with opener.open(req, timeout=5) as resp:
+                _ = resp.status
+            ms = round((time.perf_counter() - t0) * 1000)
+            host = urllib.parse.urlsplit(probe_url).netloc
+            add("基础网络", True, f"连通（{host}），延迟约 {ms} ms")
+            break
+        except Exception as e:
+            probe_error = str(e)
+    else:
+        add("基础网络", False, f"异常：{probe_error}", "warn")
 
     add("Pi Manager 版本", True, APP_VERSION)
     return checks

@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
+import stat
 
 from . import secrets as secretstore
 from .core import (
@@ -79,15 +79,36 @@ def _emit(payload: dict[str, object], output: str | None) -> None:
     if not output:
         print(text)
         return
-    path = Path(output)
-    if not path.exists() or not path.is_file():
-        raise ValueError("helper output file must already exist")
-    with path.open("w", encoding="utf-8", newline="\n") as handle:
+    # Open the pre-created response file directly (no exists()/open() gap) and
+    # refuse symlinks so a tmp-dir race cannot redirect the secret elsewhere.
+    flags = os.O_WRONLY | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(output, flags)
+    except FileNotFoundError:
+        raise ValueError("helper output file must already exist") from None
+    except OSError as exc:
+        raise ValueError(f"helper output file is not writable: {exc}") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("helper output file must be a regular file")
+        if hasattr(os, "fchmod"):
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+        handle = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+    except Exception:
+        os.close(fd)
+        raise
+    with handle:
         handle.write(text)
         handle.flush()
         os.fsync(handle.fileno())
     try:
-        os.chmod(path, 0o600)
+        os.chmod(output, 0o600)
     except OSError:
         pass
 

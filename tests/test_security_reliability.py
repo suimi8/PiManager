@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import base64
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from pi_manager import config_broker, core, secrets, storage
+from pi_manager import config_broker, core, helper_registry, secrets, storage
 
 
 def _clear_proxy_environment(monkeypatch):
@@ -89,6 +91,90 @@ def test_config_broker_concurrent_field_mutations_preserve_settings(isolated_hom
     assert settings["defaultProvider"] == "P"
     revisions = storage.load_json(core.pi_agent_dir() / ".config-revisions.json", {})
     assert revisions["settings.json"]["revision"] == 40
+
+
+def test_helper_registry_publishes_non_secret_command(isolated_home):
+    payload = helper_registry.register_current_helper()
+    saved = storage.load_json(helper_registry.registry_path(), {})
+
+    assert saved == payload
+    assert payload["schema_version"] == 1
+    assert payload["command"][0]
+    assert set(payload) == {"schema_version", "command", "updated_at", "pid"}
+    if os.name != "nt":
+        mode = helper_registry.registry_path().stat().st_mode & 0o777
+        assert mode & 0o077 == 0
+
+
+def test_private_json_mode_survives_updates_and_backups(isolated_home, tmp_path):
+    path = tmp_path / "private.json"
+    storage.save_json(path, {"v": 1}, private=True)
+    # A later writer that does not know about privacy must not widen it.
+    storage.update_json(path, {}, lambda data: {**data, "v": 2})
+    storage.save_json(path, {"v": 3})
+    assert storage.load_json(path, {}) == {"v": 3}
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o077 == 0
+        backup = tmp_path / "private.json.bak.1"
+        assert backup.stat().st_mode & 0o077 == 0
+
+
+def test_private_write_clamps_backup_of_previously_wide_file(isolated_home, tmp_path):
+    path = tmp_path / "cfg.json"
+    storage.save_json(path, {"v": 1})
+    if os.name != "nt":
+        os.chmod(path, 0o644)
+    # First private write rotates the old world-readable file into a backup;
+    # that backup must be clamped, not inherit the old mode.
+    storage.save_json(path, {"v": 2}, private=True)
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o077 == 0
+        assert (tmp_path / "cfg.json.bak.1").stat().st_mode & 0o077 == 0
+
+
+def test_import_write_path_keeps_manager_config_private(isolated_home, tmp_path):
+    from pi_manager import extras
+
+    target = tmp_path / "pi-manager.json"
+    extras._atomic_replace_bytes(target, b"{}\n", private=True)
+    if os.name != "nt":
+        assert target.stat().st_mode & 0o077 == 0
+
+
+def test_manager_config_is_written_owner_only(isolated_home):
+    core.save_manager_config({"proxy_enabled": False, "proxy_url": ""})
+    assert storage.load_json(core.manager_config_path(), {})["proxy_enabled"] is False
+    if os.name != "nt":
+        assert core.manager_config_path().stat().st_mode & 0o077 == 0
+
+
+def test_legacy_vault_is_upgraded_to_authenticated_encryption(isolated_home):
+    legacy_key = b"PiManagerLocalFallbackKey!v1"
+    payload = json.dumps({"provider:demo:apiKey": "sk-legacy"}).encode("utf-8")
+    blob = b"local:" + base64.b64encode(secrets._xor_stream(payload, legacy_key))
+    vault = secrets._vault_path()
+    vault.parent.mkdir(parents=True, exist_ok=True)
+    vault.write_bytes(blob)
+
+    assert secrets.load_vault() == {"provider:demo:apiKey": "sk-legacy"}
+    upgraded = vault.read_bytes()
+    assert upgraded.startswith((b"dpapi:", b"aesgcm:"))
+    assert secrets.load_vault() == {"provider:demo:apiKey": "sk-legacy"}
+
+
+def test_provider_env_output_must_be_existing_regular_file(isolated_home, tmp_path):
+    from pi_manager import provider_env
+
+    with pytest.raises(ValueError):
+        provider_env._emit({"ok": True}, str(tmp_path / "missing.json"))
+
+    if os.name != "nt":
+        real = tmp_path / "real.json"
+        real.write_text("", encoding="utf-8")
+        link = tmp_path / "link.json"
+        link.symlink_to(real)
+        with pytest.raises(ValueError):
+            provider_env._emit({"ok": True}, str(link))
 
 
 def test_provider_redirect_does_not_replay_credentials(monkeypatch):

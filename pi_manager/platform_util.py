@@ -315,6 +315,11 @@ def _launch_windows(argv: list[str], workdir: str, mode: str, env: dict[str, str
     return f"PowerShell: {cmdline_ps}"
 
 
+def _applescript_string(text: str) -> str:
+    """Render a strict AppleScript string literal (repr is not a safe stand-in)."""
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def _launch_macos(argv: list[str], workdir: str, mode: str, env: dict[str, str]) -> str:
     changed_env = {
         key: value for key, value in env.items() if os.environ.get(key) != value
@@ -349,6 +354,18 @@ def _launch_macos(argv: list[str], workdir: str, mode: str, env: dict[str, str])
                 pass
             wrapper.unlink(missing_ok=True)
             raise
+        # The wrapper self-deletes when it runs; if the terminal launch fails
+        # it never runs, so a detached janitor removes the secret-bearing file
+        # shortly afterwards either way.
+        try:
+            subprocess.Popen(
+                ["/bin/sh", "-c", f"sleep 120; rm -f -- {shlex.quote(str(wrapper))}"],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
         cmd = "sh " + shlex.quote(str(wrapper))
     else:
         cmd = "cd " + shlex.quote(workdir) + " && " + " ".join(shlex.quote(a) for a in argv)
@@ -359,7 +376,7 @@ def _launch_macos(argv: list[str], workdir: str, mode: str, env: dict[str, str])
             'tell application "iTerm"\n'
             "  if (count of windows) = 0 then create window with default profile\n"
             "  tell current session of current window\n"
-            f"    write text {cmd_keep!r}\n"
+            f"    write text {_applescript_string(cmd_keep)}\n"
             "  end tell\n"
             "  activate\n"
             "end tell"
@@ -377,7 +394,7 @@ def _launch_macos(argv: list[str], workdir: str, mode: str, env: dict[str, str])
             pass
         mode = "terminal"
 
-    script = f'tell application "Terminal" to do script {cmd_keep!r}'
+    script = f'tell application "Terminal" to do script {_applescript_string(cmd_keep)}'
     subprocess.Popen(["osascript", "-e", script], env=env)
     try:
         subprocess.Popen(

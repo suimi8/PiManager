@@ -262,7 +262,18 @@ def load_vault() -> dict[str, str]:
                 data = json.loads(text or "{}")
                 if not isinstance(data, dict):
                     raise ValueError("Vault 顶层必须是 JSON 对象")
-                return {str(k): str(v) for k, v in data.items()}
+                result = {str(k): str(v) for k, v in data.items()}
+                # Legacy unauthenticated formats (filekey:/local: XOR, raw
+                # DPAPI blobs, plaintext) are readable but must not stay on
+                # disk: rewrite immediately with authenticated encryption.
+                if not raw.startswith((b"dpapi:", b"aesgcm:")):
+                    try:
+                        _save_vault_unlocked(result)
+                        if path != _vault_path():
+                            path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                return result
             except Exception as exc:
                 errors.append(f"{path}: {exc}")
         if found:
@@ -270,23 +281,27 @@ def load_vault() -> dict[str, str]:
     return {}
 
 
+def _save_vault_unlocked(data: dict[str, str]) -> None:
+    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    blob = encrypt_blob(payload)
+    temp = _vault_path().with_name(
+        f".{_vault_path().name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        temp.write_bytes(blob)
+        os.replace(temp, _vault_path())
+        try:
+            os.chmod(_vault_path(), 0o600)
+        except OSError:
+            pass
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 def save_vault(data: dict[str, str]) -> None:
     _ensure_dir()
     with locked(_vault_path()):
-        payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-        blob = encrypt_blob(payload)
-        temp = _vault_path().with_name(
-            f".{_vault_path().name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
-        )
-        try:
-            temp.write_bytes(blob)
-            os.replace(temp, _vault_path())
-            try:
-                os.chmod(_vault_path(), 0o600)
-            except OSError:
-                pass
-        finally:
-            temp.unlink(missing_ok=True)
+        _save_vault_unlocked(data)
 
 
 def _load_index() -> set[str]:
