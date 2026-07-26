@@ -603,7 +603,9 @@ async function cmdAskPrompt() {
   }
 }
 
-const rpcChatManager = new RpcChatManager();
+const rpcChatManager = new RpcChatManager({
+  idleTimeoutMs: () => vscode.workspace.getConfiguration("pi").get("rpcSessionIdleTimeoutMs"),
+});
 let rpcRuntimeDisabled = false;
 
 function rpcSessionEnabled() {
@@ -660,7 +662,11 @@ function runPiPromptRpc(prompt, provider, model, cwd) {
           providerEnv,
           buildSpawn: buildRpcSpawnSpec,
         });
-        return await entry.session.prompt(String(prompt));
+        const cfg = vscode.workspace.getConfiguration("pi");
+        const timeoutMs = Number(cfg.get("rpcPromptTimeoutMs")) || 180000;
+        const result = await entry.session.prompt(String(prompt), { timeoutMs });
+        rpcChatManager.touch(cwd);
+        return result;
       } catch (error) {
         rpcChatManager.disposeFor(cwd);
         if (error && error.rpcUnavailable) {
@@ -1124,20 +1130,28 @@ class PiManagerViewProvider {
   const elFavs = document.getElementById('favs');
   const elFavCard = document.getElementById('favCard');
 
-  function fillModels() {
+  function fillModels(preferModel) {
     const p = elProvider.value;
     const models = (catalog && catalog.modelsByProvider && catalog.modelsByProvider[p]) || [];
     elModel.innerHTML = '';
     for (const m of models) {
       const opt = document.createElement('option');
       opt.value = m; opt.textContent = m;
-      if (catalog && p === catalog.defaultProvider && m === catalog.defaultModel) opt.selected = true;
       elModel.appendChild(opt);
+    }
+    // Prefer the user's prior pick; fall back to the configured default.
+    if (preferModel && models.includes(preferModel)) elModel.value = preferModel;
+    else if (catalog && p === catalog.defaultProvider && models.includes(catalog.defaultModel)) {
+      elModel.value = catalog.defaultModel;
     }
   }
 
   function render() {
     if (!catalog) return;
+    // Remember what the user had selected so a background config change
+    // (settings.json write) does not reset a half-made choice.
+    const prevProvider = elProvider.value;
+    const prevModel = elModel.value;
     elCurrent.textContent = (catalog.defaultProvider && catalog.defaultModel)
       ? (catalog.defaultProvider + '/' + catalog.defaultModel)
       : '（未设置）';
@@ -1146,13 +1160,13 @@ class PiManagerViewProvider {
     for (const p of (catalog.providers || [])) {
       const opt = document.createElement('option');
       opt.value = p; opt.textContent = p;
-      if (p === catalog.defaultProvider) opt.selected = true;
       elProvider.appendChild(opt);
     }
-    if (!elProvider.value && catalog.providers && catalog.providers[0]) {
-      elProvider.value = catalog.providers[0];
-    }
-    fillModels();
+    const providers = catalog.providers || [];
+    if (prevProvider && providers.includes(prevProvider)) elProvider.value = prevProvider;
+    else if (providers.includes(catalog.defaultProvider)) elProvider.value = catalog.defaultProvider;
+    else if (providers[0]) elProvider.value = providers[0];
+    fillModels(elProvider.value === prevProvider ? prevModel : undefined);
 
     const favs = catalog.favorites || [];
     elFavCard.style.display = favs.length ? 'block' : 'none';
@@ -1225,9 +1239,17 @@ function activate(context) {
     const watcher = vscode.workspace.createFileSystemWatcher(
       new vscode.RelativePattern(vscode.Uri.file(agentDir()), "{settings.json,models.json,pi-manager.json}")
     );
+    // Debounce: one desktop save touches temp + replace + backups, firing the
+    // watcher several times; collapse the burst into a single refresh.
+    let bumpTimer = null;
     const bump = () => {
-      refreshStatusBar();
-      if (viewProvider) viewProvider.refresh();
+      if (bumpTimer) clearTimeout(bumpTimer);
+      bumpTimer = setTimeout(() => {
+        bumpTimer = null;
+        refreshStatusBar();
+        if (viewProvider) viewProvider.refresh();
+      }, 200);
+      if (bumpTimer.unref) bumpTimer.unref();
     };
     watcher.onDidChange(bump);
     watcher.onDidCreate(bump);

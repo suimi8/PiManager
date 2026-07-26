@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -68,15 +69,20 @@ def build_chat_page(window) -> QWidget:
     composer = SurfaceCard(elevated=True, margins=(17, 14, 17, 14), spacing=9)
     composer.content.addWidget(SectionHeading("发送消息"))
     window.chat_input = QPlainTextEdit()
-    window.chat_input.setPlaceholderText("输入问题…")
+    window.chat_input.setPlaceholderText("输入问题…（Ctrl+Enter 发送）")
     window.chat_input.setMinimumHeight(100)
     window.chat_input.setMaximumHeight(150)
     composer.content.addWidget(window.chat_input)
+    # Ctrl+Enter / Cmd+Enter sends without leaving the keyboard.
+    for seq in ("Ctrl+Return", "Ctrl+Enter"):
+        shortcut = QShortcut(QKeySequence(seq), window.chat_input)
+        shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        shortcut.activated.connect(window.chat_send_enhanced)
     send_row = QHBoxLayout()
     send_row.setSpacing(8)
     send_row.addWidget(window._btn("发送到 Pi", window.chat_send_enhanced, success=True))
     send_row.addWidget(window._btn("单次发送", window.chat_send, secondary=True))
-    send_hint = QLabel("多轮模式会携带近期上下文；单次发送不会读取历史。")
+    send_hint = QLabel("多轮模式会携带近期上下文（Ctrl+Enter 发送）；单次发送不会读取历史。")
     send_hint.setObjectName("subtitle")
     send_row.addWidget(send_hint)
     send_row.addStretch(1)

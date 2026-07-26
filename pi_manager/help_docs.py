@@ -7,7 +7,7 @@ import re
 
 HELP_MARKDOWN = r'''# Pi Manager 使用教程与常见问题
 
-> 版本 1.7.1 · 跨平台 GUI 管理官方 Pi Coding Agent（Windows / macOS / Linux）
+> 版本 1.7.2 · 跨平台 GUI 管理官方 Pi Coding Agent（Windows / macOS / Linux）
 > 完整 agent 能力始终由官方 `pi` 提供，本工具负责配置、切换、测试与启动。
 
 ---
@@ -85,8 +85,9 @@ HELP_MARKDOWN = r'''# Pi Manager 使用教程与常见问题
 - `models.json` 仅保存官方 Pi 可识别的 `${PI_MANAGER_PROVIDER_..._API_KEY}` 引用，启动 Pi 时才把真实密钥注入子进程环境。
 
 ### 快速提问
-- 短问答预览（`pi -p`），支持最近 6 轮上下文。  
-- 复杂改代码请用「启动完整 Pi」。
+- 默认使用常驻 `pi --mode rpc` 会话：多轮上下文保留在会话内，故障切换模型时通过 `set_model` 在同一会话内热切、不丢上下文。
+- 空闲一段时间后会自动回收 pi 进程（固定会话 ID 保证下次提问自动恢复上下文）；可在「设置 → 可靠性」关闭常驻会话回退到一次性模式。
+- 输入框 `Ctrl+Enter` 直接发送。复杂改代码请用「启动完整 Pi」。
 
 ### 会话
 - 按路径/名称过滤。  
