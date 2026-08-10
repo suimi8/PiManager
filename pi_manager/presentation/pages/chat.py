@@ -1,8 +1,10 @@
 """Modern quick-chat page."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeySequence, QShortcut
+from pathlib import Path
+
+from PySide6.QtCore import QBuffer, QSize, Qt, Signal
+from PySide6.QtGui import QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -14,6 +16,77 @@ from PySide6.QtWidgets import (
 )
 
 from ..components import SectionHeading, StatusBadge, SurfaceCard
+
+_IMAGE_MIME_BY_SUFFIX = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".webp": "image/webp",
+}
+
+
+class ImageAttachEdit(QPlainTextEdit):
+    """Plain-text editor that also captures pasted/dropped images as attachments.
+
+    Images are not inserted into the document; they are collected so the chat
+    pipeline can run them through a vision model before asking the text model.
+    """
+
+    imagesAttached = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._attachments: list[dict] = []
+
+    def attachments(self) -> list[dict]:
+        return list(self._attachments)
+
+    def add_image_bytes(self, data: bytes, mime: str, name: str = "") -> None:
+        if not data:
+            return
+        self._attachments.append(
+            {
+                "bytes": data,
+                "mime": mime or "image/png",
+                "name": name or f"图片 {len(self._attachments) + 1}",
+            }
+        )
+        self.imagesAttached.emit()
+
+    def clear_attachments(self) -> None:
+        if self._attachments:
+            self._attachments = []
+            self.imagesAttached.emit()
+
+    def insertFromMimeData(self, source) -> None:
+        handled = False
+        if source.hasImage():
+            image = source.imageData()
+            if isinstance(image, QImage):
+                buffer = QBuffer()
+                buffer.open(QBuffer.ReadWrite)
+                image.save(buffer, "PNG")
+                self.add_image_bytes(bytes(buffer.data()), "image/png")
+                handled = True
+        if source.hasUrls():
+            for url in source.urls():
+                if not url.isLocalFile():
+                    continue
+                path = Path(url.toLocalFile())
+                suffix = path.suffix.lower()
+                if suffix not in _IMAGE_MIME_BY_SUFFIX:
+                    continue
+                try:
+                    data = path.read_bytes()
+                except OSError:
+                    continue
+                self.add_image_bytes(data, _IMAGE_MIME_BY_SUFFIX[suffix], path.name)
+                handled = True
+        if handled:
+            return
+        super().insertFromMimeData(source)
 
 
 def build_chat_page(window) -> QWidget:
@@ -68,10 +141,25 @@ def build_chat_page(window) -> QWidget:
 
     composer = SurfaceCard(elevated=True, margins=(17, 14, 17, 14), spacing=9)
     composer.content.addWidget(SectionHeading("发送消息"))
-    window.chat_input = QPlainTextEdit()
-    window.chat_input.setPlaceholderText("输入问题…（Ctrl+Enter 发送）")
+    attach_row = QHBoxLayout()
+    attach_row.setSpacing(8)
+    window.chat_attach_bar = QWidget()
+    window.chat_attach_bar.setVisible(False)
+    window.chat_attach_layout = QHBoxLayout(window.chat_attach_bar)
+    window.chat_attach_layout.setContentsMargins(0, 0, 0, 0)
+    window.chat_attach_layout.setSpacing(6)
+    attach_hint = QLabel("支持粘贴 / 拖入图片，发送时自动用识图模型识别后转文本")
+    attach_hint.setObjectName("subtitle")
+    attach_row.addWidget(attach_hint, 1)
+    attach_row.addWidget(window._btn("添加图片", window.chat_pick_images, ghost=True))
+    attach_row.addWidget(window._btn("清除图片", window.chat_clear_attachments, ghost=True))
+    composer.content.addLayout(attach_row)
+    composer.content.addWidget(window.chat_attach_bar)
+    window.chat_input = ImageAttachEdit()
+    window.chat_input.setPlaceholderText("输入问题…（Ctrl+Enter 发送；可直接粘贴截图）")
     window.chat_input.setMinimumHeight(100)
     window.chat_input.setMaximumHeight(150)
+    window.chat_input.imagesAttached.connect(window._on_chat_attachments_changed)
     composer.content.addWidget(window.chat_input)
     # Ctrl+Enter / Cmd+Enter sends without leaving the keyboard.
     for seq in ("Ctrl+Return", "Ctrl+Enter"):

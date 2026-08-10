@@ -73,8 +73,10 @@ def test_model_catalog_updates_details_panel(qapp, isolated_home):
             core.ModelInfo("provider-b", "model-two", context="64k", images="yes"),
         ]
         window.fill_models_table()
-        assert window.models_table.rowCount() == 2
-        window.models_table.selectRow(0)
+        # 树状分类：2 个 Provider 顶层分组
+        assert window.models_table.topLevelItemCount() == 2
+        child = window.models_table.topLevelItem(0).child(0)
+        window.models_table.setCurrentItem(child)
         qapp.processEvents()
         assert window.model_detail_title.text() in {"model-one", "model-two"}
         assert window.model_detail_provider.text() in {"provider-a", "provider-b"}
@@ -202,12 +204,14 @@ def test_dynamic_theme_refreshes_model_status_and_help_html(qapp, isolated_home)
 
         window.apply_ui_theme("day", "blue")
         qapp.processEvents()
-        day_status = window.models_table.item(0, 3).foreground().color().name().upper()
+        day_child = window.models_table.topLevelItem(0).child(0)
+        day_status = day_child.foreground(3).color().name().upper()
         day_html = window.help_browser.toHtml().lower()
 
         window.apply_ui_theme("night", "blue")
         qapp.processEvents()
-        night_status = window.models_table.item(0, 3).foreground().color().name().upper()
+        night_child = window.models_table.topLevelItem(0).child(0)
+        night_status = night_child.foreground(3).color().name().upper()
         night_html = window.help_browser.toHtml().lower()
 
         assert day_status == "#16A34A"

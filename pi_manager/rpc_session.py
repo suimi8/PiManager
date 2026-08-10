@@ -374,7 +374,7 @@ def _ensure(
         if thinking:
             argv += ["--thinking", thinking]
         argv += ["--session-id", session_id, "-n", "PiManager 快速提问"]
-        spawn_env = os.environ.copy()
+        spawn_env = core._sanitize_proxy_env(os.environ.copy())
         spawn_env.update(merged)
         session = PiRpcSession(argv, env=spawn_env, cwd=workdir or None)
         _entry = {

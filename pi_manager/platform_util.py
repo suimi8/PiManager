@@ -228,6 +228,23 @@ def _linux_terminal_prefix(mode: str = "auto") -> tuple[str, list[str]] | None:
     return None
 
 
+def _proxy_port_reachable(proxy_url: str, timeout: float = 0.4) -> bool:
+    """Quick TCP probe of a proxy endpoint (no core import — avoids cycles)."""
+    import socket
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(str(proxy_url or ""))
+        if parts.scheme not in {"http", "https"}:
+            return False
+        host = parts.hostname or "127.0.0.1"
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
 def launch_in_terminal(
     argv: list[str],
     workdir: str,
@@ -239,6 +256,17 @@ def launch_in_terminal(
     full_env = os.environ.copy()
     if env:
         full_env.update(env)
+        # Empty-string values explicitly remove a variable.
+        for key, value in env.items():
+            if value == "":
+                full_env.pop(key, None)
+    # A configured-but-stopped proxy makes every spawned session fail with
+    # "Connection error"; drop unreachable proxy vars so the child connects
+    # directly instead.
+    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        value = full_env.get(var)
+        if value and not _proxy_port_reachable(value):
+            full_env.pop(var, None)
     mode = (terminal or "auto").lower()
     if is_windows():
         return _launch_windows(argv, workdir, mode, full_env)

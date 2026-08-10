@@ -77,7 +77,7 @@ QToolButton#navButton {{
     border: none;
     border-radius: 8px;
     padding: 8px 10px;
-    text-align: left;
+    text-align: center;
     font-size: 13px;
     font-weight: 500;
 }}

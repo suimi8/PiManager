@@ -11,6 +11,7 @@ from PySide6.QtGui import QAction, QIcon, QPixmap, QPainter, QColor
 from PySide6.QtWidgets import (
     QFileDialog,
     QInputDialog,
+    QLabel,
     QLineEdit,
     QMenu,
     QMessageBox,
@@ -359,7 +360,21 @@ class FeatureMixin:
             self.health_table.setItem(i, 5, QTableWidgetItem(str(info.get("error") or "")[:160]))
         if hasattr(self, "health_status"):
             sc = data.get("last_scope") or "—"
-            self.health_status.setText(f"更新于 {data.get('updated_at') or '—'} | 上次范围 {sc}")
+            updated = data.get("updated_at") or ""
+            stale_hint = ""
+            if updated:
+                try:
+                    from datetime import datetime
+
+                    updated_dt = datetime.strptime(updated, "%Y-%m-%d %H:%M:%S")
+                    age_min = (datetime.now() - updated_dt).total_seconds() / 60
+                    interval = int((self.mgr or {}).get("health_interval_min") or 0)
+                    stale_after = max(interval * 2, 24 * 60) if interval else 24 * 60
+                    if age_min > stale_after:
+                        stale_hint = "（数据可能已过期，建议重新检查）"
+                except Exception:
+                    pass
+            self.health_status.setText(f"更新于 {updated or '—'} | 上次范围 {sc}{stale_hint}")
 
     def health_add_ok_to_favorites(self):
         data = extras.load_health()
@@ -421,6 +436,202 @@ class FeatureMixin:
             return
         extras.save_history([])
         self.history_refresh()
+
+    # ---- orphaned keys ----
+    def orphan_keys_cleanup(self):
+        orphans = core.list_orphaned_provider_keys()
+        if not orphans:
+            QMessageBox.information(self, "孤儿密钥", "没有需要清理的孤儿密钥。")
+            return
+        total_keys = sum(o["key_count"] for o in orphans)
+        names = "、".join(o["provider"] for o in orphans)
+        if QMessageBox.question(
+            self,
+            "清理孤儿密钥",
+            f"以下 Provider 已不存在于 models.json，但其密钥池仍保存在密钥库中"
+            f"（共 {len(orphans)} 个池、{total_keys} 把 Key）：\n\n{names}\n\n确认删除？",
+        ) != QMessageBox.Yes:
+            return
+        n = core.delete_orphaned_provider_keys()
+        QMessageBox.information(self, "清理完成", f"已清理 {n} 个孤儿密钥池。")
+        try:
+            self.refresh_providers()
+        except Exception:
+            pass
+
+    # ---- config backup restore ----
+    def backup_refresh(self):
+        rows = core.list_config_backups()
+        self._backup_rows = rows
+        combo = getattr(self, "backup_combo", None)
+        if combo is None:
+            return
+        combo.clear()
+        for r in rows:
+            combo.addItem(f"{r['target']} · {r['mtime']} · {r['size']} B", (r["path"], r["target"]))
+        if hasattr(self, "backup_status"):
+            if rows:
+                self.backup_status.setText(f"共 {len(rows)} 个备份（保存配置时自动轮转生成）")
+            else:
+                self.backup_status.setText("没有可恢复的备份")
+
+    def backup_restore(self):
+        combo = getattr(self, "backup_combo", None)
+        if combo is None or combo.count() == 0:
+            QMessageBox.information(self, "备份恢复", "请先刷新并选择一个备份。")
+            return
+        data = combo.currentData()
+        if not data:
+            return
+        path, target = data
+        if QMessageBox.question(
+            self,
+            "确认恢复",
+            f"将用备份覆盖当前配置：\n\n备份：{path}\n目标：{target}\n\n"
+            "当前文件会自动轮转为新的 .bak.1 备份，可随时再恢复。继续？",
+        ) != QMessageBox.Yes:
+            return
+        result = core.restore_config_backup(path)
+        if result.get("ok"):
+            QMessageBox.information(self, "恢复成功", f"已恢复 {result['target']}。正在刷新界面…")
+            self.refresh_all()
+            self.backup_refresh()
+        else:
+            QMessageBox.critical(self, "恢复失败", str(result.get("error") or "未知错误"))
+
+    def vision_check_config(self):
+        """校验识图配置就绪（设置页的识图模型默认使用，不写入模型列表）。
+
+        设置页配置的智谱 API Key 与识图模型选择只用于识图管道：
+        Pi vision skill（--vision-describe）默认调用它们把图片转为文字。
+        这些模型不会自动出现在 provider 模型列表中；如需在列表中使用，
+        请在 Provider 管理中手动添加。
+        """
+        if not core.zhipu_api_key():
+            QMessageBox.warning(
+                self,
+                "未配置识图模型",
+                "请先在「设置 → 识图模型」填入智谱 API Key（免费申请：https://bigmodel.cn）",
+            )
+            return
+        try:
+            info = core.ensure_zhipu_provider()
+        except Exception as exc:
+            QMessageBox.warning(self, "配置未就绪", str(exc))
+            return
+        if hasattr(self, "vision_test_status"):
+            self.vision_test_status.setText(
+                "识图配置就绪：模型列表不受影响；粘贴/拖入图片时由 Pi skill 默认调用识图模型"
+                "（GLM-4.6V-Flash / GLM-4.1V-Thinking-Flash）转文字后交给默认对话模型。"
+            )
+        self.status.showMessage("识图配置就绪（不写入模型列表）")
+        QMessageBox.information(
+            self,
+            "识图配置就绪",
+            "设置中的识图模型（GLM-4.6V-Flash / GLM-4.1V-Thinking-Flash）已默认用于识图管道：\n\n"
+            "· 粘贴/拖入图片时，Pi skill 自动调用识图转文字，再交给默认对话模型回答；\n"
+            "· 识图模型不会自动出现在模型列表中（除非你在 Provider 管理中手动添加）；\n"
+            "· 可在「设置 → 识图模型」切换识图模型，无需改动模型列表。",
+        )
+
+    def vision_test_run(self):
+        key = ""
+        if hasattr(self, "zhipu_key_edit"):
+            key = self.zhipu_key_edit.text().strip()
+        if key:
+            # 测试前同步输入框中的 Key，避免用户忘记点「保存设置」
+            try:
+                core.set_zhipu_api_key(key)
+            except Exception:
+                pass
+        if not core.zhipu_api_key():
+            QMessageBox.warning(
+                self,
+                "未配置识图模型",
+                "请先在「设置 → 识图模型」填入智谱 API Key（免费申请：https://bigmodel.cn）",
+            )
+            return
+        if hasattr(self, "vision_test_status"):
+            self.vision_test_status.setText("正在生成红色测试图并调用识图模型…")
+        self.status.showMessage("正在验证识图模型可用性…")
+
+        def job():
+            return core.test_vision()
+
+        w = self._track(self._worker_fn(job))
+        w.done.connect(self._on_vision_test_done)
+        w.failed.connect(self._on_vision_test_fail)
+        w.start()
+
+    def _on_vision_test_done(self, result: dict):
+        self.status.showMessage("识图测试完成")
+        if not hasattr(self, "vision_test_status"):
+            return
+        if result.get("ok"):
+            desc = str(result.get("description") or "").strip()
+            model = str(result.get("model") or "") or "自动"
+            self.vision_test_status.setText(
+                f"识图正常（{model}）：模型返回「{desc[:100]}」"
+            )
+            QMessageBox.information(
+                self,
+                "识图测试通过",
+                "红色测试图识别成功，识图模型可用。\n\n"
+                f"使用模型：{model}\n模型回答：{desc}",
+            )
+        else:
+            err = str(result.get("error") or "未知错误")
+            self.vision_test_status.setText(f"识图失败：{err[:140]}")
+            QMessageBox.warning(self, "识图测试失败", err)
+
+    def _on_vision_test_fail(self, err: str):
+        self.status.showMessage("识图测试失败")
+        if hasattr(self, "vision_test_status"):
+            self.vision_test_status.setText(f"识图测试异常：{err[:140]}")
+        QMessageBox.warning(self, "识图测试失败", err)
+
+    # ---- auth logout (Pi-only credential removal) ----
+    def auth_logout_selected(self):
+        if not hasattr(self, "auth_table"):
+            return
+        rows = self.auth_table.selectionModel().selectedRows()
+        if not rows:
+            QMessageBox.information(self, "提示", "请先在认证状态表中选择一个 Provider")
+            return
+        providers = []
+        for idx in rows:
+            item = self.auth_table.item(idx.row(), 0)
+            if item and item.text().strip():
+                providers.append(item.text().strip())
+        if not providers:
+            return
+        if QMessageBox.question(
+            self,
+            "登出确认",
+            f"将从 Pi 中移除以下 Provider 的登录状态：\n\n{chr(10).join(providers)}\n\n"
+            "仅影响 Pi 的 auth.json；本机 OpenAI / Claude 等其他工具的登录不受影响。继续？",
+        ) != QMessageBox.Yes:
+            return
+        ok_n = 0
+        errors = []
+        for provider in providers:
+            try:
+                if core.delete_provider_auth(provider) is not None:
+                    ok_n += 1
+            except Exception as e:
+                errors.append(f"{provider}: {e}")
+        self.refresh_dashboard()
+        # 内置 Provider 登出后 Pi 不再认为其已认证，模型列表随之收敛
+        try:
+            self.refresh_models()
+        except Exception:
+            pass
+        msg = f"已登出 {ok_n} 个 Provider。"
+        if errors:
+            msg += f"\n失败：{'；'.join(errors)}"
+        if ok_n:
+            msg += "\nPi 的模型列表已刷新，登出的内置 Provider 将不再显示。"
+        QMessageBox.information(self, "完成", msg)
 
     # ---- self check / export ----
     def self_check_run(self):
@@ -705,6 +916,73 @@ class FeatureMixin:
             self.sessions_table.setItem(i, 2, QTableWidgetItem(r.get("model") or r.get("path") or ""))
 
     # ---- chat multi-turn (context via persistent RPC session, else prompt assembly) ----
+    def _on_chat_attachments_changed(self):
+        bar = getattr(self, "chat_attach_bar", None)
+        if bar is None:
+            return
+        attachments = self.chat_input.attachments() if hasattr(self.chat_input, "attachments") else []
+        layout = getattr(self, "chat_attach_layout", None)
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        from PySide6.QtCore import QSize
+        from PySide6.QtGui import QPixmap
+
+        for index, att in enumerate(attachments, start=1):
+            thumb = QLabel()
+            thumb.setFixedSize(56, 56)
+            thumb.setToolTip(f"{att.get('name') or '图片'} · {len(att.get('bytes') or b'') // 1024} KB")
+            pixmap = QPixmap()
+            if pixmap.loadFromData(att.get("bytes") or b""):
+                thumb.setPixmap(
+                    pixmap.scaled(QSize(56, 56), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                )
+            else:
+                thumb.setText(f"[{index}]")
+                thumb.setAlignment(Qt.AlignCenter)
+            thumb.setObjectName("chatThumb")
+            layout.addWidget(thumb)
+        count = QLabel(f"已附加 {len(attachments)} 张图片" if attachments else "")
+        count.setObjectName("subtitle")
+        layout.addWidget(count)
+        layout.addStretch(1)
+        bar.setVisible(bool(attachments))
+
+    def chat_pick_images(self):
+        if not hasattr(self, "chat_input"):
+            return
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择图片",
+            "",
+            "图片 (*.png *.jpg *.jpeg *.gif *.bmp *.webp)",
+        )
+        for path in files:
+            try:
+                data = Path(path).read_bytes()
+            except OSError:
+                continue
+            suffix = Path(path).suffix.lower()
+            mime = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".gif": "image/gif",
+                ".bmp": "image/bmp",
+                ".webp": "image/webp",
+            }.get(suffix, "image/png")
+            self.chat_input.add_image_bytes(data, mime, Path(path).name)
+        self._on_chat_attachments_changed()
+
+    def chat_clear_attachments(self):
+        if hasattr(self, "chat_input") and hasattr(self.chat_input, "clear_attachments"):
+            self.chat_input.clear_attachments()
+        self._on_chat_attachments_changed()
+
     def chat_clear_history(self):
         self.chat_history = []
         if hasattr(self, "chat_output"):
@@ -717,9 +995,62 @@ class FeatureMixin:
             pass
         self.status.showMessage("已清空对话历史")
 
+    def _describe_attachments(
+        self,
+        attachments: list[dict],
+        user_prompt: str = "",
+    ) -> tuple[str | None, str | None]:
+        """Run image attachments through the built-in vision model.
+
+        The vision instruction is tailored to the user's question and demands
+        verbatim transcription of any text in the screenshot.
+
+        Returns ``(description_text, error_text)`` — exactly one is not None.
+        """
+        if not attachments:
+            return None, None
+        if not core.zhipu_api_key():
+            return None, (
+                "未配置智谱 API Key。请在「设置 → 识图模型」填入（免费申请："
+                "https://bigmodel.cn，GLM-4.6V-Flash / GLM-4.1V-Thinking-Flash 免费额度）。"
+            )
+        vision_prompt = core.build_vision_prompt(user_prompt)
+        parts = []
+        for index, att in enumerate(attachments, start=1):
+            desc_result = core.describe_image(
+                att.get("bytes") or b"",
+                att.get("mime") or "image/png",
+                prompt=vision_prompt,
+            )
+            if not desc_result.get("ok"):
+                return None, (
+                    f"识图失败（第 {index} 张，{desc_result.get('model') or '自动'}）："
+                    f"{desc_result.get('error') or '未知错误'}"
+                )
+            parts.append(
+                f"[图片{index}识别结果 · {desc_result.get('model') or '自动'}] "
+                f"{desc_result.get('description') or ''}"
+            )
+        return "\n".join(parts), None
+
+    def _append_image_prompt(self, description: str, prompt: str) -> str:
+        if not description:
+            return prompt
+        if prompt:
+            return (
+                f"用户附加了截图，图片内容已由识图模型完整转录如下"
+                f"（图片本身不可直接查看，请完全基于转录内容回答，不要声称看不到图片）：\n"
+                f"{description}\n\n"
+                f"用户的问题：{prompt}"
+            )
+        return f"用户附加了截图，图片内容已由识图模型完整转录如下（请完全基于转录内容回答）：\n{description}"
+
     def chat_send_enhanced(self):
         prompt = self.chat_input.toPlainText().strip()
-        if not prompt:
+        attachments = (
+            self.chat_input.attachments() if hasattr(self.chat_input, "attachments") else []
+        )
+        if not prompt and not attachments:
             return
         if hasattr(self, "_chat_combo_text"):
             provider = self._chat_combo_text(self.chat_provider) or None
@@ -729,6 +1060,22 @@ class FeatureMixin:
             model = self.chat_model.currentText().strip() if hasattr(self.chat_model, "currentText") else self.chat_model.text().strip()
             provider = provider or None
             model = model or None
+        # Images first: run each attachment through the built-in free vision
+        # model (Zhipu GLM-4.6V-Flash) and turn descriptions into text the
+        # chat model can understand.
+        if attachments:
+            if not core.zhipu_api_key():
+                QMessageBox.warning(
+                    self,
+                    "未配置识图模型",
+                    "已附加图片，但未配置智谱 API Key。\n\n"
+                    "请在「设置 → 识图模型」填入智谱 API Key（免费申请：\n"
+                    "https://bigmodel.cn，GLM-4.6V-Flash 免费额度）。",
+                )
+                return
+            self.chat_output.appendPlainText(
+                f"…正在用内置免费识图模型识别 {len(attachments)} 张图片…"
+            )
         # A persistent RPC session already holds the conversation in-process;
         # only the legacy one-shot path needs history stitched into the prompt.
         use_rpc = False
@@ -766,7 +1113,7 @@ class FeatureMixin:
                 self.chat_context_badge.set_status("success", "常驻会话 · 上下文保留")
             else:
                 self.chat_context_badge.set_status("info", "一次性模式")
-        self.chat_output.appendPlainText(f"\n你: {prompt}\n…思考中…")
+        self.chat_output.appendPlainText(f"\n你: {prompt or '[图片]'}\n…思考中…")
         self.chat_input.setEnabled(False)
         workdir = self.workdir_edit.text().strip() or str(core.user_home())
         thinking = "off"
@@ -777,13 +1124,29 @@ class FeatureMixin:
 
         def job():
             # 连续失败达阈值后自动切换下一个收藏/启用模型并重试（无感）
-            return extras.chat_with_failover(
-                full,
+            full_prompt = prompt
+            if attachments:
+                description, error = self._describe_attachments(attachments, prompt)
+                if error is not None:
+                    return {
+                        "ok": False,
+                        "returncode": -1,
+                        "stdout": "",
+                        "stderr": "",
+                        "latency_ms": 0,
+                        "error": error,
+                    }
+                full_prompt = self._append_image_prompt(description or "", prompt)
+            result = extras.chat_with_failover(
+                full_prompt,
                 provider=provider,
                 model=model,
                 workdir=workdir,
                 thinking=thinking,
             )
+            if attachments:
+                result["vision_text"] = description or ""
+            return result
 
         w = self._track(self._worker_fn(job))
         w.done.connect(lambda r, u=prompt: self._on_enhanced_chat_done(r, u))
@@ -816,6 +1179,12 @@ class FeatureMixin:
             err = (result.get("error") or text or "未知错误")[:500]
             self.chat_output.appendPlainText(f"失败({result.get('returncode')}): {err}")
             return
+        vision_text = result.get("vision_text") or ""
+        if vision_text:
+            self.chat_output.appendPlainText(f"— 识图结果（已作为上下文交给对话模型）—\n{vision_text[:2000]}\n")
+        if hasattr(self, "chat_input") and hasattr(self.chat_input, "clear_attachments"):
+            self.chat_input.clear_attachments()
+        self._on_chat_attachments_changed()
         self.chat_history.append({"user": user_prompt, "assistant": text})
         self.chat_history = self.chat_history[-20:]
         while self.chat_history and len(

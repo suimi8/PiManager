@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
@@ -242,43 +243,94 @@ def decrypt_text(token: str) -> str:
 
 
 def load_vault() -> dict[str, str]:
+    """Load the merged vault: primary ``secrets.vault`` first, legacy as fallback.
+
+    The legacy file (``secrets.dpapi``) is only consulted when the primary vault
+    is missing or unreadable. When the primary vault is valid and the legacy
+    file is a strict subset of it, the leftover legacy file is removed; if the
+    legacy file holds entries the primary vault does not have, it is kept and a
+    warning is logged so no secret is silently dropped.
+    """
     _ensure_dir()
     with locked(_vault_path()):
         errors: list[str] = []
         found = False
-        for path in (_vault_path(), _legacy_vault_path()):
-            if not path.exists():
-                continue
+        primary: dict[str, str] | None = None
+        legacy_data: dict[str, str] | None = None
+
+        primary_path = _vault_path()
+        legacy_path = _legacy_vault_path()
+
+        if primary_path.exists():
             found = True
             try:
-                raw = path.read_bytes()
-                if raw.startswith((b"dpapi:", b"aesgcm:", b"filekey:", b"local:")):
-                    text = decrypt_blob(raw).decode("utf-8", errors="strict")
-                else:
-                    try:
-                        text = decrypt_blob(raw).decode("utf-8", errors="strict")
-                    except Exception:
-                        text = raw.decode("utf-8", errors="strict")
-                data = json.loads(text or "{}")
-                if not isinstance(data, dict):
-                    raise ValueError("Vault 顶层必须是 JSON 对象")
-                result = {str(k): str(v) for k, v in data.items()}
-                # Legacy unauthenticated formats (filekey:/local: XOR, raw
-                # DPAPI blobs, plaintext) are readable but must not stay on
-                # disk: rewrite immediately with authenticated encryption.
-                if not raw.startswith((b"dpapi:", b"aesgcm:")):
-                    try:
-                        _save_vault_unlocked(result)
-                        if path != _vault_path():
-                            path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                return result
+                primary = _read_vault_file(primary_path, rewrite_legacy_format=True)
             except Exception as exc:
-                errors.append(f"{path}: {exc}")
-        if found:
-            raise VaultCorruptError("Vault 无法解密或解析；原文件未被修改。" + " | ".join(errors))
-    return {}
+                errors.append(f"{primary_path}: {exc}")
+        if legacy_path.exists():
+            found = True
+            try:
+                legacy_data = _read_vault_file(legacy_path, rewrite_legacy_format=False)
+            except Exception as exc:
+                errors.append(f"{legacy_path}: {exc}")
+
+        if primary is None:
+            if legacy_data is not None:
+                # Primary unreadable/missing: fall back to legacy and promote it
+                # to the primary vault with authenticated encryption.
+                try:
+                    _save_vault_unlocked(legacy_data)
+                    legacy_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return legacy_data
+            if found:
+                raise VaultCorruptError(
+                    "Vault 无法解密或解析；原文件未被修改。" + " | ".join(errors)
+                )
+            return {}
+
+        if legacy_data is not None:
+            subset = all(
+                str(key) in primary and primary[str(key)] == str(value)
+                for key, value in legacy_data.items()
+            )
+            if subset:
+                # Pure leftover copy: safe to drop.
+                try:
+                    legacy_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            else:
+                logging.getLogger(__name__).warning(
+                    "legacy vault %s 含有主 vault 没有的条目，保留文件待处理：%s",
+                    legacy_path,
+                    "、".join(sorted(legacy_data)),
+                )
+        return primary
+
+
+def _read_vault_file(path: Path, *, rewrite_legacy_format: bool = False) -> dict[str, str]:
+    """Decrypt and parse one vault file into ``{name: value}``.
+
+    ``rewrite_legacy_format`` rewrites unauthenticated legacy formats in place
+    with authenticated encryption — only safe for the primary vault path.
+    """
+    raw = path.read_bytes()
+    try:
+        text = decrypt_blob(raw).decode("utf-8", errors="strict")
+    except Exception:
+        text = raw.decode("utf-8", errors="strict")
+    data = json.loads(text or "{}")
+    if not isinstance(data, dict):
+        raise ValueError("Vault 顶层必须是 JSON 对象")
+    result = {str(k): str(v) for k, v in data.items()}
+    if rewrite_legacy_format and not raw.startswith((b"dpapi:", b"aesgcm:")):
+        # Legacy unauthenticated formats (filekey:/local: XOR, raw DPAPI
+        # blobs, plaintext) are readable but must not stay on disk: rewrite
+        # immediately with authenticated encryption.
+        _save_vault_unlocked(result)
+    return result
 
 
 def _save_vault_unlocked(data: dict[str, str]) -> None:
@@ -396,8 +448,40 @@ def delete_secret(name: str) -> None:
 
 
 def list_secret_names() -> list[str]:
-    names = set(load_vault().keys()) | _load_index()
+    vault_names = set(load_vault().keys())
+    index = _load_index()
+    names = vault_names | index
+    if vault_names - index:
+        # 自愈：vault 中存在但 index 缺失的名字补写回 index，避免后续
+        # 导出含密钥包 / 导入回滚快照因 index 不同步而遗漏密钥。
+        try:
+            with locked(_index_path()):
+                current = _load_index()
+                _save_index(names | current)
+        except Exception:
+            pass
     return sorted(names)
+
+
+def provider_pool_names() -> list[tuple[str, str, str]]:
+    """Return (provider, pool_name, single_key_name) for every provider key pool.
+
+    Used to detect key pools whose provider config has been removed from
+    models.json (orphaned credentials).
+    """
+    providers: dict[str, None] = {}
+    for name in list_secret_names():
+        match = re.match(r"^provider:(.+):(apiKeys|apiKey)$", name)
+        if match:
+            providers.setdefault(match.group(1), None)
+    return [
+        (
+            provider,
+            f"provider:{provider}:apiKeys",
+            f"provider:{provider}:apiKey",
+        )
+        for provider in sorted(providers)
+    ]
 
 
 def provider_key_name(provider: str) -> str:

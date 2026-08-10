@@ -31,6 +31,7 @@ def build_providers_page(window) -> QWidget:
     summary_text.setObjectName("subtitle")
     summary.addWidget(summary_text)
     summary.addStretch(1)
+    summary.addWidget(window._btn("清理孤儿密钥", window.orphan_keys_cleanup, danger=True))
     summary.addWidget(window._btn("从 API 拉取", window.provider_fetch_api, success=True))
     summary.addWidget(window._btn("新建 Provider", window.provider_add, secondary=True))
     layout.addLayout(summary)

@@ -13,8 +13,8 @@ from PySide6.QtWidgets import (
     QMenu,
     QPlainTextEdit,
     QSplitter,
-    QTableWidget,
     QToolButton,
+    QTreeWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -56,7 +56,7 @@ def build_models_page(window) -> QWidget:
     window.models_count_lbl = QLabel("0 个模型")
     window.models_count_lbl.setObjectName("subtitle")
     meta.addWidget(window.models_count_lbl, 1)
-    legend = QLabel("默认模型优先 · 收藏其次 · 双击可直接设为默认")
+    legend = QLabel("按 Provider 分组 · 点击箭头展开/收起 · 双击模型设为默认")
     legend.setObjectName("subtitle")
     meta.addWidget(legend)
     filter_card.content.addLayout(meta)
@@ -66,16 +66,32 @@ def build_models_page(window) -> QWidget:
     splitter.setChildrenCollapsible(False)
 
     table_card = SurfaceCard(margins=(0, 0, 0, 12), spacing=10)
-    window.models_table = QTableWidget(0, 5)
-    window.models_table.setHorizontalHeaderLabels(["模型", "Provider", "能力", "状态", "延迟"])
-    header = window.models_table.horizontalHeader()
+    window.models_table = QTreeWidget()
+    window.models_table.setColumnCount(5)
+    window.models_table.setHeaderLabels(["模型", "Provider", "能力", "状态", "延迟"])
+    header = window.models_table.header()
     header.setSectionResizeMode(0, QHeaderView.Stretch)
     header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
     header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
     header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
     header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-    window._polish_table(window.models_table)
-    window.models_table.doubleClicked.connect(window.model_set_default)
+    window._polish_tree(window.models_table)
+    window.models_table.itemExpanded.connect(
+        lambda item: window._remember_tree_expanded(item, True)
+    )
+    window.models_table.itemCollapsed.connect(
+        lambda item: window._remember_tree_expanded(item, False)
+    )
+
+    def _on_model_double_clicked(item, _column):
+        # 双击模型设为默认；双击 Provider 分组切换展开/收起
+        data = item.data(0, Qt.UserRole) if item is not None else None
+        if isinstance(data, (list, tuple)) and len(data) == 2 and data[1]:
+            window.model_set_default()
+        else:
+            item.setExpanded(not item.isExpanded())
+
+    window.models_table.itemDoubleClicked.connect(_on_model_double_clicked)
     if hasattr(window, "_on_model_selection_changed"):
         window.models_table.itemSelectionChanged.connect(window._on_model_selection_changed)
     table_card.content.addWidget(window.models_table, 1)
@@ -91,7 +107,13 @@ def build_models_page(window) -> QWidget:
     action_row.addWidget(QLabel("Thinking"))
     window.thinking_combo = QComboBox()
     window.thinking_combo.addItems(["off", "minimal", "low", "medium", "high", "xhigh", "max"])
-    window.thinking_combo.setCurrentText("high")
+    try:
+        from ... import core as _core
+        _default_thinking = _core.get_default_model()[2]
+        if _default_thinking:
+            window.thinking_combo.setCurrentText(_default_thinking)
+    except Exception:
+        window.thinking_combo.setCurrentText("high")
     window.thinking_combo.setMaximumWidth(100)
     action_row.addWidget(window.thinking_combo)
     action_row.addWidget(QLabel("测试"))

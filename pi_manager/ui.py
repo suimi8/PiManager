@@ -30,11 +30,14 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
 )
 
 from . import core
 from . import extras
+from . import provider_presets
 from .presentation.design import ACCENT_LABELS, apply_app_font, normalize_mode
 from .ui_features import FeatureMixin
 
@@ -134,6 +137,23 @@ class ProviderEditorDialog(QDialog):
         layout = QVBoxLayout(self)
         form = QFormLayout()
 
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItem("自定义（手动填写）", "")
+        for preset in provider_presets.list_presets():
+            self.preset_combo.addItem(
+                f"{preset.get('region') or ''} · {preset.get('label')}",
+                preset.get("name"),
+            )
+        self.preset_combo.currentIndexChanged.connect(self._apply_preset)
+        form.addRow("常用模板", self.preset_combo)
+        preset_tip = QLabel(
+            "选择模板会自动填充 Base URL / API 类型 / 模型列表，\n"
+            "你只需粘贴自己的 API Key 后保存即可接入（模板含国内外主流大模型）。"
+        )
+        preset_tip.setObjectName("subtitle")
+        preset_tip.setWordWrap(True)
+        form.addRow("", preset_tip)
+
         self.name_edit = QLineEdit(name)
         self.name_edit.setEnabled(not bool(name))
         self.base_url = QLineEdit(self.existing.get("baseUrl", "https://api.openai.com/v1"))
@@ -222,6 +242,34 @@ class ProviderEditorDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _apply_preset(self) -> None:
+        """选择模板后自动填充接口参数与模型列表（编辑已有 Provider 时保留名称）。"""
+        name = str(self.preset_combo.currentData() or "")
+        preset = provider_presets.find_preset(name) if name else None
+        if not preset:
+            return
+        if self.name_edit.isEnabled():
+            self.name_edit.setText(str(preset.get("name") or ""))
+        self.base_url.setText(str(preset.get("base_url") or ""))
+        api = str(preset.get("api") or "openai-completions")
+        idx = self.api.findText(api)
+        self.api.setCurrentIndex(idx if idx >= 0 else 0)
+        compat = preset.get("compat") or {}
+        self.compat_dev.setChecked(bool(compat.get("supportsDeveloperRole", False)))
+        self.compat_reason.setChecked(bool(compat.get("supportsReasoningEffort", True)))
+        self.models_text.setPlainText(
+            json.dumps(preset.get("models") or [], ensure_ascii=False, indent=2)
+        )
+        self._fetched_models = []
+        self.model_pick.clear()
+        hint = str(preset.get("hint") or "")
+        key_url = str(preset.get("key_url") or "")
+        text = hint
+        if key_url:
+            text += f"\n获取 API Key：{key_url}"
+        text += "\n填写 API Key 后可直接保存，或点击下方按钮拉取最新模型列表。"
+        self.fetch_status.setText(text)
 
     def fetch_models(self):
         base = self.base_url.text().strip()
@@ -889,6 +937,24 @@ class MainWindow(FeatureMixin, QMainWindow):
         table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
 
+    def _polish_tree(self, tree: QTreeWidget) -> None:
+        """统一树状列表观感（模型按 Provider 分组）。"""
+        tree.setAlternatingRowColors(True)
+        tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        tree.setWordWrap(False)
+        tree.setRootIsDecorated(True)
+        tree.setUniformRowHeights(True)
+        tree.setIndentation(20)
+        tree.setAllColumnsShowFocus(True)
+        tree.setExpandsOnDoubleClick(False)
+        tree.setFocusPolicy(Qt.StrongFocus)
+        tree.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        tree.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        tree.header().setStretchLastSection(False)
+        tree.header().setMinimumSectionSize(60)
+
     def quick_fetch_and_save(self):
         name = self.quick_name.text().strip()
         base = self.quick_base.text().strip()
@@ -992,70 +1058,60 @@ class MainWindow(FeatureMixin, QMainWindow):
             parts.append(f"图:{m.images}")
         return " ".join(parts) if parts else "—"
 
-    def _model_status_cells(self, m: core.ModelInfo) -> tuple[QTableWidgetItem, QTableWidgetItem]:
-        """状态 / 延迟：短文案 + 当前全局主题的语义色。"""
+    def _model_status_cells(
+        self, m: core.ModelInfo
+    ) -> tuple[str, str, QColor, QColor, str, str]:
+        """状态 / 延迟：返回 (状态文本, 延迟文本, 状态色, 延迟色, 状态提示, 延迟提示)。"""
         from .presentation.design import tokens_for
 
         theme = core.get_ui_theme()
         colors = tokens_for(theme.get("mode"), theme.get("accent"))
         res = self.test_results.get(m.key)
-        st = QTableWidgetItem("—")
-        lat_item = QTableWidgetItem("—")
-        st.setTextAlignment(Qt.AlignCenter)
-        lat_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        muted = QColor(colors.text_muted)
         if not res:
-            st.setForeground(QColor(colors.text_muted))
-            lat_item.setForeground(QColor(colors.text_muted))
-            return st, lat_item
+            return "—", "—", muted, muted, "", ""
         if res.get("pending"):
-            st.setText("…")
-            st.setForeground(QColor(colors.warning))
-            lat_item.setText("…")
-            lat_item.setForeground(QColor(colors.warning))
-            return st, lat_item
+            return "…", "…", QColor(colors.warning), QColor(colors.warning), "", ""
         if res.get("available") is True:
-            st.setText("✓")
-            st.setToolTip("可用")
-            st.setForeground(QColor(colors.success))
+            status_text, status_color, status_tip = "✓", QColor(colors.success), "可用"
         elif res.get("available") is False:
-            st.setText("✗")
-            err = str(res.get("error") or res.get("preview") or "不可用")
-            st.setToolTip(err[:300])
-            st.setForeground(QColor(colors.danger))
+            status_text, status_color = "✗", QColor(colors.danger)
+            status_tip = str(res.get("error") or res.get("preview") or "不可用")[:300]
         else:
-            st.setText("?")
-            st.setForeground(QColor(colors.text_muted))
+            status_text, status_color, status_tip = "?", muted, ""
         lat = res.get("latency_ms")
         if isinstance(lat, (int, float)):
-            lat_item.setText(f"{lat:.0f}ms")
+            latency_text = f"{lat:.0f}ms"
             if lat < 800:
-                lat_item.setForeground(QColor(colors.success))
+                latency_color = QColor(colors.success)
             elif lat < 2000:
-                lat_item.setForeground(QColor(colors.warning))
+                latency_color = QColor(colors.warning)
             else:
-                lat_item.setForeground(QColor(colors.danger))
+                latency_color = QColor(colors.danger)
         else:
-            lat_item.setForeground(QColor(colors.text_muted))
-        return st, lat_item
+            latency_text, latency_color = "—", muted
+        return status_text, latency_text, status_color, latency_color, status_tip, ""
+
+    def _model_item_key(self, item) -> tuple[str, str] | None:
+        """从树节点读取 (provider, model)；组节点（model 为空）返回 None。"""
+        if item is None:
+            return None
+        data = item.data(0, Qt.UserRole)
+        if isinstance(data, (list, tuple)) and len(data) == 2:
+            provider = str(data[0] or "").strip()
+            model = str(data[1] or "").strip()
+            if provider and model:
+                return provider, model
+        return None
 
     def _model_row_key(self, row: int) -> tuple[str, str] | None:
-        # 兼容：UserRole 存在于「模型」列（第 0 列）
-        item = self.models_table.item(row, 0)
-        if not item:
+        """兼容旧表格行号调用：树模式下取第 row 个组节点的第一个模型子项。"""
+        tree = self.models_table
+        if not hasattr(tree, "topLevelItem"):
             return None
-        data = item.data(Qt.UserRole)
-        if isinstance(data, (list, tuple)) and len(data) == 2:
-            return str(data[0]), str(data[1])
-        # 兜底：Provider 列 + 去掉标记后的模型名
-        prov_item = self.models_table.item(row, 1)
-        if prov_item and item.text():
-            name = item.text().lstrip("●★· ").strip()
-            if name:
-                return prov_item.text().strip(), name
-        text = item.text().lstrip("●★· ").strip()
-        if "/" in text:
-            p, m = text.split("/", 1)
-            return p.strip(), m.strip()
+        group = tree.topLevelItem(row)
+        if group is not None and group.childCount():
+            return self._model_item_key(group.child(0))
         return None
 
     def _track(self, worker: Worker):
@@ -1068,10 +1124,8 @@ class MainWindow(FeatureMixin, QMainWindow):
             self.workers.remove(worker)
 
     def selected_model_row(self) -> core.ModelInfo | None:
-        rows = self.models_table.selectionModel().selectedRows()
-        if not rows:
-            return None
-        parsed = self._model_row_key(rows[0].row())
+        item = self.models_table.currentItem()
+        parsed = self._model_item_key(item)
         if not parsed:
             return None
         provider, model = parsed
@@ -1081,13 +1135,10 @@ class MainWindow(FeatureMixin, QMainWindow):
         return core.ModelInfo(provider, model)
 
     def selected_model_rows(self) -> list[core.ModelInfo]:
-        sm = self.models_table.selectionModel()
-        if not sm:
-            return []
         out: list[core.ModelInfo] = []
         seen: set[str] = set()
-        for idx in sm.selectedRows():
-            parsed = self._model_row_key(idx.row())
+        for item in self.models_table.selectedItems():
+            parsed = self._model_item_key(item)
             if not parsed:
                 continue
             provider, model = parsed
@@ -1169,7 +1220,13 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.status.showMessage(f"批量收藏 +{n}，共 {len(favs)}")
 
     def model_select_visible(self):
-        self.models_table.selectAll()
+        tree = self.models_table
+        for i in range(tree.topLevelItemCount()):
+            group = tree.topLevelItem(i)
+            if group is None:
+                continue
+            for j in range(group.childCount()):
+                group.child(j).setSelected(True)
 
     def _visible_model_pairs(self) -> list[tuple[str, str]]:
         q = (self.model_filter.text() or "").lower().strip()
@@ -1586,7 +1643,8 @@ class MainWindow(FeatureMixin, QMainWindow):
                 self.model_provider_filter.blockSignals(False)
                 prov = str(self.model_provider_filter.currentData() or "")
 
-        rows: list[core.ModelInfo] = []
+        # 按 Provider 分组收集符合条件的模型（用户手动添加的模型均正常展示）
+        groups: dict[str, list[core.ModelInfo]] = {}
         for m in self.models:
             if prov and m.provider != prov:
                 continue
@@ -1594,70 +1652,125 @@ class MainWindow(FeatureMixin, QMainWindow):
                 continue
             if q and q not in m.key.lower() and q not in m.provider.lower() and q not in m.model.lower():
                 continue
-            rows.append(m)
+            groups.setdefault(m.provider, []).append(m)
 
-        # 默认模型置顶，其次收藏，再按 provider + model 名
+        # 组内排序：默认模型置顶 → 收藏 → 模型名
         def _sort_key(m: core.ModelInfo) -> tuple:
             is_def = 0 if m.key == default_key else 1
             is_fav = 0 if m.key in fav_set else 1
-            return (is_def, is_fav, m.provider.lower(), m.model.lower())
+            return (is_def, is_fav, m.model.lower())
 
-        rows.sort(key=_sort_key)
+        for provider_name in groups:
+            groups[provider_name].sort(key=_sort_key)
 
-        # 选中单一 Provider 时隐藏 Provider 列，减少重复
-        hide_provider_col = bool(prov)
-        if self.models_table.columnCount() >= 2:
-            self.models_table.setColumnHidden(1, hide_provider_col)
+        # 组排序：默认 Provider 置顶 → 组内含收藏 → Provider 名
+        ordered_providers = sorted(
+            groups.keys(),
+            key=lambda p: (
+                0 if p == def_p else 1,
+                0 if any(m.key in fav_set for m in groups[p]) else 1,
+                str(p).lower(),
+            ),
+        )
+
+        # 记忆展开状态：首次构建默认全部展开
+        expanded = set(getattr(self, "_models_tree_expanded", None) or ())
+        if not expanded and ordered_providers:
+            expanded = set(ordered_providers)
 
         from .presentation.design import tokens_for
 
         theme = core.get_ui_theme()
         colors = tokens_for(theme.get("mode"), theme.get("accent"))
-        self.models_table.setRowCount(len(rows))
-        for i, m in enumerate(rows):
-            is_default = m.key == default_key
-            is_fav = m.key in fav_set
-            prefix = ""
-            if is_default:
-                prefix += "● "
-            if is_fav:
-                prefix += "★ "
-            name_item = QTableWidgetItem(f"{prefix}{m.model}")
-            name_item.setData(Qt.UserRole, [m.provider, m.model])
-            tip_bits = [m.key]
-            if is_default:
-                tip_bits.append("当前默认")
-            if is_fav:
-                tip_bits.append("已收藏")
-            name_item.setToolTip(" · ".join(tip_bits))
-            if is_default:
-                name_item.setForeground(QColor(colors.accent_text))
-            self.models_table.setItem(i, 0, name_item)
-
-            prov_item = QTableWidgetItem(m.provider)
-            prov_item.setToolTip(m.provider)
-            prov_item.setForeground(QColor(colors.text_muted))
-            self.models_table.setItem(i, 1, prov_item)
-
-            cap = QTableWidgetItem(self._model_capability_text(m))
-            cap.setToolTip(
-                f"context={m.context or '-'}  thinking={m.thinking or '-'}  images={m.images or '-'}"
+        tree = self.models_table
+        tree.clear()
+        # Provider 列由树状分组体现，隐藏重复列
+        try:
+            tree.setColumnHidden(1, True)
+        except Exception:
+            pass
+        for provider_name in ordered_providers:
+            models = groups[provider_name]
+            is_default_group = provider_name == def_p
+            group = QTreeWidgetItem(tree)
+            group.setText(0, f"{provider_name}  ({len(models)})")
+            group.setText(1, provider_name)
+            group.setData(0, Qt.UserRole, [provider_name, ""])
+            group.setData(0, Qt.UserRole + 1, "group")
+            group.setToolTip(
+                0,
+                f"Provider：{provider_name}\n{len(models)} 个模型"
+                + ("\n当前默认 Provider" if is_default_group else ""),
             )
-            self.models_table.setItem(i, 2, cap)
+            group.setForeground(0, QColor(colors.accent_text if is_default_group else colors.text))
+            group.setForeground(1, QColor(colors.text_muted))
+            font = group.font(0)
+            font.setBold(True)
+            group.setFont(0, font)
+            group.setExpanded(provider_name in expanded)
 
-            st, lat_item = self._model_status_cells(m)
-            self.models_table.setItem(i, 3, st)
-            self.models_table.setItem(i, 4, lat_item)
+            for m in models:
+                is_default = m.key == default_key
+                is_fav = m.key in fav_set
+                prefix = ""
+                if is_default:
+                    prefix += "● "
+                if is_fav:
+                    prefix += "★ "
+                child = QTreeWidgetItem(group)
+                child.setText(0, f"{prefix}{m.model}")
+                child.setData(0, Qt.UserRole, [m.provider, m.model])
+                tip_bits = [m.key]
+                if is_default:
+                    tip_bits.append("当前默认")
+                if is_fav:
+                    tip_bits.append("已收藏")
+                child.setToolTip(0, " · ".join(tip_bits))
+                if is_default:
+                    child.setForeground(0, QColor(colors.accent_text))
+                child.setText(1, m.provider)
+                child.setForeground(1, QColor(colors.text_muted))
+                cap = self._model_capability_text(m)
+                child.setText(2, cap)
+                child.setToolTip(
+                    2,
+                    f"context={m.context or '-'}  thinking={m.thinking or '-'}  images={m.images or '-'}",
+                )
+                status_text, latency_text, sc, lc, status_tip, _lt = self._model_status_cells(m)
+                child.setText(3, status_text)
+                child.setText(4, latency_text)
+                child.setForeground(3, sc)
+                child.setForeground(4, lc)
+                if status_tip:
+                    child.setToolTip(3, status_tip)
 
         if hasattr(self, "models_count_lbl"):
             total = len(self.models)
+            shown = sum(len(v) for v in groups.values())
             fav_n = sum(1 for m in self.models if m.key in fav_set)
             extra = f" · 收藏 {fav_n}"
             if only_fav:
                 extra += " · 仅收藏"
             if prov:
                 extra += f" · {prov}"
-            self.models_count_lbl.setText(f"显示 {len(rows)} / 共 {total}{extra}")
+            self.models_count_lbl.setText(f"显示 {shown} / 共 {total}{extra}")
+
+    def _remember_tree_expanded(self, item, expanded: bool) -> None:
+        """记录用户手动展开 / 收起的 Provider 分组，刷新时保持状态。"""
+        if item is None:
+            return
+        data = item.data(0, Qt.UserRole)
+        if not isinstance(data, (list, tuple)) or not data:
+            return
+        provider = str(data[0] or "")
+        if not provider:
+            return
+        state = set(getattr(self, "_models_tree_expanded", None) or ())
+        if expanded:
+            state.add(provider)
+        else:
+            state.discard(provider)
+        self._models_tree_expanded = state
 
     def refresh_providers(self):
         cfg = core.load_models_config()
@@ -2043,15 +2156,19 @@ class MainWindow(FeatureMixin, QMainWindow):
             self.chat_provider.addItem(p)
         self.chat_provider.blockSignals(False)
 
-        if cur_p:
-            self._set_chat_combo_text(self.chat_provider, cur_p)
+        # 决定要选中的 Provider：当前选择（仍存在）→ 默认 Provider（存在）→ 第一个
+        try:
+            dp, _, _ = core.get_default_model()
+        except Exception:
+            dp = ""
+        target = ""
+        if cur_p and cur_p in providers:
+            target = cur_p
+        elif dp and dp in providers:
+            target = dp
         elif providers:
-            # 默认选中当前默认 provider
-            try:
-                dp, _, _ = core.get_default_model()
-            except Exception:
-                dp = ""
-            self._set_chat_combo_text(self.chat_provider, dp or providers[0])
+            target = providers[0]
+        self._set_chat_combo_text(self.chat_provider, target)
 
         self._reload_chat_models_for_provider(self._chat_combo_text(self.chat_provider), prefer_model=cur_m)
 
@@ -2062,16 +2179,20 @@ class MainWindow(FeatureMixin, QMainWindow):
         self._reload_chat_models_for_provider(self._chat_combo_text(self.chat_provider), prefer_model=prefer)
 
     def _reload_chat_models_for_provider(self, provider: str, prefer_model: str = "") -> None:
+        """填充快速提问的模型下拉：list-models 结果 + models.json 手动添加的模型。"""
         if not hasattr(self, "chat_model") or not isinstance(self.chat_model, QComboBox):
             return
         provider = (provider or "").strip()
         models: list[str] = []
+        seen: set[str] = set()
+        # 1) pi --list-models 枚举到的模型
         for m in self.models or []:
             if not provider or m.provider == provider:
-                if m.model and m.model not in models:
+                if m.model and m.model not in seen:
+                    seen.add(m.model)
                     models.append(m.model)
-        # models.json 兜底
-        if not models and provider:
+        # 2) models.json 中该 provider 手动添加的模型（始终合并，保证可选择）
+        if provider:
             try:
                 cfg = core.load_models_config()
                 pdata = (cfg.get("providers") or {}).get(provider) or {}
@@ -2081,7 +2202,8 @@ class MainWindow(FeatureMixin, QMainWindow):
                         mid = str(item.get("id") or item.get("model") or "")
                     elif isinstance(item, str):
                         mid = item
-                    if mid and mid not in models:
+                    if mid and mid not in seen:
+                        seen.add(mid)
                         models.append(mid)
             except Exception:
                 pass
@@ -2092,7 +2214,7 @@ class MainWindow(FeatureMixin, QMainWindow):
             self.chat_model.addItem(mid)
         self.chat_model.blockSignals(False)
 
-        if prefer_model and (not provider or any(m.provider == provider and m.model == prefer_model for m in (self.models or [])) or prefer_model in models):
+        if prefer_model and prefer_model in models:
             self._set_chat_combo_text(self.chat_model, prefer_model)
         elif models:
             try:
@@ -2104,17 +2226,30 @@ class MainWindow(FeatureMixin, QMainWindow):
             else:
                 self._set_chat_combo_text(self.chat_model, models[0])
         else:
-            self.chat_model.setEditText(prefer_model or "")
+            # 无可用模型：清空，不残留不存在的模型文本
+            self.chat_model.setCurrentIndex(-1)
+            self.chat_model.setEditText("")
+            self.chat_model.setPlaceholderText("该 Provider 暂无可用模型")
 
     def chat_fill_default(self):
-        p, m, _t = core.get_default_model()
+        p, m, t = core.get_default_model()
+        if hasattr(self, "thinking_combo") and t:
+            idx = self.thinking_combo.findText(t)
+            if idx >= 0:
+                self.thinking_combo.setCurrentIndex(idx)
         if hasattr(self, "chat_provider") and isinstance(self.chat_provider, QComboBox):
             # 确保下拉有数据
             if self.chat_provider.count() == 0:
                 self.refresh_chat_model_choices()
+            # 默认 provider 可能已不存在（配置残留）：回退到第一个可用 provider
+            available = [
+                self.chat_provider.itemText(i) for i in range(self.chat_provider.count())
+            ]
+            if p not in available:
+                p = available[0] if available else ""
+                m = ""
             self._set_chat_combo_text(self.chat_provider, p)
             self._reload_chat_models_for_provider(p, prefer_model=m)
-            self._set_chat_combo_text(self.chat_model, m)
         else:
             # 旧控件兼容
             try:
@@ -2125,22 +2260,58 @@ class MainWindow(FeatureMixin, QMainWindow):
 
     def chat_send(self):
         prompt = self.chat_input.toPlainText().strip()
-        if not prompt:
+        attachments = (
+            self.chat_input.attachments() if hasattr(self.chat_input, "attachments") else []
+        )
+        if not prompt and not attachments:
             return
         provider = self._chat_combo_text(self.chat_provider) or None
         model = self._chat_combo_text(self.chat_model) or None
         workdir = self.workdir_edit.text().strip() or str(core.user_home())
-        self.chat_output.appendPlainText(f"\n>>> {prompt}\n…请求中，请稍候…\n")
+        # Read widget values on the UI thread; the worker must not touch Qt.
+        try:
+            thinking = self.thinking_combo.currentText() or "off"
+        except Exception:
+            thinking = "off"
+        if attachments:
+            if not core.zhipu_api_key():
+                QMessageBox.warning(
+                    self,
+                    "未配置识图模型",
+                    "已附加图片，但未配置智谱 API Key。请在「设置 → 识图模型」填入。",
+                )
+                return
+            self.chat_output.appendPlainText(
+                f"\n你: {prompt or '[图片]'}\n…正在用内置免费识图模型识别图片…"
+            )
+        else:
+            self.chat_output.appendPlainText(f"\n>>> {prompt}\n…请求中，请稍候…\n")
         self.status.showMessage("Pi 快速提问运行中…")
 
         def job():
-            return extras.chat_with_failover(
-                prompt,
+            full_prompt = prompt
+            if attachments:
+                description, error = self._describe_attachments(attachments, prompt)
+                if error is not None:
+                    return {
+                        "ok": False,
+                        "returncode": -1,
+                        "stdout": "",
+                        "stderr": "",
+                        "latency_ms": 0,
+                        "error": error,
+                    }
+                full_prompt = self._append_image_prompt(description or "", prompt)
+            result = extras.chat_with_failover(
+                full_prompt,
                 provider=provider,
                 model=model,
                 workdir=workdir,
-                thinking=self.thinking_combo.currentText(),
+                thinking=thinking,
             )
+            if attachments:
+                result["vision_text"] = description or ""
+            return result
 
         w = self._track(Worker(job))
         self.chat_input.setEnabled(False)
@@ -2172,8 +2343,19 @@ class MainWindow(FeatureMixin, QMainWindow):
                 self.chat_output.appendPlainText(out)
             if err and not result.get("ok"):
                 self.chat_output.appendPlainText(f"[stderr]\n{err}")
+            vision_text = result.get("vision_text") or ""
+            if vision_text:
+                self.chat_output.appendPlainText(
+                    f"— 识图结果（已作为上下文交给对话模型）—\n{vision_text[:2000]}\n"
+                )
             self.chat_output.appendPlainText(f"\n[exit {code} · {p}/{m}]")
             self.status.showMessage("快速提问完成" if result.get("ok") else "快速提问失败")
+            if result.get("ok") and hasattr(self.chat_input, "clear_attachments"):
+                self.chat_input.clear_attachments()
+                try:
+                    self._on_chat_attachments_changed()
+                except Exception:
+                    pass
             return
         # 兼容旧 tuple 返回
         code, out, err = result
@@ -2251,6 +2433,12 @@ class MainWindow(FeatureMixin, QMainWindow):
             core.apply_language_preference(core.get_language())
             from pi_manager.builtin_themes import ensure_builtin_themes
             ensure_builtin_themes()
+        except Exception:
+            pass
+        # Ensure the Pi vision skill is installed (idempotent; regenerates the
+        # helper command if this installation moved).
+        try:
+            core.install_vision_skill()
         except Exception:
             pass
         # first-run wizard
@@ -2357,6 +2545,15 @@ class MainWindow(FeatureMixin, QMainWindow):
         else:
             self.set_enabled.setPlainText(str(enabled))
 
+        if hasattr(self, "zhipu_key_edit"):
+            self.zhipu_key_edit.setText(core.zhipu_api_key())
+        if hasattr(self, "vision_model_combo"):
+            chosen = core.vision_model_choice()
+            index = self.vision_model_combo.findData(chosen)
+            if index >= 0:
+                self.vision_model_combo.setCurrentIndex(index)
+            else:
+                self.vision_model_combo.setCurrentIndex(0)
         if hasattr(self, "set_ui_mode"):
             ut = core.get_ui_theme()
             for i in range(self.set_ui_mode.count()):
@@ -2387,6 +2584,13 @@ class MainWindow(FeatureMixin, QMainWindow):
         settings["defaultProvider"] = self.set_provider.text().strip()
         settings["defaultModel"] = self.set_model.text().strip()
         settings["defaultThinkingLevel"] = self.set_thinking.currentText()
+        # Keep the model-page Thinking dropdown in sync with the global default
+        # so chat/test/launch use the configured level instead of a stale value.
+        if hasattr(self, "thinking_combo"):
+            saved_thinking = self.set_thinking.currentText()
+            current_index = self.thinking_combo.findText(saved_thinking)
+            if current_index >= 0:
+                self.thinking_combo.setCurrentIndex(current_index)
         settings["theme"] = core.cli_theme_for_ui_mode(mode)
         if hasattr(self, "set_language"):
             core.set_language(self.set_language.currentData() or "zh-CN")
@@ -2396,6 +2600,10 @@ class MainWindow(FeatureMixin, QMainWindow):
         elif "enabledModels" in settings:
             del settings["enabledModels"]
         core.save_settings(settings)
+        if hasattr(self, "zhipu_key_edit"):
+            core.set_zhipu_api_key(self.zhipu_key_edit.text())
+        if hasattr(self, "vision_model_combo"):
+            core.set_vision_model_choice(self.vision_model_combo.currentData() or "")
         self.save_feature_settings_fields()
         self.apply_ui_theme(mode, accent)
         final_settings = core.load_settings()
@@ -2426,6 +2634,25 @@ def run_app():
     app.setApplicationName("Pi Manager")
     app.setOrganizationName("PiManager")
     app.setQuitOnLastWindowClosed(False)
+    # 单实例保护：多个窗口同时运行会并发写回 models.json / settings.json，
+    # 导致“删除的 Provider 又被旧实例写回”等数据冲突。
+    try:
+        from PySide6.QtCore import QLockFile
+
+        core.ensure_agent_dir()
+        lock = QLockFile(str(core.pi_agent_dir() / "pi-manager.lock"))
+        lock.setStaleLockTime(0)
+        if not lock.tryLock(100):
+            QMessageBox.warning(
+                None,
+                "Pi Manager 已在运行",
+                "检测到 Pi Manager 已在运行。\n\n"
+                "为避免多个实例同时写入配置导致数据冲突（例如删除的 Provider 又被旧实例写回），\n"
+                "请关闭本窗口，使用已打开的 Pi Manager。",
+            )
+            return 0
+    except Exception:
+        lock = None
     try:
         app.setStyle("Fusion")
     except Exception:

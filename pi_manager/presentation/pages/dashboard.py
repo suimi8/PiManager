@@ -216,6 +216,18 @@ def build_dashboard_page(window) -> QWidget:
     window._polish_table(window.auth_table)
     window.auth_table.setMinimumHeight(155)
     auth.content.addWidget(window.auth_table, 1)
+    auth_actions = QHBoxLayout()
+    auth_actions.setSpacing(8)
+    auth_actions.addWidget(window._btn("登出选中", window.auth_logout_selected, danger=True))
+    auth_actions.addStretch(1)
+    auth.content.addLayout(auth_actions)
+    auth_hint = QLabel(
+        "内置 Provider（如 openai-codex）需单独登录后才可用；登出仅移除 Pi 的登录态，"
+        "不影响本机其他工具（OpenAI / Claude 等各自独立存储凭证）。"
+    )
+    auth_hint.setObjectName("subtitle")
+    auth_hint.setWordWrap(True)
+    auth.content.addWidget(auth_hint)
     lower.addWidget(auth, 1)
     layout.addLayout(lower)
     layout.addStretch(1)

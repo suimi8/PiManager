@@ -14,7 +14,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
 from ... import extras
 from ..components import SectionHeading, StatusBadge, SurfaceCard
 
@@ -152,6 +151,27 @@ def build_tools_page(window) -> QWidget:
     transfer_row.addStretch(1)
     transfers.content.addLayout(transfer_row)
     layout.addWidget(transfers)
+
+    backups = SurfaceCard(margins=(17, 15, 17, 15), spacing=10)
+    backups.content.addWidget(
+        SectionHeading(
+            "配置备份恢复",
+            "保存配置时自动轮转 .bak.1/.bak.2；若配置被误删或覆盖，可在此恢复。",
+        )
+    )
+    backup_row = QHBoxLayout()
+    backup_row.setSpacing(8)
+    window.backup_combo = QComboBox()
+    window.backup_combo.setMinimumWidth(340)
+    backup_row.addWidget(window.backup_combo, 1)
+    backup_row.addWidget(window._btn("刷新", window.backup_refresh, ghost=True))
+    backup_row.addWidget(window._btn("恢复所选备份", window.backup_restore, danger=True))
+    backups.content.addLayout(backup_row)
+    window.backup_status = QLabel("尚未刷新")
+    window.backup_status.setObjectName("subtitle")
+    window.backup_status.setWordWrap(True)
+    backups.content.addWidget(window.backup_status)
+    layout.addWidget(backups)
 
     updates = SurfaceCard(elevated=True, margins=(17, 15, 17, 15), spacing=10)
     update_header = QHBoxLayout()

@@ -105,10 +105,12 @@ class NavigationRail(QFrame):
             button.setIconSize(QSize(18, 18))
             button.setText(page.title)
             button.setToolTip(f"{page.title}\n{page.description}")
-            button.setFixedHeight(39)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             button.clicked.connect(lambda checked=False, key=page.key: self.set_current_key(key))
             self._buttons[page.key] = button
-            root.addWidget(button)
+            # Horizontal: Expanding policy fills the rail width uniformly;
+            # vertical centering keeps every tab aligned to the same midline.
+            root.addWidget(button, 0, Qt.AlignVCenter)
         root.addStretch(1)
 
         self.footer = QFrame()
@@ -145,6 +147,7 @@ class NavigationRail(QFrame):
         button.setCursor(Qt.PointingHandCursor)
         button.setToolTip(tooltip)
         button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        button.setFixedHeight(32)
         button.clicked.connect(signal)
         return button
 
@@ -208,14 +211,67 @@ class NavigationRail(QFrame):
         self.collapse_button.setToolTip("展开侧边栏" if self._collapsed else "收起侧边栏")
         self.launch_button.setText("" if self._collapsed else "启动 Pi")
         self.launch_button.setToolTip("启动完整 Pi")
-        self.version_label.setVisible(not self._collapsed)
-        self.footer.layout().setContentsMargins(7 if self._collapsed else 9, 9, 7 if self._collapsed else 9, 9)
+        self._apply_footer_layout()
         self.update_icons()
         if emit:
             self.collapsedChanged.emit(self._collapsed)
+
+    def _apply_footer_layout(self) -> None:
+        """Rebuild the footer items for expanded / collapsed rail.
+
+        The root layout object stays the same (replacing it via setLayout is
+        unreliable with deferred deletes); only its items change. Collapsed rail
+        is only ~38px wide internally, so the three utility icon buttons are
+        stacked vertically instead of side by side to avoid overlapping icons.
+        """
+        layout = self.footer.layout()
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            child = item.layout()
+            if child is not None:
+                child.deleteLater()
+            widget = item.widget()
+            if widget is not None and widget not in (
+                self.launch_button,
+                self.refresh_button,
+                self.theme_button,
+                self.config_button,
+                self.version_label,
+            ):
+                widget.deleteLater()
+        if self._collapsed:
+            layout.setContentsMargins(7, 9, 7, 9)
+            layout.setSpacing(6)
+            self.version_label.setVisible(False)
+            layout.addWidget(self.launch_button)
+            for button in (self.refresh_button, self.theme_button, self.config_button):
+                button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                button.setIconSize(QSize(18, 18))
+                button.setFixedHeight(32)
+                layout.addWidget(button)
+        else:
+            layout.setContentsMargins(9, 9, 9, 9)
+            layout.setSpacing(7)
+            self.version_label.setVisible(False)
+            layout.addWidget(self.launch_button)
+            utility = QHBoxLayout()
+            utility.setSpacing(4)
+            for button in (self.refresh_button, self.theme_button, self.config_button):
+                button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                button.setIconSize(QSize(18, 18))
+                button.setFixedHeight(32)
+                utility.addWidget(button)
+            layout.addLayout(utility)
+        layout.activate()
+        self.footer.updateGeometry()
 
     def is_collapsed(self) -> bool:
         return self._collapsed
 
     def set_version(self, text: str) -> None:
         self.version_label.setText(text)
+        self.launch_button.setToolTip(
+            f"启动完整 Pi" + (f"\n{text}" if text else "")
+        )

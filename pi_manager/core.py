@@ -6,6 +6,7 @@ providers/models/settings and launches full Pi sessions.
 from __future__ import annotations
 
 import copy
+import base64
 import heapq
 import json
 import logging
@@ -168,6 +169,42 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=2)
 
 
+def proxy_reachable(proxy_url: str, timeout: float = 0.4) -> bool:
+    """Quick TCP probe of a proxy endpoint (local proxies only, fast fail)."""
+    import socket
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(str(proxy_url or ""))
+        if parts.scheme not in {"http", "https"}:
+            return False
+        host = parts.hostname or "127.0.0.1"
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _sanitize_proxy_env(env: dict[str, str]) -> dict[str, str]:
+    """Drop proxy env vars that point at unreachable endpoints.
+
+    A configured-but-stopped Clash/other proxy makes every child process fail
+    with "Connection error"; when the proxy cannot be reached the child should
+    simply connect directly instead.
+    """
+    result = dict(env)
+    checked: set[str] = set()
+    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        value = (result.get(var) or "").strip()
+        if not value or value in checked:
+            continue
+        checked.add(value)
+        if not proxy_reachable(value):
+            result.pop(var, None)
+    return result
+
+
 def run_pi(
     args: list[str],
     *,
@@ -180,6 +217,7 @@ def run_pi(
     full_env = os.environ.copy()
     if env:
         full_env.update(env)
+    full_env = _sanitize_proxy_env(full_env)
     full_env.setdefault("PYTHONIOENCODING", "utf-8")
     output_limit = 8 * 1024 * 1024
     creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -302,8 +340,16 @@ def list_models(search: str | None = None) -> list[ModelInfo]:
         provider, model = parts[0], parts[1]
         if provider in {"provider", "─", "-", "="}:
             continue
-        # skip junk
-        if not re.match(r"^[\w.-]+$", provider):
+        # Provider names may contain spaces or non-ASCII characters (e.g.
+        # "opencode go", "中转站"), so only reject obvious junk: a trailing
+        # colon identifies warning/error lines ("Warning: ...").
+        if not provider or not model or provider.endswith(":"):
+            continue
+        # Real table rows carry a numeric-ish capability column right after
+        # the model id (e.g. "128K", "1M", "32.8K"); free-text lines such as
+        # "No models matching ..." never do. When the row is too short to
+        # check, keep it.
+        if len(parts) >= 3 and not re.match(r"^[0-9.,]+[KM]?$", parts[2]):
             continue
         models.append(
             ModelInfo(
@@ -492,6 +538,36 @@ def auth_summary() -> list[dict[str, str]]:
     return rows
 
 
+def delete_provider_auth(provider: str) -> dict[str, Any] | None:
+    """Remove one provider's Pi credentials from auth.json (Pi-only logout).
+
+    Other local tools (OpenAI CLI, Claude Code, Gemini CLI, …) keep their own
+    credential stores and are never touched by this operation.
+    """
+    provider = (provider or "").strip()
+    if not provider:
+        return None
+    removed: dict[str, Any] | None = None
+
+    def remove(current: Any) -> dict[str, Any]:
+        nonlocal removed
+        if not isinstance(current, dict):
+            raise ValueError("auth.json 顶层必须是对象")
+        entry = current.get(provider)
+        if not isinstance(entry, dict):
+            raise ValueError(f"Provider「{provider}」没有已保存的认证")
+        removed = entry
+        result = dict(current)
+        del result[provider]
+        return result
+
+    try:
+        storage.update_json(auth_path(), {}, remove)
+    except Exception as exc:
+        raise ValueError(str(exc)) from exc
+    return removed
+
+
 def load_manager_config() -> dict[str, Any]:
     data = _load_json_cached(
         manager_config_path(),
@@ -649,6 +725,12 @@ def upsert_custom_provider(
         entry["headers"] = existing["headers"]
     providers[name] = entry
     save_models_config(cfg)
+    # Saving a provider means the user is about to use Pi: make sure the
+    # vision skill is installed so image handling works out of the box.
+    try:
+        install_vision_skill()
+    except Exception:
+        pass
     return cfg
 
 
@@ -753,6 +835,76 @@ def purge_favorites(
     return result
 
 
+def purge_enabled_models(
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+) -> list[str]:
+    """从 settings.enabledModels 中移除指向已删除 Provider/模型 的残留模式。
+
+    - 仅 provider：移除该 Provider 下全部模式（如 ``name/model``）
+    - provider + model：只移除精确匹配 ``provider/model`` 的模式
+    - 纯模型名（不含 ``/``）不参与匹配，原样保留
+    """
+    provider = (provider or "").strip()
+    model = (model or "").strip()
+    settings = load_settings()
+    patterns = settings.get("enabledModels")
+    if not isinstance(patterns, list):
+        return []
+    kept: list[str] = []
+    removed: list[str] = []
+    for pattern in patterns:
+        key = str(pattern)
+        parsed = _parse_favorite_key(key)
+        if not parsed:
+            kept.append(key)
+            continue
+        p, m = parsed
+        drop = False
+        if provider and model:
+            drop = p == provider and m == model
+        elif provider:
+            drop = p == provider
+        if drop:
+            removed.append(key)
+        else:
+            kept.append(key)
+    if removed:
+        if kept:
+            settings["enabledModels"] = kept
+        else:
+            settings.pop("enabledModels", None)
+        save_settings(settings)
+    return removed
+
+
+def list_stale_enabled_models(builtin_providers: set[str] | None = None) -> list[str]:
+    """返回 settings.enabledModels 中引用已不存在 Provider 的残留模式。
+
+    ``builtin_providers`` 传入 Pi 内置 Provider 名集合时可避免误报；
+    不传时仅与 models.json 中的自定义 Provider 比对。
+    """
+    settings = load_settings()
+    patterns = settings.get("enabledModels")
+    if not isinstance(patterns, list):
+        return []
+    cfg = load_models_config()
+    custom = set(cfg.get("providers") or {})
+    stale: list[str] = []
+    for pattern in patterns:
+        parsed = _parse_favorite_key(str(pattern))
+        if not parsed:
+            continue
+        p, _m = parsed
+        if p in custom:
+            continue
+        if builtin_providers and p in builtin_providers:
+            continue
+        stale.append(str(pattern))
+    return stale
+
+
 def delete_custom_provider(name: str) -> dict[str, Any]:
     cfg = load_models_config()
     providers = cfg.get("providers", {})
@@ -774,6 +926,12 @@ def delete_custom_provider(name: str) -> dict[str, Any]:
         cfg["_purge"] = purge_favorites(provider=name, redefault=True)
     except Exception:
         cfg["_purge"] = {"removed_favorites": [], "favorites": [], "default_changed": False}
+    # 同步清理 settings.enabledModels 中的残留模式，避免 Pi 每次启动
+    # 输出 "No models match pattern" 警告并污染测试结果
+    try:
+        cfg["_purged_enabled"] = purge_enabled_models(provider=name)
+    except Exception:
+        cfg["_purged_enabled"] = []
     return cfg
 
 
@@ -805,6 +963,10 @@ def remove_model_from_provider(provider: str, model_id: str) -> dict[str, Any]:
         cfg["_purge"] = purge_favorites(provider=provider, model=model_id, redefault=True)
     except Exception:
         cfg["_purge"] = {"removed_favorites": [], "favorites": [], "default_changed": False}
+    try:
+        cfg["_purged_enabled"] = purge_enabled_models(provider=provider, model=model_id)
+    except Exception:
+        cfg["_purged_enabled"] = []
     return cfg
 
 
@@ -847,11 +1009,18 @@ def launch_pi_interactive(
     base = pi_base_cmd()
     full_cmd_list = base + pi_args
     workdir = workdir or str(user_home())
+    # Inject the target provider's key when one is selected; otherwise inject
+    # every custom provider's keys so the session still has usable models
+    # (Pi reads apiKey references from the environment).
+    if provider:
+        child_env = provider_runtime_env(provider)
+    else:
+        child_env = all_provider_runtime_env(strict=False)
     return pu.launch_in_terminal(
         full_cmd_list,
         workdir,
         terminal=terminal,
-        env=provider_runtime_env(provider),
+        env=child_env,
     )
 
 
@@ -1939,6 +2108,422 @@ def _friendly_fetch_error(exc: BaseException, endpoint: str = "") -> str:
     return header
 
 
+# ---- vision / image understanding (built-in Zhipu GLM-4.6V-Flash) -------
+
+
+ZHIPU_VISION_MODELS = ("glm-4.6v-flash", "glm-4.1v-thinking-flash")
+ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+ZHIPU_API_KEY_SECRET = "zhipu:apiKey"
+
+
+def zhipu_api_key() -> str:
+    """Return the configured Zhipu API key (secret store first, then env)."""
+    try:
+        from . import secrets as secretstore
+
+        value = secretstore.get_secret(ZHIPU_API_KEY_SECRET)
+        if value:
+            return value
+    except Exception:
+        pass
+    return os.environ.get("ZHIPU_API_KEY", "").strip()
+
+
+def set_zhipu_api_key(value: str) -> None:
+    """Persist the Zhipu API key into the secure secret store."""
+    from . import secrets as secretstore
+
+    value = (value or "").strip()
+    if value:
+        secretstore.set_secret(ZHIPU_API_KEY_SECRET, value)
+    else:
+        secretstore.delete_secret(ZHIPU_API_KEY_SECRET)
+    try:
+        install_vision_skill()
+    except Exception:
+        pass
+
+
+def vision_model_choice() -> str:
+    """Return the user-configured vision model name ('' = auto)."""
+    try:
+        cfg = load_manager_config()
+        return str(cfg.get("vision_model") or "").strip()
+    except Exception:
+        return ""
+
+
+def set_vision_model_choice(value: str) -> None:
+    """Persist the vision model choice ('' = auto) into pi-manager.json."""
+    try:
+        cfg = load_manager_config()
+        cfg["vision_model"] = (value or "").strip()
+        save_manager_config(cfg)
+    except Exception:
+        pass
+
+
+def _call_zhipu_vision(
+    model: str,
+    api_key: str,
+    body_obj: dict[str, Any],
+    timeout: float,
+) -> dict[str, Any]:
+    """Call the Zhipu vision endpoint.
+
+    Zhipu is a mainland-China API: it is tried with an explicit NO-PROXY
+    opener first (``urllib.urlopen`` alone would silently honor HTTP_PROXY /
+    HTTPS_PROXY env vars and fail with connection-refused when the proxy is
+    down). The proxy is only used as a fallback when the direct attempt fails
+    at the network layer (no server response); service responses such as 429
+    mean the network is fine and must be returned as-is so the caller can
+    switch to the backup model.
+    """
+    result = _zhipu_vision_request(model, api_key, body_obj, timeout, proxy="")
+    if result.get("ok") or result.get("http_status"):
+        # A server answered (even with an error): the network is fine.
+        return result
+    proxy = _configured_proxy_url()
+    if not proxy:
+        return result
+    return _zhipu_vision_request(model, api_key, body_obj, timeout, proxy=proxy)
+
+
+def _configured_proxy_url() -> str:
+    try:
+        cfg = load_manager_config()
+        if cfg.get("proxy_enabled") and cfg.get("proxy_url"):
+            return str(cfg.get("proxy_url") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _zhipu_vision_request(
+    model: str,
+    api_key: str,
+    body_obj: dict[str, Any],
+    timeout: float,
+    proxy: str,
+) -> dict[str, Any]:
+    import time as _time
+    import urllib.error
+    import urllib.request
+
+    from . import http_client
+
+    req = urllib.request.Request(
+        ZHIPU_BASE_URL + "/chat/completions",
+        data=json.dumps(body_obj, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "PiManager/1.0 (+zhipu-vision)",
+        },
+        method="POST",
+    )
+    handlers: list[Any] = []
+    if proxy:
+        handlers.append(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        )
+    else:
+        # Explicitly disable proxies (including env vars) for the direct path.
+        handlers.append(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(*handlers)
+    t0 = _time.perf_counter()
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            raw = http_client.read_limited(resp, http_client.MODEL_TEST_MAX_BYTES)
+            status = int(getattr(resp, "status", 200))
+            body_text = raw.decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        err_body = b""
+        try:
+            err_body = http_client.read_limited(e, http_client.ERROR_MAX_BYTES)
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "description": "",
+            "error": f"HTTP {e.code}: {e.reason}",
+            "http_status": int(getattr(e, "code", 0) or 0),
+            "model": model,
+            "latency_ms": round((_time.perf_counter() - t0) * 1000, 1),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "description": "",
+            "error": str(e),
+            "http_status": 0,
+            "model": model,
+            "latency_ms": round((_time.perf_counter() - t0) * 1000, 1),
+        }
+    if not (200 <= status < 300):
+        return {
+            "ok": False,
+            "description": "",
+            "error": f"HTTP {status}",
+            "http_status": status,
+            "model": model,
+            "latency_ms": round((_time.perf_counter() - t0) * 1000, 1),
+        }
+    description = _extract_reply_preview("openai-completions", body_text or "", limit=12000)
+    if not description:
+        return {"ok": False, "description": "", "error": "识图模型没有返回文本", "model": model}
+    return {
+        "ok": True,
+        "description": description,
+        "latency_ms": round((_time.perf_counter() - t0) * 1000, 1),
+        "model": model,
+    }
+
+
+def build_vision_prompt(user_prompt: str = "") -> str:
+    """Build a targeted vision instruction from the user's question.
+
+    Screenshots almost always carry text (code, errors, UI labels); the vision
+    model must transcribe it verbatim instead of giving a generic description,
+    and it should focus on details relevant to the user's question.
+    """
+    user_prompt = (user_prompt or "").strip()
+    if user_prompt:
+        return (
+            "请仔细阅读这张图片，完成以下任务：\n"
+            "1. 原样转录图片中的全部文字内容（代码、报错信息、界面文本、按钮文案等），"
+            "不要遗漏、不要改写、不要概括；\n"
+            "2. 简要说明图片类型与整体布局（如：终端报错截图 / 代码编辑器 / 对话框）；\n"
+            "3. 针对用户的问题，提取图片中与之相关的关键信息。\n"
+            f"用户的问题：{user_prompt}"
+        )
+    return (
+        "请仔细阅读这张图片：原样转录其中的全部文字（代码、报错、界面文本），"
+        "并简要描述图片类型与整体布局。"
+    )
+
+
+def describe_image(
+    image_bytes: bytes,
+    mime: str = "image/png",
+    prompt: str = "请详细描述这张图片的内容，包括界面元素、文字与布局。",
+    timeout: float = 90,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Describe an image with the built-in free Zhipu vision models.
+
+    Model selection:
+    - explicit ``model`` argument wins;
+    - otherwise the user-configured choice (settings page);
+    - otherwise the automatic chain: ``glm-4.6v-flash`` first, falling back to
+      ``glm-4.1v-thinking-flash`` when the free tier is rate-limited (429).
+
+    Requires a Zhipu API key (settings page or ``ZHIPU_API_KEY`` env var).
+    Returns ``{ok, description, error, ...}``.
+    """
+    api_key = zhipu_api_key()
+    if not api_key:
+        return {
+            "ok": False,
+            "description": "",
+            "error": (
+                "未配置智谱 API Key。请在「设置 → 识图模型」填入，免费申请："
+                "https://bigmodel.cn （GLM-4.6V-Flash / GLM-4.1V-Thinking-Flash 免费额度）"
+            ),
+        }
+    configured = model or vision_model_choice()
+    candidates = [configured] if configured else list(ZHIPU_VISION_MODELS)
+    data_uri = (
+        f"data:{mime or 'image/png'};base64,"
+        f"{base64.b64encode(image_bytes or b'').decode('ascii')}"
+    )
+    body_obj: dict[str, Any] = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                ],
+            }
+        ],
+        # GLM-4.1V-Thinking spends part of the budget on its chain-of-thought;
+        # a small cap truncates the transcription mid-sentence.
+        "max_tokens": 8192,
+    }
+    last: dict[str, Any] | None = None
+    for candidate in candidates:
+        result = _call_zhipu_vision(
+            candidate,
+            api_key,
+            {**body_obj, "model": candidate},
+            timeout,
+        )
+        if result.get("ok"):
+            return result
+        last = result
+        # Rate-limited on the free tier: try the next free model.
+        if result.get("http_status") not in (429, 500, 502, 503):
+            return result
+    return last or {"ok": False, "description": "", "error": "识图失败"}
+
+
+def _make_test_image_png(size: int = 64) -> bytes:
+    """Generate a solid red PNG without any external image dependency."""
+    import struct
+    import zlib
+
+    width = height = size
+    row = b"\x00" + b"\xff\x00\x00" * width  # filter 0, RGB red
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        payload = tag + data
+        return (
+            struct.pack(">I", len(data))
+            + payload
+            + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(row * height))
+        + chunk(b"IEND", b"")
+    )
+
+
+def test_vision(timeout: float = 90) -> dict[str, Any]:
+    """Verify the built-in vision pipeline with a generated solid red image.
+
+    Returns the describe_image result; a healthy model should answer with a
+    red-ish color name.
+    """
+    png = _make_test_image_png(64)
+    result = describe_image(
+        png,
+        "image/png",
+        prompt="这张图片是什么颜色？请直接回答颜色名。",
+        timeout=timeout,
+    )
+    result["test_image"] = "红色测试图（程序生成）"
+    return result
+
+
+def ensure_zhipu_provider() -> dict[str, Any]:
+    """校验智谱识图配置是否就绪（仅用于识图管道，不写 models.json）。
+
+    设置页配置的智谱 API Key 与识图模型选择（GLM-4.6V-Flash /
+    GLM-4.1V-Thinking-Flash）只服务于识图管道：describe_image 与 Pi vision
+    skill（--vision-describe）默认使用它们把图片转为文字。这些模型**不会**
+    自动出现在 provider 模型列表中；用户如需在列表中使用智谱模型，请在
+    Provider 管理中手动添加。
+    """
+    key = zhipu_api_key()
+    if not key:
+        raise ValueError(
+            "未配置智谱 API Key。请在「设置 → 识图模型」填入（免费申请：https://bigmodel.cn）"
+        )
+    return {
+        "ok": True,
+        "api_key_configured": True,
+        "base_url": ZHIPU_BASE_URL,
+        "models": list(ZHIPU_VISION_MODELS),
+    }
+
+
+def install_vision_skill() -> dict[str, Any]:
+    """Install (or refresh) the Pi vision skill into ~/.pi/skills/.
+
+    The skill instructs Pi sessions to route every image through the free
+    Zhipu vision models before the text provider answers. The helper command
+    inside SKILL.md is generated from the current executable (frozen build or
+    source tree), so the skill works when this project is shared with others.
+
+    Idempotent: the file is only rewritten when its content changes.
+    """
+    import shlex
+
+    from . import helper_registry
+
+    skill_dir = Path(os.path.expanduser("~")) / ".pi" / "skills" / "pi-manager-vision"
+    skill_file = skill_dir / "SKILL.md"
+    try:
+        command_parts = helper_registry.current_helper_command()
+        vision_command = " ".join(shlex.quote(str(part)) for part in command_parts)
+    except Exception:
+        if getattr(sys, "frozen", False):
+            vision_command = shlex.quote(sys.executable)
+        else:
+            main_path = Path(__file__).resolve().parents[1] / "main.py"
+            vision_command = (
+                f"{shlex.quote(sys.executable)} {shlex.quote(str(main_path))}"
+            )
+    content = _VISION_SKILL_TEMPLATE.format(vision_command=vision_command)
+    try:
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        if skill_file.exists():
+            existing = skill_file.read_text(encoding="utf-8")
+            if existing == content:
+                return {"ok": True, "installed": True, "updated": False, "path": str(skill_file)}
+        temp = skill_file.with_name(f".{skill_file.name}.{os.getpid()}.tmp")
+        temp.write_text(content, encoding="utf-8")
+        os.replace(temp, skill_file)
+        return {"ok": True, "installed": True, "updated": True, "path": str(skill_file)}
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+_VISION_SKILL_TEMPLATE = """---
+name: pi-manager-vision
+description: 自动降级识图管道。当用户要求查看、识别或分析图片、截图、报错截图、界面截图，或对话中涉及图片（粘贴/拖入/提供图片路径）时使用。无论当前对话 provider 模型是否支持图片，一律先用智谱 GLM-4.6V-Flash / GLM-4.1V-Thinking-Flash 免费视觉模型把图片转为文字描述（含原样文字转录），再把识别结果作为上下文返回给当前对话模型进行回答。Trigger on 图片/截图/识图/看图/视觉/image/screenshot/clipboard 图片/粘贴图片等表述，以及任何包含图片文件路径的请求。
+---
+
+# Pi Manager 自动降级识图管道
+
+## 核心规则（必须遵守）
+
+**只要对话中出现图片（用户粘贴、拖入、给出图片文件路径、或要求看最新截图），永远先执行识图转文本，绝不要尝试把图片直接发送给当前对话模型。**
+
+原因：当前对话 provider 模型（如 deepseek-v4-flash）可能不支持图片输入，直接发送图片会报 `image_url` 错误。智谱视觉模型免费、快速、可靠，识图后转成文本即可与任何 provider 模型对话。
+
+## 执行步骤
+
+1. **确定图片文件**：
+   - 用户给了路径 → 直接使用。
+   - 用户粘贴/拖入图片（未给路径）→ 从剪贴板临时目录查找最新的：
+     ```
+     Get-ChildItem $env:TEMP -Filter "pi-clipboard-*" -File | Sort-Object LastWriteTime -Descending | Select-Object -First 3 Name, Length
+     ```
+     取最新的一张（或让用户确认）。
+   - 用户说"看最新截图" → 同样从 Temp 目录取最新。
+
+2. **调用识图命令**（把图片转成文字描述）：
+
+   ```
+   {vision_command} --vision-describe "<图片完整路径>" "<用户的问题，可空>"
+   ```
+
+   多张图片时逐张调用，分别得到每张的描述。
+
+3. **基于识别结果回答**：命令输出即图片的文字描述（含原样转录的文字内容）。完全基于该描述回答用户的问题。如用户有具体问题，把问题与描述结合回答。
+
+4. **识别结果即"图片本身"**：向用户转述时说明"已通过识图模型读取图片内容"。
+
+## 失败处理
+
+- 输出包含 `未配置智谱 API Key` → 告知用户：请在 Pi Manager「设置 → 识图模型」填入智谱 API Key（免费申请 https://bigmodel.cn）。
+- 输出包含 `429` / `Too Many Requests` → 智谱免费额度限流，稍等片刻后自动重试一次；仍失败则告知用户稍后再试。
+- 输出包含 `无法读取图片` → 路径错误，帮助用户确认路径或从 Temp 目录查找最新的剪贴板图片。
+- 输出包含 `HTTP 4xx/5xx` → 把错误原样反馈给用户。
+
+## 例外（仅在确认可用时）
+
+仅当你明确知道当前对话模型**原生支持图片**（例如模型列表中该 provider 的 images 列为 yes，且此前成功直接发图过）时，才可以直接把图片发给模型；否则一律走本技能识图管道。拿不准时，走识图管道是最安全的选择。
+"""
+
+
 def fetch_remote_models(
     base_url: str,
     api_key: str = "",
@@ -2306,6 +2891,128 @@ def get_provider_config(provider: str) -> dict[str, Any] | None:
     return entry if isinstance(entry, dict) else None
 
 
+def list_orphaned_provider_keys() -> list[dict[str, Any]]:
+    """Return key pools stored in the secret store with no matching provider config.
+
+    A provider deleted outside this app (or by an older version) leaves its
+    key pool behind; this surfaces those leftovers so they can be cleaned.
+    """
+    from . import secrets as secretstore
+
+    cfg = load_models_config()
+    providers = cfg.get("providers") or {}
+    orphaned: list[dict[str, Any]] = []
+    for provider, _pool_name, _single_name in secretstore.provider_pool_names():
+        if provider in providers:
+            continue
+        keys = secretstore.list_provider_keys(provider)
+        orphaned.append(
+            {
+                "provider": provider,
+                "key_count": len(keys),
+                "statuses": sorted({str(k.get("status") or "") for k in keys}),
+                "masked": [str(k.get("masked") or "") for k in keys][:3],
+            }
+        )
+    return orphaned
+
+
+def delete_orphaned_provider_keys() -> int:
+    """Delete key pools whose provider no longer exists in models.json."""
+    from . import secrets as secretstore
+
+    cfg = load_models_config()
+    providers = cfg.get("providers") or {}
+    deleted = 0
+    for provider, _pool_name, _single_name in secretstore.provider_pool_names():
+        if provider in providers:
+            continue
+        try:
+            secretstore.delete_provider_api_keys(provider)
+            deleted += 1
+        except Exception:
+            pass
+    return deleted
+
+
+_BACKUP_TARGETS = frozenset(
+    {
+        "settings.json",
+        "models.json",
+        "pi-manager.json",
+        "pi-manager-test-history.json",
+        "pi-manager-health.json",
+        "auth.json",
+    }
+)
+
+
+def list_config_backups() -> list[dict[str, str]]:
+    """List recoverable ``.bak.*`` config backups inside the agent directory."""
+    from datetime import datetime
+
+    rows: list[dict[str, str]] = []
+    root = pi_agent_dir()
+    if not root.exists():
+        return rows
+    for path in sorted(root.glob("*.bak.*")):
+        if not path.is_file():
+            continue
+        name = path.name
+        target_name = ""
+        for target in _BACKUP_TARGETS:
+            if name.startswith(target + ".bak."):
+                target_name = target
+                break
+        if not target_name:
+            continue
+        try:
+            st = path.stat()
+            mtime_s = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+        except OSError:
+            st = None
+            mtime_s = ""
+        rows.append(
+            {
+                "path": str(path),
+                "name": name,
+                "target": target_name,
+                "mtime": mtime_s,
+                "size": str(st.st_size) if st is not None else "",
+            }
+        )
+    return rows
+
+
+def restore_config_backup(backup_path: str | Path) -> dict[str, Any]:
+    """Restore a ``.bak.*`` backup back to its target config file (atomic).
+
+    The backup must live in the agent directory and map to a known JSON config
+    target, so no path traversal or arbitrary overwrite is possible.
+    """
+    src = Path(backup_path).resolve()
+    root = pi_agent_dir().resolve()
+    if src.parent != root:
+        return {"ok": False, "error": "备份文件必须在配置目录内"}
+    name = src.name
+    target_name = ""
+    for target in _BACKUP_TARGETS:
+        if name.startswith(target + ".bak."):
+            target_name = target
+            break
+    if not target_name:
+        return {"ok": False, "error": "不是可恢复的配置备份"}
+    try:
+        data = load_json(src, None)
+    except Exception as exc:
+        return {"ok": False, "error": f"备份内容无法解析：{exc}"}
+    try:
+        save_json(root / target_name, data)
+    except Exception as exc:
+        return {"ok": False, "error": f"恢复失败：{exc}"}
+    return {"ok": True, "target": target_name, "backup": name}
+
+
 def list_provider_api_keys(provider: str) -> list[dict[str, Any]]:
     from . import secrets as secretstore
 
@@ -2355,7 +3062,13 @@ def _http_json_request(
     insecure_ssl: bool = False,
     proxy: str = "",
 ) -> dict[str, Any]:
-    """Low-level HTTP helper with latency measurement."""
+    """Low-level HTTP helper with latency measurement.
+
+    When a proxy is in use and the request fails at the network layer (no
+    server response — e.g. a configured-but-stopped Clash), the request is
+    retried once without the proxy so an inactive proxy does not turn into a
+    bogus "unavailable" test result.
+    """
     import time
     import urllib.error
     import urllib.request
@@ -2380,66 +3093,80 @@ def _http_json_request(
             or ""
         ).strip()
 
-    handlers: list[Any] = []
-    if proxy:
-        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-    handlers.append(http_client.DenyRedirectHandler())
-    handlers.append(urllib.request.HTTPSHandler(context=_ssl_context(insecure_ssl)))
-    opener = urllib.request.build_opener(*handlers)
-
-    req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
-    t0 = time.perf_counter()
-    try:
-        with opener.open(req, timeout=timeout) as resp:
-            raw = http_client.read_limited(resp, http_client.MODEL_TEST_MAX_BYTES)
-            t1 = time.perf_counter()
-            status = getattr(resp, "status", 200)
-            text = raw.decode("utf-8", errors="replace")
-            return {
-                "ok": 200 <= int(status) < 300,
-                "status": int(status),
-                "body": text,
-                "latency_ms": round((t1 - t0) * 1000, 1),
-                "bytes": len(raw),
-                "proxy": redact_endpoint_url(proxy),
-                "error": "",
-            }
-    except urllib.error.HTTPError as e:
-        t1 = time.perf_counter()
-        err_body = ""
+    def request_once(active_proxy: str) -> dict[str, Any]:
+        handlers: list[Any] = []
+        if active_proxy:
+            handlers.append(
+                urllib.request.ProxyHandler({"http": active_proxy, "https": active_proxy})
+            )
+        else:
+            # Explicit no-proxy opener (urllib would otherwise honor env vars).
+            handlers.append(urllib.request.ProxyHandler({}))
+        handlers.append(http_client.DenyRedirectHandler())
+        handlers.append(
+            urllib.request.HTTPSHandler(context=_ssl_context(insecure_ssl))
+        )
+        opener = urllib.request.build_opener(*handlers)
+        req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
+        t0 = time.perf_counter()
         try:
-            err_body = http_client.read_limited(
-                e, http_client.ERROR_MAX_BYTES
-            ).decode("utf-8", errors="replace")[:800]
-        except Exception:
-            pass
-        return {
-            "ok": False,
-            "status": int(getattr(e, "code", 0) or 0),
-            "body": err_body,
-            "latency_ms": round((t1 - t0) * 1000, 1),
-            "bytes": len(err_body.encode("utf-8", errors="ignore")),
-            "proxy": redact_endpoint_url(proxy),
-            "error": f"HTTP {e.code}: {e.reason}",
-        }
-    except Exception as e:
-        t1 = time.perf_counter()
-        return {
-            "ok": False,
-            "status": 0,
-            "body": "",
-            "latency_ms": round((t1 - t0) * 1000, 1),
-            "bytes": 0,
-            "proxy": redact_endpoint_url(proxy),
-            "error": _friendly_fetch_error(e, url),
-        }
+            with opener.open(req, timeout=timeout) as resp:
+                raw = http_client.read_limited(resp, http_client.MODEL_TEST_MAX_BYTES)
+                t1 = time.perf_counter()
+                status = getattr(resp, "status", 200)
+                text = raw.decode("utf-8", errors="replace")
+                return {
+                    "ok": 200 <= int(status) < 300,
+                    "status": int(status),
+                    "body": text,
+                    "latency_ms": round((t1 - t0) * 1000, 1),
+                    "bytes": len(raw),
+                    "proxy": redact_endpoint_url(active_proxy),
+                    "error": "",
+                }
+        except urllib.error.HTTPError as e:
+            t1 = time.perf_counter()
+            err_body = ""
+            try:
+                err_body = http_client.read_limited(
+                    e, http_client.ERROR_MAX_BYTES
+                ).decode("utf-8", errors="replace")[:800]
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "status": int(getattr(e, "code", 0) or 0),
+                "body": err_body,
+                "latency_ms": round((t1 - t0) * 1000, 1),
+                "bytes": len(err_body.encode("utf-8", errors="ignore")),
+                "proxy": redact_endpoint_url(active_proxy),
+                "error": f"HTTP {e.code}: {e.reason}",
+            }
+        except Exception as e:
+            t1 = time.perf_counter()
+            return {
+                "ok": False,
+                "status": 0,
+                "body": "",
+                "latency_ms": round((t1 - t0) * 1000, 1),
+                "bytes": 0,
+                "proxy": redact_endpoint_url(active_proxy),
+                "error": _friendly_fetch_error(e, url),
+            }
+
+    result = request_once(proxy)
+    if not result.get("ok") and result.get("status") == 0 and proxy:
+        # Network-layer failure through the proxy (e.g. stopped Clash):
+        # retry directly once so the test does not report bogus unavailability.
+        result = request_once("")
+    return result
 
 
-def _extract_reply_preview(api: str, body_text: str) -> str:
+def _extract_reply_preview(api: str, body_text: str, limit: int = 120) -> str:
     try:
         data = json.loads(body_text or "{}")
     except Exception:
-        return (body_text or "")[:120]
+        return (body_text or "")[:limit]
 
     api = (api or "").lower()
     try:
@@ -2458,26 +3185,26 @@ def _extract_reply_preview(api: str, body_text: str) -> str:
                             parts.append(c)
                     content = "".join(parts)
                 if content:
-                    return str(content).strip()[:120]
+                    return str(content).strip()[:limit]
                 if choices[0].get("text"):
-                    return str(choices[0]["text"]).strip()[:120]
+                    return str(choices[0]["text"]).strip()[:limit]
             # responses API
             if data.get("output_text"):
-                return str(data["output_text"]).strip()[:120]
+                return str(data["output_text"]).strip()[:limit]
             output = data.get("output") or []
             for item in output:
                 if not isinstance(item, dict):
                     continue
                 for c in item.get("content") or []:
                     if isinstance(c, dict) and c.get("text"):
-                        return str(c["text"]).strip()[:120]
+                        return str(c["text"]).strip()[:limit]
         if api in {"anthropic-messages", "anthropic"}:
             content = data.get("content") or []
             for c in content:
                 if isinstance(c, dict) and c.get("type") == "text":
-                    return str(c.get("text") or "").strip()[:120]
+                    return str(c.get("text") or "").strip()[:limit]
                 if isinstance(c, dict) and c.get("text"):
-                    return str(c.get("text") or "").strip()[:120]
+                    return str(c.get("text") or "").strip()[:limit]
         if api in {"google-generative-ai", "google"}:
             cands = data.get("candidates") or []
             if cands:
@@ -2485,10 +3212,10 @@ def _extract_reply_preview(api: str, body_text: str) -> str:
                 texts = [str(p.get("text") or "") for p in parts if isinstance(p, dict)]
                 joined = "".join(texts).strip()
                 if joined:
-                    return joined[:120]
+                    return joined[:limit]
     except Exception:
         pass
-    return (body_text or "")[:120]
+    return (body_text or "")[:limit]
 
 
 def test_model_http(

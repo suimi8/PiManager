@@ -393,72 +393,81 @@ class ModernMainWindow(LegacyMainWindow):
         except Exception:
             default_provider, default_model = "", ""
         default_key = f"{default_provider}/{default_model}" if default_provider and default_model else ""
-        for row in range(self.models_table.rowCount()):
-            name_item = self.models_table.item(row, 0)
-            provider_item = self.models_table.item(row, 1)
-            if name_item is not None:
-                data = name_item.data(Qt.UserRole) or []
+        tree = self.models_table
+        for row in range(tree.topLevelItemCount()):
+            group = tree.topLevelItem(row)
+            if group is None:
+                continue
+            data = group.data(0, Qt.UserRole) or []
+            group_provider = str(data[0]) if data else ""
+            group.setForeground(
+                0, QColor(colors.accent_text if group_provider == default_provider else colors.text)
+            )
+            group.setForeground(1, QColor(colors.text_muted))
+            for col in range(group.childCount()):
+                child = group.child(col)
+                data = child.data(0, Qt.UserRole) or []
                 key = f"{data[0]}/{data[1]}" if len(data) >= 2 else ""
-                name_item.setForeground(QColor(colors.accent_text if key == default_key else colors.text))
-            if provider_item is not None:
-                provider_item.setForeground(QColor(colors.text_muted))
+                child.setForeground(0, QColor(colors.accent_text if key == default_key else colors.text))
+                child.setForeground(1, QColor(colors.text_muted))
 
     def _model_status_cells(self, m: core.ModelInfo):
-        status_item, latency_item = super()._model_status_cells(m)
+        status_text, latency_text, status_color, latency_color, status_tip, _latency_tip = (
+            super()._model_status_cells(m)
+        )
         colors = tokens_for(*self._theme_pair())
         result = self.test_results.get(m.key)
         if not result:
-            status_item.setForeground(QColor(colors.text_muted))
-            latency_item.setForeground(QColor(colors.text_muted))
-            return status_item, latency_item
+            return status_text, latency_text, QColor(colors.text_muted), QColor(colors.text_muted), status_tip, ""
         if result.get("pending"):
-            status_item.setForeground(QColor(colors.warning))
-            latency_item.setForeground(QColor(colors.warning))
-            return status_item, latency_item
+            return status_text, latency_text, QColor(colors.warning), QColor(colors.warning), status_tip, ""
         available = result.get("available")
-        status_item.setForeground(
-            QColor(
-                colors.success
-                if available is True
-                else colors.danger
-                if available is False
-                else colors.text_muted
-            )
+        status_color = QColor(
+            colors.success
+            if available is True
+            else colors.danger
+            if available is False
+            else colors.text_muted
         )
         latency = result.get("latency_ms")
         if isinstance(latency, (int, float)):
-            latency_item.setForeground(
-                QColor(
-                    colors.success
-                    if latency < 800
-                    else colors.warning
-                    if latency < 2000
-                    else colors.danger
-                )
+            latency_color = QColor(
+                colors.success
+                if latency < 800
+                else colors.warning
+                if latency < 2000
+                else colors.danger
             )
         else:
-            latency_item.setForeground(QColor(colors.text_muted))
-        return status_item, latency_item
+            latency_color = QColor(colors.text_muted)
+        return status_text, latency_text, status_color, latency_color, status_tip, ""
 
     def _refresh_model_status_colors(self) -> None:
         if not hasattr(self, "models_table"):
             return
         by_key = {model.key: model for model in self.models}
-        for row in range(self.models_table.rowCount()):
-            name_item = self.models_table.item(row, 0)
-            data = name_item.data(Qt.UserRole) if name_item is not None else None
-            if not isinstance(data, (list, tuple)) or len(data) < 2:
+        tree = self.models_table
+        for row in range(tree.topLevelItemCount()):
+            group = tree.topLevelItem(row)
+            if group is None:
                 continue
-            model = by_key.get(f"{data[0]}/{data[1]}")
-            if model is None:
-                continue
-            status_color, latency_color = self._model_status_cells(model)
-            current_status = self.models_table.item(row, 3)
-            current_latency = self.models_table.item(row, 4)
-            if current_status is not None:
-                current_status.setForeground(status_color.foreground())
-            if current_latency is not None:
-                current_latency.setForeground(latency_color.foreground())
+            for col in range(group.childCount()):
+                child = group.child(col)
+                data = child.data(0, Qt.UserRole)
+                if not isinstance(data, (list, tuple)) or len(data) < 2:
+                    continue
+                model = by_key.get(f"{data[0]}/{data[1]}")
+                if model is None:
+                    continue
+                status_text, latency_text, status_color, latency_color, status_tip, _ = (
+                    self._model_status_cells(model)
+                )
+                child.setText(3, status_text)
+                child.setText(4, latency_text)
+                child.setForeground(3, status_color)
+                child.setForeground(4, latency_color)
+                if status_tip:
+                    child.setToolTip(3, status_tip)
 
     def _on_model_selection_changed(self) -> None:
         if not hasattr(self, "model_detail_title"):

@@ -46,6 +46,29 @@ def main():
         from pi_manager.provider_env import main as provider_env_main
 
         return provider_env_main(sys.argv[2:])
+    if len(sys.argv) >= 2 and sys.argv[1] == "--vision-describe":
+        # Lightweight image understanding entry for Pi skills: no GUI import.
+        import json
+
+        from pi_manager.core import describe_image
+
+        path = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not path:
+            print(json.dumps({"ok": False, "error": "usage: --vision-describe <image-path> [prompt]"}))
+            return 2
+        prompt = " ".join(sys.argv[3:]) or ""
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            print(json.dumps({"ok": False, "error": f"无法读取图片：{exc}"}))
+            return 2
+        result = describe_image(data, prompt=prompt or None)
+        if result.get("ok"):
+            print(result.get("description") or "")
+            return 0
+        print(json.dumps({"ok": False, "error": result.get("error") or "识图失败"}))
+        return 1
     if len(sys.argv) >= 2 and sys.argv[1] == "--config-mutate":
         import json
 

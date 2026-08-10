@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QPlainTextEdit,
     QScrollArea,
@@ -128,6 +129,47 @@ def build_settings_page(window) -> QWidget:
     reliability_form.addRow("", window.chat_persistent_session)
     reliability.body_layout.addLayout(reliability_form)
     layout.addWidget(reliability)
+
+    vision = CollapsibleSection(
+        "识图模型",
+        "快速提问中粘贴/拖入图片时，自动用内置免费识图模型 GLM-4.6V-Flash（智谱 AI）识别，再转成文本交给当前对话模型。",
+        expanded=False,
+    )
+    vision_form = _form()
+    window.zhipu_key_edit = QLineEdit()
+    window.zhipu_key_edit.setEchoMode(QLineEdit.Password)
+    window.zhipu_key_edit.setPlaceholderText("智谱 API Key（免费申请：https://bigmodel.cn）")
+    window.vision_model_combo = QComboBox()
+    window.vision_model_combo.addItem("自动（GLM-4.6V-Flash 优先，限流时切换 4.1V-Thinking）", "")
+    window.vision_model_combo.addItem("GLM-4.6V-Flash", "glm-4.6v-flash")
+    window.vision_model_combo.addItem("GLM-4.1V-Thinking-Flash（免费 · 深度思考）", "glm-4.1v-thinking-flash")
+    vision_form.addRow("智谱 API Key", window.zhipu_key_edit)
+    vision_form.addRow("识图模型", window.vision_model_combo)
+    vision_hint = QLabel(
+        "内置两个免费视觉模型：GLM-4.6V-Flash（快速）与 GLM-4.1V-Thinking-Flash（深度思考，免费版）。\n"
+        "识图模型默认用于识图管道，不自动出现在模型列表中：粘贴/拖入图片时由 Pi skill 自动调用识图转文字，\n"
+        "再把结果交给当前默认对话模型回答；如要在模型列表中使用智谱模型，请在 Provider 管理中手动添加。\n"
+        "「自动」模式在 4.6V-Flash 限流（429）时自动切换到 4.1V-Thinking 重试；Key 加密保存在本机密钥库。"
+    )
+    vision_hint.setObjectName("subtitle")
+    vision_hint.setWordWrap(True)
+    vision_form.addRow("", vision_hint)
+    vision.body_layout.addLayout(vision_form)
+    vision_actions = QHBoxLayout()
+    vision_actions.setSpacing(8)
+    vision_actions.addWidget(
+        window._btn("用红色测试图验证识图", window.vision_test_run, success=True)
+    )
+    vision_actions.addWidget(
+        window._btn("检查识图配置", window.vision_check_config, secondary=True)
+    )
+    vision_actions.addStretch(1)
+    vision.body_layout.addLayout(vision_actions)
+    window.vision_test_status = QLabel("尚未测试 — 点击按钮将生成一张红色图片并调用识图模型")
+    window.vision_test_status.setObjectName("subtitle")
+    window.vision_test_status.setWordWrap(True)
+    vision.body_layout.addWidget(window.vision_test_status)
+    layout.addWidget(vision)
 
     system = CollapsibleSection(
         "系统行为与安全",
