@@ -55,7 +55,9 @@ def resolve_onefile(dist: Path, plat: str) -> Path | None:
         candidate = dist / "PiManager.app" / "Contents" / "MacOS" / "PiManager"
     else:
         candidate = dist / "PiManager"
-    return candidate if candidate.exists() else None
+    # Onedir builds keep a directory named like the binary; only a real
+    # standalone file at this location is a onefile product.
+    return candidate if candidate.is_file() else None
 
 
 def run_self_check(binary: Path, plat: str, env: dict[str, str], timeout: int) -> tuple[int, str]:
