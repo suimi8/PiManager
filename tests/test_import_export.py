@@ -147,6 +147,71 @@ def test_command_headers_and_non_string_headers_are_rejected(isolated_home, tmp_
         assert core.get_provider_config("Command Provider") is None
 
 
+def test_import_rejects_non_public_model_base_urls(isolated_home, tmp_path):
+    cases = [
+        "file:///etc/passwd",
+        "ftp://example.invalid/v1",
+        "gopher://example.invalid/1",
+        "http://127.0.0.1:8080/v1",
+        "http://localhost:8080/v1",
+        "http://10.0.0.5/v1",
+        "http://172.16.3.4/v1",
+        "http://192.168.1.10/v1",
+        "http://169.254.169.254/latest/meta-data",
+        "http://[::1]:8080/v1",
+        "http://[fe80::1]/v1",
+        "http://ollama.local:11434/v1",
+    ]
+    for index, base_url in enumerate(cases):
+        bundle = tmp_path / f"local-base-{index}.zip"
+        models = {
+            "providers": {
+                "Local Host": {
+                    "baseUrl": base_url,
+                    "apiKey": "${SAFE_KEY}",
+                    "models": [],
+                }
+            }
+        }
+        _write_zip(bundle, {"models.json": json.dumps(models)})
+        rejected = extras.import_config_bundle(str(bundle))
+        assert rejected["ok"] is False
+        assert "baseUrl" in rejected["error"]
+        assert "手动添加" in rejected["error"]
+        assert core.get_provider_config("Local Host") is None
+
+
+def test_import_accepts_public_model_base_url(isolated_home, tmp_path):
+    bundle = tmp_path / "public-base.zip"
+    models = {
+        "providers": {
+            "Public Host": {
+                "baseUrl": "https://api.example.invalid/v1",
+                "apiKey": "${SAFE_KEY}",
+                "models": [],
+            }
+        }
+    }
+    _write_zip(bundle, {"models.json": json.dumps(models)})
+    imported = extras.import_config_bundle(str(bundle))
+    assert imported["ok"] is True
+    assert core.get_provider_config("Public Host") is not None
+
+
+def test_import_rejects_invalid_manager_proxy_url(isolated_home, tmp_path):
+    for index, proxy_url in enumerate(
+        ["ftp://proxy.example:8080", "file:///etc/passwd", "not-a-url"]
+    ):
+        bundle = tmp_path / f"proxy-{index}.zip"
+        _write_zip(
+            bundle,
+            {"pi-manager.json": json.dumps({"proxy_url": proxy_url})},
+        )
+        rejected = extras.import_config_bundle(str(bundle))
+        assert rejected["ok"] is False
+        assert "代理" in rejected["error"]
+
+
 def test_normal_export_removes_proxy_credentials(isolated_home, tmp_path):
     manager = core.load_manager_config()
     manager["proxy_url"] = "http://user:password@proxy.example:8080"

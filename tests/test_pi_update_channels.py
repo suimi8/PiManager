@@ -145,3 +145,31 @@ def test_node_20_install_uses_legacy_dist_tag(monkeypatch):
     assert calls == [
         ["npm", "install", "-g", "@earendil-works/pi-coding-agent@legacy-node20"]
     ]
+
+
+def test_parse_favorite_key_is_public_with_private_alias():
+    assert core.parse_favorite_key("ProviderA/model-x") == ("ProviderA", "model-x")
+    assert core._parse_favorite_key("ProviderA/model-x") == ("ProviderA", "model-x")
+    assert core.parse_favorite_key("no-slash") is None
+    assert core.parse_favorite_key("/model") is None
+    assert core.parse_favorite_key("Provider/") is None
+    assert core.parse_favorite_key("  P / m  ") == ("P", "m")
+
+
+def test_default_thinking_level_constant(isolated_home):
+    assert core.DEFAULT_THINKING_LEVEL == "medium"
+    assert core.get_default_model()[2] == core.DEFAULT_THINKING_LEVEL
+
+
+def test_sanitize_proxy_env_is_public_with_private_alias(monkeypatch):
+    monkeypatch.setattr(core, "proxy_reachable", lambda url, timeout=0.4: False)
+    env = {"HTTPS_PROXY": "http://127.0.0.1:1", "KEEP": "x"}
+    assert core.sanitize_proxy_env(env) == {"KEEP": "x"}
+    assert core._sanitize_proxy_env(env) == {"KEEP": "x"}
+    assert core.sanitize_proxy_env({"KEEP": "x"}) == {"KEEP": "x"}
+
+
+def test_project_name_from_path_is_public_with_private_alias():
+    assert core.project_name_from_path(r"C:\Users\me\app") == "app"
+    assert core._project_name_from_path(r"C:\Users\me\app") == "app"
+    assert core.project_name_from_path("C:\\") == "C:"

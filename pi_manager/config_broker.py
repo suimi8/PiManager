@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import os
 from pathlib import Path
 from typing import Any
 
-from . import core, storage
+from . import core, secrets, storage
 
 _ALLOWED_MANAGER_FIELDS = frozenset(
     {
@@ -17,6 +19,45 @@ _ALLOWED_MANAGER_FIELDS = frozenset(
         "failover_silent",
     }
 )
+
+
+def broker_token_path() -> Path:
+    return secrets.broker_token_path()
+
+
+def _create_broker_token() -> str:
+    token = os.urandom(32).hex()
+    path = broker_token_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(path, flags, 0o600) if os.name != "nt" else os.open(path, flags)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(token.encode("ascii"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        return token
+    except Exception:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _verify_broker_token(provided: str) -> bool:
+    path = broker_token_path()
+    if not path.exists():
+        try:
+            _create_broker_token()
+            return True
+        except FileExistsError:
+            pass
+    try:
+        stored = path.read_text(encoding="utf-8", errors="strict").strip()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return hmac.compare_digest((provided or "").strip(), stored)
 
 
 def _revision_path() -> Path:
@@ -47,6 +88,12 @@ def _record_revision(path: Path) -> int:
 
 def mutate(request: dict[str, Any]) -> dict[str, Any]:
     request_id = str(request.get("request_id") or "")
+    if not _verify_broker_token(str(request.get("token") or "")):
+        return {
+            "ok": False,
+            "request_id": request_id,
+            "error": "broker token 校验失败，请求已被拒绝",
+        }
     if int(request.get("schema_version") or 0) != 1:
         return {"ok": False, "request_id": request_id, "error": "unsupported_schema"}
     operation = str(request.get("operation") or "")

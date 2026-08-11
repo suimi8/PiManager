@@ -3,6 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const https = require("https");
+const crypto = require("crypto");
 const { execFile } = require("child_process");
 const { chatWithFailover, normalizeModelPair } = require("./failover");
 const { commandParts, resolveCommand } = require("./invocation");
@@ -237,11 +238,11 @@ function invokeConfigBroker(operation, args) {
   }
   const requestPath = path.join(
     os.tmpdir(),
-    `pi-manager-config-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`
+    `pi-manager-config-${process.pid}-${Date.now()}-${crypto.randomUUID()}.json`
   );
   const request = {
     schema_version: 1,
-    request_id: `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    request_id: `${process.pid}-${Date.now()}-${crypto.randomUUID()}`,
     operation,
     arguments: args || {},
   };
@@ -252,7 +253,7 @@ function invokeConfigBroker(operation, args) {
   }
   const responsePath = path.join(
     os.tmpdir(),
-    `pi-manager-config-response-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`
+    `pi-manager-config-response-${process.pid}-${Date.now()}-${crypto.randomUUID()}.json`
   );
   try {
     const fd = fs.openSync(responsePath, "wx", 0o600);
@@ -301,7 +302,7 @@ function invokeProviderHelper(provider, helperArgs = []) {
   return new Promise((resolve, reject) => {
     const output = path.join(
       os.tmpdir(),
-      `pi-manager-env-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`
+      `pi-manager-env-${process.pid}-${Date.now()}-${crypto.randomUUID()}.json`
     );
     try {
       const fd = fs.openSync(output, "wx", 0o600);
@@ -411,8 +412,9 @@ function piInvocation(piCommand = findPiCommand()) {
   return resolveCommand(piCommand, (candidate) => fs.existsSync(candidate)) || { bin: "pi", args: [] };
 }
 
-function shellQuote(s) {
+function shellQuote(s, shim = false) {
   if (process.platform === "win32") {
+    if (shim) s = String(s).replace(/%/g, "%%");
     if (!/[ \t"&<>|^]/.test(s) && !s.includes("@")) return s;
     return `"${String(s).replace(/"/g, '""')}"`;
   }
@@ -453,7 +455,7 @@ function terminalProcessSpec(spec) {
   if (process.platform !== "win32" || !/\.(cmd|bat)$/i.test(String(spec.executable))) {
     return spec;
   }
-  const command = [shellQuote(String(spec.executable)), ...spec.args.map((arg) => shellQuote(String(arg)))].join(" ");
+  const command = [shellQuote(String(spec.executable), true), ...spec.args.map((arg) => shellQuote(String(arg), true))].join(" ");
   return {
     executable: process.env.ComSpec || "cmd.exe",
     args: ["/d", "/s", "/c", command],
@@ -630,7 +632,7 @@ function buildRpcSpawnSpec({ env, provider, model, sessionId, cwd }) {
   args.push(...commandParts(executableConfiguration("extraArgs", "")));
   args.push("--session-id", sessionId, "-n", "Cursor 快速提问");
   if (process.platform === "win32" && /\.(cmd|bat)$/i.test(String(bin))) {
-    const command = [shellQuote(String(bin)), ...args.map((arg) => shellQuote(String(arg)))].join(" ");
+    const command = [shellQuote(String(bin), true), ...args.map((arg) => shellQuote(String(arg), true))].join(" ");
     bin = process.env.ComSpec || "cmd.exe";
     args = ["/d", "/s", "/c", command];
   }
@@ -722,7 +724,7 @@ function runPiPrompt(prompt, provider, model, cwd) {
         let runBin = bin;
         let runArgs = [...args];
         if (process.platform === "win32" && /\.(cmd|bat)$/i.test(String(runBin))) {
-          const command = [shellQuote(String(runBin)), ...runArgs.map((arg) => shellQuote(String(arg)))].join(" ");
+          const command = [shellQuote(String(runBin), true), ...runArgs.map((arg) => shellQuote(String(arg), true))].join(" ");
           runBin = process.env.ComSpec || "cmd.exe";
           runArgs = ["/d", "/s", "/c", command];
         }
@@ -1208,7 +1210,30 @@ class PiManagerViewProvider {
   }
 }
 
+function cleanupStaleTempFiles() {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  let names;
+  try {
+    names = fs.readdirSync(os.tmpdir());
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (
+      !name.startsWith("pi-manager-env-") &&
+      !name.startsWith("pi-manager-config-response-")
+    ) {
+      continue;
+    }
+    const file = path.join(os.tmpdir(), name);
+    try {
+      if (fs.statSync(file).mtimeMs < cutoff) fs.unlinkSync(file);
+    } catch {}
+  }
+}
+
 function activate(context) {
+  cleanupStaleTempFiles();
   askOutput = vscode.window.createOutputChannel("Pi Ask");
   context.subscriptions.push(askOutput);
   viewProvider = new PiManagerViewProvider(context.extensionUri);

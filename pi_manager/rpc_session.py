@@ -9,6 +9,7 @@ restarts too.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -20,8 +21,11 @@ from typing import Any
 from . import core
 from . import secrets as secretstore
 
+logger = logging.getLogger(__name__)
+
 _COMMAND_TIMEOUT = 30.0
 _PROMPT_TIMEOUT = 180.0
+_RUNTIME_RETRY_COOLDOWN = 30.0
 
 
 class RpcSessionError(RuntimeError):
@@ -84,9 +88,10 @@ class PiRpcSession:
 
     def close(self) -> None:
         try:
-            self._proc.kill()
-        except Exception:
-            pass
+            if self._proc.poll() is None:
+                self._proc.kill()
+        except Exception as exc:
+            logger.warning("关闭 Pi RPC 进程失败: %s", exc)
         self._on_exit("closed")
 
     def _read_stdout(self) -> None:
@@ -100,16 +105,16 @@ class PiRpcSession:
                 except ValueError:
                     continue
                 self._handle(message)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("读取 Pi RPC stdout 失败: %s", exc)
         self._on_exit(f"exit code={self._proc.poll()}")
 
     def _read_stderr(self) -> None:
         try:
             for line in self._proc.stderr or []:
                 self._stderr_tail = (self._stderr_tail + line)[-4000:]
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("读取 Pi RPC stderr 失败: %s", exc)
 
     def _handle(self, message: Any) -> None:
         if not isinstance(message, dict):
@@ -274,6 +279,7 @@ class PiRpcSession:
 _manager_lock = threading.Lock()
 _entry: dict[str, Any] | None = None
 _runtime_disabled = False
+_runtime_disabled_since = 0.0
 _idle_timer: threading.Timer | None = None
 
 
@@ -322,8 +328,11 @@ def _reap_idle_session() -> None:
 
 
 def rpc_chat_enabled() -> bool:
+    global _runtime_disabled
     if _runtime_disabled:
-        return False
+        if time.monotonic() - _runtime_disabled_since < _RUNTIME_RETRY_COOLDOWN:
+            return False
+        _runtime_disabled = False
     try:
         mgr = core.load_manager_config()
     except Exception:
@@ -363,19 +372,19 @@ def _ensure(
     )
     if respawn:
         session_id = entry["session_id"] if entry else str(uuid.uuid4())
-        env_by_provider: dict[str, dict[str, str]] = dict(entry["env_by_provider"]) if entry else {}
-        env_by_provider[provider] = dict(provider_env)
+        env_by_provider = {provider: dict(provider_env)}
         if entry is not None:
             entry["session"].close()
-        merged: dict[str, str] = {}
-        for env in env_by_provider.values():
-            merged.update(env)
-        argv = core.pi_base_cmd() + ["--mode", "rpc", "--provider", provider, "--model", model]
+        base = core.pi_base_cmd()
+        argv = base + core.escape_cmd_shim_args(
+            ["--mode", "rpc", "--provider", provider, "--model", model],
+            base,
+        )
         if thinking:
             argv += ["--thinking", thinking]
         argv += ["--session-id", session_id, "-n", "PiManager 快速提问"]
-        spawn_env = core._sanitize_proxy_env(os.environ.copy())
-        spawn_env.update(merged)
+        spawn_env = core.sanitize_proxy_env(os.environ.copy())
+        spawn_env.update(dict(provider_env))
         session = PiRpcSession(argv, env=spawn_env, cwd=workdir or None)
         _entry = {
             "session": session,
@@ -421,9 +430,11 @@ def rpc_chat_once(
     via the sticky session id); other failures are returned for the model
     failover layer to count.
     """
-    global _entry, _runtime_disabled
+    global _entry, _runtime_disabled, _runtime_disabled_since
     if not provider or not model:
         return _failed(provider, model, "Provider 和 Model 必须成对指定")
+    if _runtime_disabled and time.monotonic() - _runtime_disabled_since >= _RUNTIME_RETRY_COOLDOWN:
+        _runtime_disabled = False
     attempted: set[str] = set()
     last: dict[str, Any] | None = None
     while True:
@@ -447,9 +458,11 @@ def rpc_chat_once(
                     _entry = None
             if exc.unavailable:
                 _runtime_disabled = True
+                _runtime_disabled_since = time.monotonic()
             result = _failed(provider, model, str(exc))
         except FileNotFoundError as exc:
             _runtime_disabled = True
+            _runtime_disabled_since = time.monotonic()
             return _failed(provider, model, str(exc))
         with _manager_lock:
             if _entry is not None:
@@ -457,6 +470,8 @@ def rpc_chat_once(
                 _schedule_idle_reaper()
         result["provider"], result["model"] = provider, model
         if result.get("ok") or not key_id:
+            if result.get("ok"):
+                _runtime_disabled = False
             return result
         classification = core.classify_provider_key_failure(
             int(result.get("returncode") or -1),

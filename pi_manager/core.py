@@ -22,7 +22,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import secrets as secretstore
 from . import storage
+
+logger = logging.getLogger(__name__)
 
 
 def user_home() -> Path:
@@ -30,7 +33,7 @@ def user_home() -> Path:
 
 
 def pi_agent_dir() -> Path:
-    return user_home() / ".pi" / "agent"
+    return secretstore.config_dir()
 
 
 def models_path() -> Path:
@@ -64,6 +67,7 @@ def load_json(path: Path, default: Any) -> Any:
 def save_json(path: Path, data: Any, *, private: bool = False) -> None:
     ensure_agent_dir()
     storage.save_json(path, data, private=private)
+    _invalidate_config_cache(path)
 
 
 def mask_secret(value: str | None, keep: int = 4) -> str:
@@ -134,6 +138,22 @@ def pi_base_cmd() -> list[str]:
     return [raw]
 
 
+def escape_cmd_shim_args(
+    args: list[str], base: list[str] | None = None
+) -> list[str]:
+    """Escape % to %% when the pi launcher is a cmd.exe batch shim.
+
+    cmd.exe re-expands %VAR% in the /c command line before a .cmd/.bat script
+    runs; escaping keeps literal percents so injected provider key env names
+    are never substituted into the script's arguments.
+    """
+    if base is None:
+        base = pi_base_cmd()
+    if sys.platform == "win32" and base and base[0].lower() in {"cmd.exe", "cmd"}:
+        return [arg.replace("%", "%%") for arg in args]
+    return list(args)
+
+
 def list_terminal_options() -> list[tuple[str, str]]:
     from . import platform_util as pu
 
@@ -186,7 +206,74 @@ def proxy_reachable(proxy_url: str, timeout: float = 0.4) -> bool:
         return False
 
 
-def _sanitize_proxy_env(env: dict[str, str]) -> dict[str, str]:
+def _is_private_host(hostname: str) -> bool:
+    """True for loopback / link-local / private network hosts (RFC 1918 etc.).
+
+    Local model servers (Ollama, LM Studio, ...) are legitimate plaintext
+    targets; remote ones are not.
+    """
+    import ipaddress
+
+    host = (hostname or "").strip().strip("[]").lower()
+    if not host or host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+    )
+
+
+def _check_request_scheme(url: str) -> str:
+    """Return '' when the URL may be requested, else a Chinese error message.
+
+    urllib's default handlers support file:// reads; only http(s) targets are
+    ever allowed here. http to a non-local host is allowed but logs a warning
+    that the key will travel in plaintext.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(str(url or ""))
+        scheme = (parts.scheme or "").lower()
+    except (TypeError, ValueError):
+        return "Base URL 不是合法的 http/https 地址。"
+    if scheme not in {"http", "https"}:
+        return f"Base URL 仅允许 http/https 协议，已拒绝 {scheme or '未知'}:// 请求。"
+    if scheme == "http" and not _is_private_host(str(parts.hostname or "")):
+        logger.warning(
+            "请求目标 %s 使用明文 HTTP：密钥将以明文发送。建议改用 https://。",
+            str(parts.hostname or ""),
+        )
+    return ""
+
+
+def validate_proxy_url(proxy_url: str) -> str:
+    """Return '' for a usable proxy URL, else a Chinese error message."""
+    from urllib.parse import urlsplit
+
+    value = (proxy_url or "").strip()
+    if not value:
+        return "代理地址不能为空。"
+    try:
+        parts = urlsplit(value)
+    except (TypeError, ValueError):
+        return "代理地址格式非法，应为 http://127.0.0.1:7890 形式。"
+    scheme = (parts.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        return f"代理地址仅支持 http/https 协议，当前为 {scheme or '空'}://。"
+    if not parts.hostname:
+        return "代理地址缺少主机名（host）。"
+    return ""
+
+
+def sanitize_proxy_env(env: dict[str, str]) -> dict[str, str]:
     """Drop proxy env vars that point at unreachable endpoints.
 
     A configured-but-stopped Clash/other proxy makes every child process fail
@@ -205,6 +292,9 @@ def _sanitize_proxy_env(env: dict[str, str]) -> dict[str, str]:
     return result
 
 
+_sanitize_proxy_env = sanitize_proxy_env
+
+
 def run_pi(
     args: list[str],
     *,
@@ -213,11 +303,12 @@ def run_pi(
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run Pi with real-time 8 MiB limits for stdout and stderr."""
-    cmd = pi_base_cmd() + args
+    base = pi_base_cmd()
+    cmd = base + escape_cmd_shim_args(args, base)
     full_env = os.environ.copy()
     if env:
         full_env.update(env)
-    full_env = _sanitize_proxy_env(full_env)
+    full_env = sanitize_proxy_env(full_env)
     full_env.setdefault("PYTHONIOENCODING", "utf-8")
     output_limit = 8 * 1024 * 1024
     creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -376,6 +467,15 @@ _CONFIG_CACHE: dict[str, tuple[int, int, Any]] = {}
 _CONFIG_CACHE_LOCK = threading.Lock()
 
 
+def _invalidate_config_cache(path: Path | None = None) -> None:
+    """Drop cached config entries after an in-process write."""
+    with _CONFIG_CACHE_LOCK:
+        if path is None:
+            _CONFIG_CACHE.clear()
+        else:
+            _CONFIG_CACHE.pop(str(path), None)
+
+
 def _load_json_cached(path: Path, default: Any) -> Any:
     """load_json with an (mtime_ns, size)-keyed cache for hot-path configs.
 
@@ -506,9 +606,10 @@ def load_models_config() -> dict[str, Any]:
             cfg["providers"] = updated_providers
             try:
                 save_models_config(cfg)
-            except Exception:
-                # Keep the in-memory config usable if models.json is temporarily locked.
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "保存默认 User-Agent 头失败，models.json 与内存配置可能不一致: %s", exc
+                )
     return cfg
 
 
@@ -653,6 +754,9 @@ def normalize_model_pair(
     return p, m
 
 
+DEFAULT_THINKING_LEVEL = "medium"
+
+
 def set_default_model(provider: str, model: str, thinking: str | None = None) -> dict[str, Any]:
     pair = normalize_model_pair(provider, model, allow_empty=False)
     assert pair is not None
@@ -671,7 +775,7 @@ def get_default_model() -> tuple[str, str, str]:
     return (
         str(s.get("defaultProvider") or ""),
         str(s.get("defaultModel") or ""),
-        str(s.get("defaultThinkingLevel") or "medium"),
+        str(s.get("defaultThinkingLevel") or DEFAULT_THINKING_LEVEL),
     )
 
 
@@ -729,12 +833,12 @@ def upsert_custom_provider(
     # vision skill is installed so image handling works out of the box.
     try:
         install_vision_skill()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("安装 vision skill 失败: %s", exc)
     return cfg
 
 
-def _parse_favorite_key(key: str) -> tuple[str, str] | None:
+def parse_favorite_key(key: str) -> tuple[str, str] | None:
     key = (key or "").strip()
     if "/" not in key:
         return None
@@ -743,6 +847,9 @@ def _parse_favorite_key(key: str) -> tuple[str, str] | None:
     if not provider or not model:
         return None
     return provider, model
+
+
+_parse_favorite_key = parse_favorite_key
 
 
 def purge_favorites(
@@ -764,7 +871,7 @@ def purge_favorites(
     kept: list[str] = []
     removed: list[str] = []
     for key in favs:
-        parsed = _parse_favorite_key(str(key))
+        parsed = parse_favorite_key(str(key))
         if not parsed:
             kept.append(str(key))
             continue
@@ -810,7 +917,7 @@ def purge_favorites(
     if need_redefault:
         next_p, next_m = "", ""
         for key in kept:
-            parsed = _parse_favorite_key(str(key))
+            parsed = parse_favorite_key(str(key))
             if parsed:
                 next_p, next_m = parsed
                 break
@@ -856,7 +963,7 @@ def purge_enabled_models(
     removed: list[str] = []
     for pattern in patterns:
         key = str(pattern)
-        parsed = _parse_favorite_key(key)
+        parsed = parse_favorite_key(key)
         if not parsed:
             kept.append(key)
             continue
@@ -893,7 +1000,7 @@ def list_stale_enabled_models(builtin_providers: set[str] | None = None) -> list
     custom = set(cfg.get("providers") or {})
     stale: list[str] = []
     for pattern in patterns:
-        parsed = _parse_favorite_key(str(pattern))
+        parsed = parse_favorite_key(str(pattern))
         if not parsed:
             continue
         p, _m = parsed
@@ -919,18 +1026,20 @@ def delete_custom_provider(name: str) -> dict[str, Any]:
         if isinstance(deleted_entry, dict) and isinstance(deleted_entry.get("headers"), dict):
             secretstore.delete_provider_header_secrets(name, deleted_entry["headers"])
         secretstore.delete_provider_api_keys(name)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("删除 provider「%s」的密钥/头清理失败: %s", name, exc)
     # 同步清理收藏，并在默认属于该 Provider 时切换到下一个收藏
     try:
         cfg["_purge"] = purge_favorites(provider=name, redefault=True)
-    except Exception:
+    except Exception as exc:
+        logger.warning("删除 provider「%s」后清理收藏失败: %s", name, exc)
         cfg["_purge"] = {"removed_favorites": [], "favorites": [], "default_changed": False}
     # 同步清理 settings.enabledModels 中的残留模式，避免 Pi 每次启动
     # 输出 "No models match pattern" 警告并污染测试结果
     try:
         cfg["_purged_enabled"] = purge_enabled_models(provider=name)
-    except Exception:
+    except Exception as exc:
+        logger.warning("删除 provider「%s」后清理 enabledModels 失败: %s", name, exc)
         cfg["_purged_enabled"] = []
     return cfg
 
@@ -961,11 +1070,13 @@ def remove_model_from_provider(provider: str, model_id: str) -> dict[str, Any]:
         save_models_config(cfg)
     try:
         cfg["_purge"] = purge_favorites(provider=provider, model=model_id, redefault=True)
-    except Exception:
+    except Exception as exc:
+        logger.warning("移除模型后清理收藏失败: %s", exc)
         cfg["_purge"] = {"removed_favorites": [], "favorites": [], "default_changed": False}
     try:
         cfg["_purged_enabled"] = purge_enabled_models(provider=provider, model=model_id)
-    except Exception:
+    except Exception as exc:
+        logger.warning("移除模型后清理 enabledModels 失败: %s", exc)
         cfg["_purged_enabled"] = []
     return cfg
 
@@ -1006,16 +1117,14 @@ def launch_pi_interactive(
         provider=provider, model=model, thinking=thinking, extra=extra
     )
     pi_args = append_language_args(pi_args)
+    pi_args = append_vision_args(pi_args)
     base = pi_base_cmd()
     full_cmd_list = base + pi_args
     workdir = workdir or str(user_home())
-    # Inject the target provider's key when one is selected; otherwise inject
-    # every custom provider's keys so the session still has usable models
-    # (Pi reads apiKey references from the environment).
     if provider:
         child_env = provider_runtime_env(provider)
     else:
-        child_env = all_provider_runtime_env(strict=False)
+        child_env = {}
     return pu.launch_in_terminal(
         full_cmd_list,
         workdir,
@@ -1074,24 +1183,34 @@ def run_pi_print(
 
 
 def _decode_session_folder_slug(slug: str) -> str:
-    """Pi 将 cwd 编码为目录名，如 --C--Users-suimi-Desktop-app-- → C:\\Users\\suimi\\Desktop\\app。"""
+    """Pi 把 cwd 编码为会话目录名，如 --C--Users-suimi-Desktop-app-- → C:\\Users\\suimi\\Desktop\\app。
+
+    编码规则（Pi 0.84.1 及旧版一致）：去掉首分隔符后把 \\ / : 替换为 "-"
+    （旧版 Pi 把盘符冒号编码为 "--"），再包一层 "--"。编码有损（连字符与
+    分隔符同形），解码为兜底展示，jsonl 中的 cwd 才是权威值。
+    """
     s = (slug or "").strip()
     if not s or s in {".", ""}:
         return s
-    # Windows: --C--Users-suimi-Desktop-app--
-    m = re.match(r"^--([A-Za-z])--(.+)--$", s)
-    if m:
-        drive = m.group(1).upper()
-        rest = m.group(2).replace("-", "\\")
-        return f"{drive}:\\{rest}"
-    # 退化：去掉两侧 --
-    if s.startswith("--") and s.endswith("--") and len(s) > 4:
-        body = s[2:-2]
-        return "/" + body.replace("-", "/")
-    return s
+    if not s.startswith("--") or not s.endswith("--") or len(s) <= 4:
+        return s
+    body = s[2:-2]
+    if not body:
+        return s
+    # Windows 会话目录保留盘符：--C--Users-...--（旧版）或 --C-Users-...--（新版）；
+    # 盘符后的 "--" 是路径中的字面连字符（旧版编码的盘符冒号已在上一步消费），
+    # 只把单个 "-" 分隔符还原为反斜杠。
+    if sys.platform == "win32":
+        m = re.match(r"^([A-Za-z])--?(.+)$", body)
+        if m:
+            drive = m.group(1).upper()
+            rest = re.sub(r"(?<!-)-(?!-)", "\\\\", m.group(2))
+            return f"{drive}:\\{rest}"
+    # 其余平台按实际编码规则还原：去掉两侧 -- 后把单个 "-" 分隔符还原为 "/"
+    return "/" + re.sub(r"(?<!-)-(?!-)", "/", body)
 
 
-def _project_name_from_path(path_str: str) -> str:
+def project_name_from_path(path_str: str) -> str:
     p = Path(path_str or "")
     name = p.name.strip() if str(p) else ""
     if name:
@@ -1099,6 +1218,9 @@ def _project_name_from_path(path_str: str) -> str:
     # Windows 根目录 C:\
     s = str(path_str or "").rstrip("\\/")
     return s or "（未知项目）"
+
+
+_project_name_from_path = project_name_from_path
 
 
 def _parse_session_meta(path: Path) -> dict[str, str]:
@@ -1131,7 +1253,7 @@ def _parse_session_meta(path: Path) -> dict[str, str]:
                     cwd = str(obj.get("cwd") or "").strip()
                     if cwd:
                         meta["cwd"] = cwd
-                        meta["project"] = _project_name_from_path(cwd)
+                        meta["project"] = project_name_from_path(cwd)
                     sid = str(obj.get("id") or "").strip()
                     if sid:
                         meta["session_id"] = sid
@@ -1205,7 +1327,7 @@ def list_sessions(limit: int = 50) -> list[dict[str, str]]:
             folder_slug = str(p.parent.relative_to(root)) if p.parent != root else "."
             meta = _parse_session_meta(p)
             cwd = meta.get("cwd") or _decode_session_folder_slug(folder_slug)
-            project = meta.get("project") or _project_name_from_path(cwd)
+            project = meta.get("project") or project_name_from_path(cwd)
             # 时间展示
             from datetime import datetime
 
@@ -1341,6 +1463,47 @@ def append_language_args(args: list[str], lang: str | None = None) -> list[str]:
     if text.strip():
         args = list(args) + ["--append-system-prompt", text.strip()]
     return args
+
+
+def _helper_command_text() -> str:
+    """Shell-quoted helper command for prompts/skills (single source of truth)."""
+    import shlex
+
+    try:
+        from .helper_registry import current_helper_command
+
+        return " ".join(shlex.quote(str(part)) for part in current_helper_command())
+    except Exception:
+        if getattr(sys, "frozen", False):
+            return shlex.quote(sys.executable)
+        main_path = Path(__file__).resolve().parents[1] / "main.py"
+        return f"{shlex.quote(sys.executable)} {shlex.quote(str(main_path))}"
+
+
+def _vision_rule_prompt() -> str:
+    """System-prompt rule appended when launching Pi: images are always
+    routed through the free Zhipu vision model first — never sent straight to
+    a (possibly text-only) provider model."""
+    command = _helper_command_text()
+    return (
+        "## 图片处理规则（必须遵守）\n"
+        "- 用户发送图片、粘贴截图或要求查看图片时：绝不要尝试把图片直接发送给当前对话模型"
+        "（纯文本模型会报 image_url 错误）。\n"
+        "- 先获取图片文件路径：用户提供，或从系统临时目录（%TEMP%）查找最新的 "
+        "pi-clipboard-*.png 文件。\n"
+        f"- 运行识图命令：{command} --vision-describe \"<图片路径>\" \"<用户问题，可空>\"\n"
+        "- 将命令输出的文字描述视为图片内容，结合用户问题回答。\n"
+        "- 若提示未配置智谱 API Key，请告知用户在 Pi Manager「设置 → 识图模型」中配置。"
+    )
+
+
+def append_vision_args(args: list[str]) -> list[str]:
+    """Add the image-routing system-prompt rule at launch time."""
+    try:
+        text = _vision_rule_prompt()
+    except Exception:
+        return list(args)
+    return list(args) + ["--append-system-prompt", text]
 
 
 def apply_theme(theme_name: str) -> dict[str, Any]:
@@ -1952,6 +2115,7 @@ def provider_runtime_credential(provider: str | None) -> dict[str, Any]:
                 storage.update_json(
                     models_path(), {"providers": {}}, persist_reference
                 )
+                _invalidate_config_cache(models_path())
             except Exception as exc:
                 raise ProviderKeyError(
                     f"Provider「{provider}」的旧 API Key 配置无法迁移到安全引用：{exc}。"
@@ -2029,7 +2193,8 @@ def _ssl_context(insecure: bool = False):
         import certifi
 
         cafile = certifi.where()
-    except Exception:
+    except Exception as exc:
+        logger.warning("加载 certifi 证书失败，回退系统默认证书: %s", exc)
         cafile = None
     if cafile and os.path.isfile(cafile):
         ctx = ssl.create_default_context(cafile=cafile)
@@ -2037,8 +2202,8 @@ def _ssl_context(insecure: bool = False):
         ctx = ssl.create_default_context()
     try:
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("设置最低 TLS 版本失败: %s", exc)
     return ctx
 
 
@@ -2193,9 +2358,45 @@ def _configured_proxy_url() -> str:
     try:
         cfg = load_manager_config()
         if cfg.get("proxy_enabled") and cfg.get("proxy_url"):
-            return str(cfg.get("proxy_url") or "").strip()
+            url = str(cfg.get("proxy_url") or "").strip()
+            error = validate_proxy_url(url)
+            if error:
+                logger.warning("已配置的代理地址无效，已忽略: %s", error)
+                return ""
+            return url
+    except Exception as exc:
+        logger.warning("读取代理配置失败: %s", exc)
+    return ""
+
+
+def _effective_proxy_url(explicit: str = "") -> str:
+    """Resolve the proxy for an outgoing request (explicit > config > env).
+
+    Invalid (non-http(s) scheme or missing host) values are dropped with a
+    warning instead of being handed to urllib.
+    """
+    candidates: list[str] = []
+    explicit = (explicit or "").strip()
+    if explicit:
+        candidates.append(explicit)
+    try:
+        cfg = load_manager_config()
+        if not explicit and cfg.get("proxy_enabled") and cfg.get("proxy_url"):
+            candidates.append(str(cfg.get("proxy_url") or "").strip())
     except Exception:
         pass
+    if not candidates:
+        for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+            value = (os.environ.get(var) or "").strip()
+            if value:
+                candidates.append(value)
+                break
+    for value in candidates:
+        error = validate_proxy_url(value)
+        if error:
+            logger.warning("忽略无效代理地址「%s」: %s", value, error)
+            continue
+        return value
     return ""
 
 
@@ -2219,7 +2420,7 @@ def _zhipu_vision_request(
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "PiManager/1.0 (+zhipu-vision)",
+            "User-Agent": DEFAULT_OPENAI_COMPAT_USER_AGENT,
         },
         method="POST",
     )
@@ -2443,23 +2644,9 @@ def install_vision_skill() -> dict[str, Any]:
 
     Idempotent: the file is only rewritten when its content changes.
     """
-    import shlex
-
-    from . import helper_registry
-
     skill_dir = Path(os.path.expanduser("~")) / ".pi" / "skills" / "pi-manager-vision"
     skill_file = skill_dir / "SKILL.md"
-    try:
-        command_parts = helper_registry.current_helper_command()
-        vision_command = " ".join(shlex.quote(str(part)) for part in command_parts)
-    except Exception:
-        if getattr(sys, "frozen", False):
-            vision_command = shlex.quote(sys.executable)
-        else:
-            main_path = Path(__file__).resolve().parents[1] / "main.py"
-            vision_command = (
-                f"{shlex.quote(sys.executable)} {shlex.quote(str(main_path))}"
-            )
+    vision_command = _helper_command_text()
     content = _VISION_SKILL_TEMPLATE.format(vision_command=vision_command)
     try:
         skill_dir.mkdir(parents=True, exist_ok=True)
@@ -2548,6 +2735,15 @@ def fetch_remote_models(
     base = normalize_openai_base_url(base_url)
     if not base:
         return {"ok": False, "models": [], "endpoint": "", "error": "Base URL 为空", "raw_count": 0}
+    scheme_error = _check_request_scheme(base)
+    if scheme_error:
+        return {
+            "ok": False,
+            "models": [],
+            "endpoint": "",
+            "error": scheme_error,
+            "raw_count": 0,
+        }
 
     raw_key = (api_key or "").strip()
     key_id = ""
@@ -2610,7 +2806,7 @@ def fetch_remote_models(
             endpoint = base
         req_headers = {
             "Accept": "application/json",
-            "User-Agent": "PiManager/1.0 (+Windows)",
+            "User-Agent": DEFAULT_OPENAI_COMPAT_USER_AGENT,
         }
         if key:
             req_headers["Authorization"] = f"Bearer {key}"
@@ -2623,7 +2819,7 @@ def fetch_remote_models(
             endpoint = base.rstrip("/") + "/v1/models"
         req_headers = {
             "Accept": "application/json",
-            "User-Agent": "PiManager/1.0 (+Windows)",
+            "User-Agent": DEFAULT_OPENAI_COMPAT_USER_AGENT,
             "anthropic-version": "2023-06-01",
         }
         if key:
@@ -2641,7 +2837,7 @@ def fetch_remote_models(
                 sep = "&" if "?" in endpoint else "?"
                 from urllib.parse import quote
                 endpoint = f"{endpoint}{sep}key={quote(key, safe='')}"
-        req_headers = {"Accept": "application/json", "User-Agent": "PiManager/1.0 (+Windows)"}
+        req_headers = {"Accept": "application/json", "User-Agent": DEFAULT_OPENAI_COMPAT_USER_AGENT}
         if not key and "key=" not in endpoint:
             return {
                 "ok": False,
@@ -2652,7 +2848,7 @@ def fetch_remote_models(
             }
     else:
         endpoint = base + ("/models" if base.endswith("/v1") else "/v1/models")
-        req_headers = {"Accept": "application/json", "User-Agent": "PiManager/1.0 (+Windows)"}
+        req_headers = {"Accept": "application/json", "User-Agent": DEFAULT_OPENAI_COMPAT_USER_AGENT}
         if key:
             req_headers["Authorization"] = f"Bearer {key}"
 
@@ -2666,22 +2862,7 @@ def fetch_remote_models(
                 provider, str(k), str(v)
             )
 
-    proxy = (proxy or "").strip()
-    if not proxy:
-        try:
-            cfg = load_manager_config()
-            if cfg.get("proxy_enabled") and cfg.get("proxy_url"):
-                proxy = str(cfg.get("proxy_url") or "").strip()
-        except Exception:
-            proxy = ""
-    if not proxy:
-        proxy = (
-            os.environ.get("HTTPS_PROXY")
-            or os.environ.get("https_proxy")
-            or os.environ.get("HTTP_PROXY")
-            or os.environ.get("http_proxy")
-            or ""
-        ).strip()
+    proxy = _effective_proxy_url(proxy)
 
     handlers: list[Any] = []
     if proxy:
@@ -2713,6 +2894,10 @@ def fetch_remote_models(
             ).decode("utf-8", errors="replace")[:500]
         except Exception:
             pass
+        err_body = redact_secret_values(err_body, [key])
+        err_body = re.sub(
+            r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+", r"\1***", err_body
+        )
         detail = f"HTTP {e.code}: {e.reason}"
         if err_body:
             detail += f"\n{err_body}"
@@ -3075,23 +3260,20 @@ def _http_json_request(
 
     from . import http_client
 
+    scheme_error = _check_request_scheme(url)
+    if scheme_error:
+        return {
+            "ok": False,
+            "status": 0,
+            "body": "",
+            "latency_ms": 0,
+            "bytes": 0,
+            "proxy": redact_endpoint_url((proxy or "").strip()),
+            "error": scheme_error,
+        }
+
     req_headers = dict(headers or {})
-    proxy = (proxy or "").strip()
-    if not proxy:
-        try:
-            cfg = load_manager_config()
-            if cfg.get("proxy_enabled") and cfg.get("proxy_url"):
-                proxy = str(cfg.get("proxy_url") or "").strip()
-        except Exception:
-            proxy = ""
-    if not proxy:
-        proxy = (
-            os.environ.get("HTTPS_PROXY")
-            or os.environ.get("https_proxy")
-            or os.environ.get("HTTP_PROXY")
-            or os.environ.get("http_proxy")
-            or ""
-        ).strip()
+    proxy = _effective_proxy_url(proxy)
 
     def request_once(active_proxy: str) -> dict[str, Any]:
         handlers: list[Any] = []
@@ -3289,13 +3471,28 @@ def test_model_http(
             "http_status": 0,
         }
 
+    scheme_error = _check_request_scheme(base)
+    if scheme_error:
+        return {
+            "ok": False,
+            "available": False,
+            "mode": "http",
+            "provider": provider,
+            "model": model,
+            "latency_ms": None,
+            "error": scheme_error,
+            "preview": "",
+            "endpoint": base,
+            "http_status": 0,
+        }
+
     effective_headers = _openai_compat_headers(api, extra_headers)
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
     if not any(str(key).strip().lower() == "user-agent" for key in effective_headers):
-        headers["User-Agent"] = "PiManager/1.0 (+model-test)"
+        headers["User-Agent"] = DEFAULT_OPENAI_COMPAT_USER_AGENT
     for k, v in effective_headers.items():
         headers[str(k)] = secretstore.resolve_provider_header_value(
             provider, str(k), str(v)
@@ -3557,48 +3754,6 @@ def test_model(
         return http_res
 
     return test_model_via_pi(provider, model, timeout=timeout, workdir=workdir)
-
-
-def test_models_batch(
-    pairs: list[tuple[str, str]],
-    *,
-    mode: str = "auto",
-    timeout: float = 60,
-    insecure_ssl: bool = False,
-    proxy: str = "",
-    workdir: str | None = None,
-) -> list[dict[str, Any]]:
-    """Test multiple provider/model pairs sequentially."""
-    results: list[dict[str, Any]] = []
-    for provider, model in pairs:
-        try:
-            results.append(
-                test_model(
-                    provider,
-                    model,
-                    mode=mode,
-                    timeout=timeout,
-                    insecure_ssl=insecure_ssl,
-                    proxy=proxy,
-                    workdir=workdir,
-                )
-            )
-        except Exception as e:
-            results.append(
-                {
-                    "ok": False,
-                    "available": False,
-                    "mode": mode,
-                    "provider": provider,
-                    "model": model,
-                    "latency_ms": None,
-                    "error": str(e),
-                    "preview": "",
-                    "endpoint": "",
-                    "http_status": 0,
-                }
-            )
-    return results
 
 
 def format_test_summary(result: dict[str, Any]) -> str:

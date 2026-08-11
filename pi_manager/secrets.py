@@ -27,6 +27,7 @@ from .storage import locked
 SERVICE = "PiManager"
 _KEYRING = None
 _KEYRING_TRIED = False
+_KEYRING_PROBE_TIMEOUT = 5.0
 
 
 class VaultCorruptError(ValueError):
@@ -35,6 +36,15 @@ class VaultCorruptError(ValueError):
 
 def _vault_path() -> Path:
     return Path(os.path.expanduser("~")) / ".pi" / "agent" / "secrets.vault"
+
+
+def config_dir() -> Path:
+    """Pi 配置目录（固定为 ~/.pi/agent/，Windows 为 %USERPROFILE%\\.pi\\agent）。"""
+    return Path(os.path.expanduser("~")) / ".pi" / "agent"
+
+
+def broker_token_path() -> Path:
+    return config_dir() / ".broker-token"
 
 
 def _legacy_vault_path() -> Path:
@@ -61,6 +71,12 @@ def _ensure_dir() -> None:
     _vault_path().parent.mkdir(parents=True, exist_ok=True)
 
 
+def _keyring_backend_is_unsafe(backend: Any) -> bool:
+    """True when the selected keyring backend persists secrets in plain files."""
+    name = f"{type(backend).__name__} {type(backend).__module__}".lower()
+    return any(marker in name for marker in ("file", "plaintext", "keyrings.alt"))
+
+
 def _get_keyring():
     global _KEYRING, _KEYRING_TRIED
     if _KEYRING_TRIED:
@@ -68,12 +84,37 @@ def _get_keyring():
     _KEYRING_TRIED = True
     try:
         import keyring  # type: ignore
-
-        # probe
-        keyring.get_password(SERVICE, "__pi_manager_probe__")
-        _KEYRING = keyring
     except Exception:
         _KEYRING = None
+        return _KEYRING
+    outcome: dict[str, Any] = {}
+
+    def probe() -> None:
+        try:
+            backend = keyring.get_keyring()
+            if backend is None or _keyring_backend_is_unsafe(backend):
+                return
+            probe_user = "__pi_manager_probe__"
+            keyring.set_password(SERVICE, probe_user, "_")
+            try:
+                if keyring.get_password(SERVICE, probe_user) != "_":
+                    return
+            finally:
+                try:
+                    keyring.delete_password(SERVICE, probe_user)
+                except Exception:
+                    pass
+            outcome["backend"] = keyring
+        except Exception as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=probe, daemon=True, name="keyring-probe")
+    thread.start()
+    thread.join(_KEYRING_PROBE_TIMEOUT)
+    if thread.is_alive() or "error" in outcome:
+        _KEYRING = None
+    else:
+        _KEYRING = outcome.get("backend")
     return _KEYRING
 
 
@@ -135,7 +176,32 @@ def _dpapi_unprotect(data: bytes) -> bytes:
         kernel32.LocalFree(blob_out.pbData)
 
 
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _windows_file_attributes(path: Path) -> int | None:
+    try:
+        import ctypes
+
+        func = ctypes.windll.kernel32.GetFileAttributesW
+        func.argtypes = [ctypes.c_wchar_p]
+        func.restype = ctypes.c_uint32
+    except Exception:
+        return None
+    try:
+        value = func(str(path))
+    except Exception:
+        return None
+    if value == 0xFFFFFFFF:
+        return None
+    return int(value)
+
+
 def _validate_master_key(path: Path) -> bytes:
+    if os.name == "nt":
+        attributes = _windows_file_attributes(path)
+        if attributes is not None and attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise VaultCorruptError(f"主密钥不能是 reparse point: {path}")
     info = path.stat(follow_symlinks=False)
     if not stat.S_ISREG(info.st_mode):
         raise VaultCorruptError(f"主密钥不是普通文件: {path}")
@@ -225,21 +291,6 @@ def decrypt_blob(raw: bytes) -> bytes:
         except Exception:
             pass
     return raw
-
-
-def encrypt_text(text: str) -> str:
-    blob = encrypt_blob((text or "").encode("utf-8"))
-    return blob.decode("ascii", errors="ignore")
-
-
-def decrypt_text(token: str) -> str:
-    token = (token or "").strip()
-    if not token:
-        return ""
-    try:
-        return decrypt_blob(token.encode("ascii")).decode("utf-8", errors="replace")
-    except Exception:
-        return token
 
 
 def load_vault() -> dict[str, str]:
@@ -700,12 +751,23 @@ def remove_provider_api_key(provider: str, key_id: str) -> bool:
         return True
 
 
+def _sanitize_reason(text: str) -> str:
+    """Strip NUL and control characters (newlines kept) from external input."""
+    cleaned = []
+    for ch in str(text or ""):
+        code = ord(ch)
+        if ch == "\n" or (code >= 0x20 and code != 0x7F and not 0x80 <= code <= 0x9F):
+            cleaned.append(ch)
+    return "".join(cleaned)[:400]
+
+
 def mark_provider_key_failed(provider: str, key_id: str, reason: str = "") -> bool:
     provider = (provider or "").strip()
     key_id = (key_id or "").strip()
+    reason = _sanitize_reason(reason)
     from .core import classify_provider_key_failure
 
-    classification = classify_provider_key_failure(1, "", str(reason or ""))
+    classification = classify_provider_key_failure(1, "", reason)
     status = classification.get("status") or "restricted"
     with locked(_provider_key_pool_lock_path()):
         pool, _migrated = _read_provider_key_pool(provider)
@@ -718,9 +780,9 @@ def mark_provider_key_failed(provider: str, key_id: str, reason: str = "") -> bo
             item["retry_at"] = classification.get("retry_at") or ""
             item["failure_kind"] = classification.get("failure_kind") or "unknown"
             item["failure_count"] = int(item.get("failure_count") or 0) + 1
-            item["failure_reason"] = (
-                classification.get("reason") or str(reason or "").strip()
-            )[:500]
+            item["failure_reason"] = _sanitize_reason(
+                classification.get("reason") or reason.strip()
+            )
             found = True
             break
         if not found:

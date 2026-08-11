@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -42,8 +45,13 @@ from .presentation.design import ACCENT_LABELS, apply_app_font, normalize_mode
 from .ui_features import FeatureMixin
 
 
-APP_STYLE = ""  # styling comes from presentation.design.build_stylesheet
+LATENCY_OK_MS = 800
+LATENCY_WARN_MS = 2000
+BATCH_TEST_TIMEOUT_PI = 90
+BATCH_TEST_TIMEOUT_DIRECT = 45
+SINGLE_INSTANCE_SERVER_NAME = "PiManager"
 
+logger = logging.getLogger(__name__)
 
 
 class Worker(QThread):
@@ -60,6 +68,7 @@ class Worker(QThread):
         try:
             self.done.emit(self.fn(*self.args, **self.kwargs))
         except Exception as e:
+            logger.exception("Worker task failed")
             self.failed.emit(str(e))
 
 
@@ -106,7 +115,9 @@ class BatchTestWorker(QThread):
                 self.done.emit(result)
                 return
 
-            timeout = self.timeout if self.timeout is not None else (90 if self.mode == "pi" else 45)
+            timeout = self.timeout if self.timeout is not None else (
+                BATCH_TEST_TIMEOUT_PI if self.mode == "pi" else BATCH_TEST_TIMEOUT_DIRECT
+            )
 
             def on_one(res):
                 self.progress.emit(res)
@@ -123,6 +134,7 @@ class BatchTestWorker(QThread):
             )
             self.done.emit(results)
         except Exception as e:
+            logger.exception("BatchTestWorker failed")
             self.failed.emit(str(e))
 
 
@@ -134,6 +146,7 @@ class ProviderEditorDialog(QDialog):
         self.resize(680, 640)
         self.existing = existing or {}
         self._worker = None
+        self._workers: list[Worker] = []
         layout = QVBoxLayout(self)
         form = QFormLayout()
 
@@ -271,6 +284,29 @@ class ProviderEditorDialog(QDialog):
         text += "\n填写 API Key 后可直接保存，或点击下方按钮拉取最新模型列表。"
         self.fetch_status.setText(text)
 
+    def _track(self, worker: Worker) -> Worker:
+        worker.setParent(self)
+        self._workers.append(worker)
+        worker.finished.connect(lambda: self._untrack(worker))
+        worker.finished.connect(worker.deleteLater)
+        return worker
+
+    def _untrack(self, worker: Worker) -> None:
+        if worker in self._workers:
+            self._workers.remove(worker)
+
+    def closeEvent(self, event):
+        running = [w for w in self._workers if w.isRunning()]
+        if running:
+            for w in running:
+                w.requestInterruption()
+            deadline = time.monotonic() + 2.0
+            for w in running:
+                remaining = max(0, int((deadline - time.monotonic()) * 1000))
+                if w.isRunning() and remaining:
+                    w.wait(remaining)
+        super().closeEvent(event)
+
     def fetch_models(self):
         base = self.base_url.text().strip()
         key = self.api_key.text().strip()
@@ -280,12 +316,14 @@ class ProviderEditorDialog(QDialog):
             return
         self.btn_fetch.setEnabled(False)
         self.fetch_status.setText("正在请求模型列表…")
-        self._worker = Worker(
-            core.fetch_remote_models,
-            base,
-            key,
-            api=api,
-            provider=self.name_edit.text().strip(),
+        self._worker = self._track(
+            Worker(
+                core.fetch_remote_models,
+                base,
+                key,
+                api=api,
+                provider=self.name_edit.text().strip(),
+            )
         )
         self._worker.done.connect(self._on_fetch_done)
         self._worker.failed.connect(self._on_fetch_fail)
@@ -556,6 +594,30 @@ class FetchModelsDialog(QDialog):
         layout.addLayout(row)
         self._models: list[dict[str, Any]] = []
         self._worker = None
+        self._workers: list[Worker] = []
+
+    def _track(self, worker: Worker) -> Worker:
+        worker.setParent(self)
+        self._workers.append(worker)
+        worker.finished.connect(lambda: self._untrack(worker))
+        worker.finished.connect(worker.deleteLater)
+        return worker
+
+    def _untrack(self, worker: Worker) -> None:
+        if worker in self._workers:
+            self._workers.remove(worker)
+
+    def closeEvent(self, event):
+        running = [w for w in self._workers if w.isRunning()]
+        if running:
+            for w in running:
+                w.requestInterruption()
+            deadline = time.monotonic() + 2.0
+            for w in running:
+                remaining = max(0, int((deadline - time.monotonic()) * 1000))
+                if w.isRunning() and remaining:
+                    w.wait(remaining)
+        super().closeEvent(event)
 
     def _fetch(self):
         base = self.base_url.text().strip()
@@ -574,13 +636,15 @@ class FetchModelsDialog(QDialog):
             return
         self.btn_fetch.setEnabled(False)
         self.status.setText("请求中…（若长时间无响应，请检查网络/代理）")
-        self._worker = Worker(
-            core.fetch_remote_models,
-            base,
-            key,
-            api=self.api.currentText(),
-            insecure_ssl=self.insecure_ssl.isChecked(),
-            proxy=self.proxy.text().strip(),
+        self._worker = self._track(
+            Worker(
+                core.fetch_remote_models,
+                base,
+                key,
+                api=self.api.currentText(),
+                insecure_ssl=self.insecure_ssl.isChecked(),
+                proxy=self.proxy.text().strip(),
+            )
         )
         self._worker.done.connect(self._done)
         self._worker.failed.connect(lambda e: self._fail(e))
@@ -661,6 +725,7 @@ class InstallPiDialog(QDialog):
         self.setWindowTitle("\u5b89\u88c5 / \u5347\u7ea7 Pi")
         self.resize(620, 460)
         self._worker = None
+        self._workers: list[Worker] = []
         self.install_succeeded = False
         self.status_info = dict(status or {})
         node_version = self.status_info.get("node_version") or core.get_node_version()
@@ -711,12 +776,31 @@ class InstallPiDialog(QDialog):
                 str(self.status_info.get("error") or "\u8bf7\u5148\u4fee\u590d Node.js/npm \u73af\u5883\u3002")
             )
 
+    def _track(self, worker: Worker) -> Worker:
+        worker.setParent(self)
+        self._workers.append(worker)
+        worker.finished.connect(lambda: self._untrack(worker))
+        worker.finished.connect(worker.deleteLater)
+        return worker
+
+    def _untrack(self, worker: Worker) -> None:
+        if worker in self._workers:
+            self._workers.remove(worker)
+
+    def closeEvent(self, event):
+        if self._worker is not None and self._worker.isRunning():
+            event.ignore()
+            self.log.appendPlainText("\u5b89\u88c5\u4e2d\uff0c\u8bf7\u8010\u5fc3\u7b49\u5f85\u5b89\u88c5\u5b8c\u6210\u6216\u5931\u8d25\u3002")
+            return
+        super().closeEvent(event)
+
     def _run(self):
         self.install_succeeded = False
         self.btn_install.setEnabled(False)
+        self.btn_close.setEnabled(False)
         command_text = f"npm install -g {self.package_spec}" if self.package_spec else "npm install -g"
         self.log.appendPlainText(f"\u6b63\u5728\u6267\u884c {command_text} ...")
-        self._worker = Worker(core.install_or_update_pi)
+        self._worker = self._track(Worker(core.install_or_update_pi))
         self._worker.done.connect(self._done)
         self._worker.failed.connect(self._fail)
         self._worker.start()
@@ -728,6 +812,7 @@ class InstallPiDialog(QDialog):
         if err:
             self.log.appendPlainText(err)
         self.btn_install.setEnabled(True)
+        self.btn_close.setEnabled(True)
         if code == 0:
             self.install_succeeded = True
             self.log.appendPlainText("\n\u5b8c\u6210\uff1a\u5b89\u88c5/\u5347\u7ea7\u5df2\u9a8c\u8bc1\uff0c\u6b63\u5728\u8fd4\u56de\u7ba1\u7406\u5668\u9762\u677f\u3002")
@@ -743,6 +828,7 @@ class InstallPiDialog(QDialog):
 
     def _fail(self, err: str):
         self.btn_install.setEnabled(True)
+        self.btn_close.setEnabled(True)
         self.log.appendPlainText(f"\u5931\u8d25\uff1a{err}")
         QMessageBox.warning(self, "\u5931\u8d25", err)
 
@@ -831,8 +917,8 @@ class SetupWizardDialog(QDialog):
         core.mark_setup_done(True)
         try:
             core.run_first_time_bootstrap()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("first-run bootstrap failed: %s", e)
         self.accept()
 
 
@@ -1017,8 +1103,8 @@ class MainWindow(FeatureMixin, QMainWindow):
                 if mid:
                     core.set_default_model(name, str(mid))
                     self.refresh_dashboard()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("auto set default model failed: %s", e)
         QMessageBox.information(
             self,
             "已接入",
@@ -1082,9 +1168,9 @@ class MainWindow(FeatureMixin, QMainWindow):
         lat = res.get("latency_ms")
         if isinstance(lat, (int, float)):
             latency_text = f"{lat:.0f}ms"
-            if lat < 800:
+            if lat < LATENCY_OK_MS:
                 latency_color = QColor(colors.success)
-            elif lat < 2000:
+            elif lat < LATENCY_WARN_MS:
                 latency_color = QColor(colors.warning)
             else:
                 latency_color = QColor(colors.danger)
@@ -1162,16 +1248,6 @@ class MainWindow(FeatureMixin, QMainWindow):
             return self.test_mode_combo.currentText()
         return "auto"
 
-    def _parse_favorite_key(self, key: str) -> tuple[str, str] | None:
-        key = (key or "").strip()
-        if "/" not in key:
-            return None
-        provider, model = key.split("/", 1)
-        provider, model = provider.strip(), model.strip()
-        if not provider or not model:
-            return None
-        return provider, model
-
     def model_test_selected(self):
         rows = self.selected_model_rows()
         if not rows:
@@ -1190,7 +1266,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         favs = list(self.mgr.get("favorites") or [])
         pairs: list[tuple[str, str]] = []
         for key in favs:
-            parsed = self._parse_favorite_key(key)
+            parsed = core.parse_favorite_key(key)
             if parsed:
                 pairs.append(parsed)
         if not pairs:
@@ -1304,7 +1380,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         if not item:
             QMessageBox.information(self, "提示", "请先选择一个收藏模型")
             return
-        parsed = self._parse_favorite_key(item.text())
+        parsed = core.parse_favorite_key(item.text())
         if not parsed:
             QMessageBox.warning(self, "提示", f"无法解析收藏项：{item.text()}")
             return
@@ -1345,7 +1421,7 @@ class MainWindow(FeatureMixin, QMainWindow):
                 pairs,
                 mode=mode,
                 workdir=workdir,
-                timeout=90 if mode == "pi" else 45,
+                timeout=BATCH_TEST_TIMEOUT_PI if mode == "pi" else BATCH_TEST_TIMEOUT_DIRECT,
                 kind="model",
             )
         )
@@ -1396,8 +1472,6 @@ class MainWindow(FeatureMixin, QMainWindow):
             if isinstance(r, dict):
                 key = f"{r.get('provider')}/{r.get('model')}"
                 self.test_results[key] = r
-                if r.get("available") and key not in "".join(lines):
-                    pass
         self.fill_models_table()
         try:
             self.history_refresh()
@@ -1831,7 +1905,7 @@ class MainWindow(FeatureMixin, QMainWindow):
     def _fill_sessions_table(self, rows: list[dict[str, str]]) -> None:
         self.sessions_table.setRowCount(len(rows))
         for i, r in enumerate(rows):
-            project = r.get("project") or core._project_name_from_path(r.get("cwd") or r.get("folder") or "")
+            project = r.get("project") or core.project_name_from_path(r.get("cwd") or r.get("folder") or "")
             cwd = r.get("cwd") or r.get("folder") or ""
             model = r.get("model") or "—"
             when = r.get("started") or r.get("mtime_text") or ""
@@ -1954,7 +2028,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         if not item:
             return
         key = item.text()
-        parsed = self._parse_favorite_key(key)
+        parsed = core.parse_favorite_key(key)
         if parsed:
             purge = core.purge_favorites(provider=parsed[0], model=parsed[1], redefault=True)
             self.mgr = core.load_manager_config()
@@ -2070,8 +2144,8 @@ class MainWindow(FeatureMixin, QMainWindow):
         # 重新加载 manager 配置（收藏可能已变）
         try:
             self.mgr = core.load_manager_config()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("reload manager config after provider delete failed: %s", e)
         self.refresh_providers()
         self.refresh_models()
         try:
@@ -2433,14 +2507,14 @@ class MainWindow(FeatureMixin, QMainWindow):
             core.apply_language_preference(core.get_language())
             from pi_manager.builtin_themes import ensure_builtin_themes
             ensure_builtin_themes()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("startup language/theme bootstrap failed: %s", e)
         # Ensure the Pi vision skill is installed (idempotent; regenerates the
         # helper command if this installation moved).
         try:
             core.install_vision_skill()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("install vision skill failed: %s", e)
         # first-run wizard
         if not core.is_setup_done():
             self.open_setup_wizard(force=True)
@@ -2527,7 +2601,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         s = core.load_settings()
         self.set_provider.setText(str(s.get("defaultProvider") or ""))
         self.set_model.setText(str(s.get("defaultModel") or ""))
-        th = str(s.get("defaultThinkingLevel") or "medium")
+        th = str(s.get("defaultThinkingLevel") or core.DEFAULT_THINKING_LEVEL)
         i = self.set_thinking.findText(th)
         if i >= 0:
             self.set_thinking.setCurrentIndex(i)
@@ -2564,7 +2638,9 @@ class MainWindow(FeatureMixin, QMainWindow):
                 if self.set_ui_accent.itemData(i) == ut.get("accent"):
                     self.set_ui_accent.setCurrentIndex(i)
                     break
-        self.settings_raw.setPlainText(json.dumps(s, ensure_ascii=False, indent=2))
+        self.settings_raw.setPlainText(
+            json.dumps(core.redact_sensitive_config(s), ensure_ascii=False, indent=2)
+        )
         self.load_feature_settings_fields()
 
     def settings_save(self):
@@ -2607,7 +2683,9 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.save_feature_settings_fields()
         self.apply_ui_theme(mode, accent)
         final_settings = core.load_settings()
-        self.settings_raw.setPlainText(json.dumps(final_settings, ensure_ascii=False, indent=2))
+        self.settings_raw.setPlainText(
+            json.dumps(core.redact_sensitive_config(final_settings), ensure_ascii=False, indent=2)
+        )
         self.refresh_dashboard()
         self.status.showMessage("\u8bbe\u7f6e\u5df2\u4fdd\u5b58\uff0c\u7ba1\u7406\u5668\u4e0e Pi CLI \u5df2\u540c\u6b65\u4e3b\u9898")
         QMessageBox.information(
@@ -2634,25 +2712,25 @@ def run_app():
     app.setApplicationName("Pi Manager")
     app.setOrganizationName("PiManager")
     app.setQuitOnLastWindowClosed(False)
-    # 单实例保护：多个窗口同时运行会并发写回 models.json / settings.json，
-    # 导致“删除的 Provider 又被旧实例写回”等数据冲突。
-    try:
-        from PySide6.QtCore import QLockFile
+    # 单实例保护：只允许一个桌面实例；后启动的实例向已运行实例发送唤醒消息
+    # 后退出，避免多实例并发写回 models.json / settings.json 造成数据冲突。
+    # PI_MANAGER_DISABLE_SINGLE_INSTANCE=1 可跳过（供测试与嵌入场景使用）。
+    server = None
+    if os.environ.get("PI_MANAGER_DISABLE_SINGLE_INSTANCE") != "1":
+        from PySide6.QtCore import QLocalServer, QLocalSocket
 
         core.ensure_agent_dir()
-        lock = QLockFile(str(core.pi_agent_dir() / "pi-manager.lock"))
-        lock.setStaleLockTime(0)
-        if not lock.tryLock(100):
-            QMessageBox.warning(
-                None,
-                "Pi Manager 已在运行",
-                "检测到 Pi Manager 已在运行。\n\n"
-                "为避免多个实例同时写入配置导致数据冲突（例如删除的 Provider 又被旧实例写回），\n"
-                "请关闭本窗口，使用已打开的 Pi Manager。",
-            )
+        server = QLocalServer(app)
+        server.setSocketOptions(QLocalServer.UserAccessOption)
+        if not server.listen(SINGLE_INSTANCE_SERVER_NAME):
+            socket = QLocalSocket()
+            socket.connectToServer(SINGLE_INSTANCE_SERVER_NAME)
+            if socket.waitForConnected(500):
+                socket.write(b"wake")
+                socket.flush()
+                socket.waitForBytesWritten(500)
+            socket.close()
             return 0
-    except Exception:
-        lock = None
     try:
         app.setStyle("Fusion")
     except Exception:
@@ -2672,4 +2750,12 @@ def run_app():
 
     win = ModernMainWindow()
     win.show()
+    if server is not None:
+
+        def _wake_primary():
+            win.showNormal()
+            win.raise_()
+            win.activateWindow()
+
+        server.newConnection.connect(_wake_primary)
     return app.exec()

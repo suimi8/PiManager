@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import core
+from ..ui import LATENCY_OK_MS, LATENCY_WARN_MS
 from ..ui import MainWindow as LegacyMainWindow
 from ..ui import NAV_PAGES, Worker
 from .components import AppButton, CollapsibleSection, NavigationRail, PageHeader
@@ -433,9 +434,9 @@ class ModernMainWindow(LegacyMainWindow):
         if isinstance(latency, (int, float)):
             latency_color = QColor(
                 colors.success
-                if latency < 800
+                if latency < LATENCY_OK_MS
                 else colors.warning
-                if latency < 2000
+                if latency < LATENCY_WARN_MS
                 else colors.danger
             )
         else:

@@ -13,9 +13,11 @@ from pi_manager import core, extras, rpc_session
 def _reset_rpc_state():
     rpc_session.reset_chat_session()
     rpc_session._runtime_disabled = False
+    rpc_session._runtime_disabled_since = 0.0
     yield
     rpc_session.reset_chat_session()
     rpc_session._runtime_disabled = False
+    rpc_session._runtime_disabled_since = 0.0
 
 
 def test_rpc_chat_disabled_by_manager_config(isolated_home):
@@ -26,7 +28,10 @@ def test_rpc_chat_disabled_by_manager_config(isolated_home):
 
 
 def test_chat_attempt_falls_back_when_rpc_runtime_disabled(isolated_home, monkeypatch):
+    import time
+
     rpc_session._runtime_disabled = True
+    rpc_session._runtime_disabled_since = time.monotonic()
     calls: list[str] = []
 
     def fake_chat_once(prompt, **kwargs):
@@ -161,22 +166,25 @@ def test_rpc_chat_hot_switches_models_with_real_pi(isolated_home, monkeypatch, t
         assert "REPLY-FROM-A" in first["stdout"]
         session_after_first = rpc_session._entry["session"]
 
-        # Different provider: respawn with merged env (sticky session id).
+        # Different provider: respawn with only that provider's env (sticky
+        # session id keeps the conversation).
         second = rpc_session.rpc_chat_once(
             "and again", provider="ProvB", model="model-b", workdir=str(tmp_path), timeout=60
         )
         assert second["ok"] is True, second
         assert "REPLY-FROM-B" in second["stdout"]
 
-        # Back to ProvA: its env is already in the process — hot set_model,
-        # the very same session object keeps running.
+        # Back to ProvA: the running process only carries ProvB's env, so the
+        # process is respawned with ProvA's env; the sticky session id keeps
+        # the conversation and the hot set_model path is not used across
+        # providers (each process holds exactly one provider's keys).
         session_before_third = rpc_session._entry["session"]
         third = rpc_session.rpc_chat_once(
             "one more", provider="ProvA", model="model-a", workdir=str(tmp_path), timeout=60
         )
         assert third["ok"] is True, third
         assert "REPLY-FROM-A" in third["stdout"]
-        assert rpc_session._entry["session"] is session_before_third
+        assert rpc_session._entry["session"] is not session_before_third
         assert rpc_session._entry["session"] is not session_after_first
 
         paths = [path.split("/")[1] for path, _auth in seen]

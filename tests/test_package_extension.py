@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from pi_manager import config_broker, core
 from scripts import package_extension, package_release
 
 
@@ -117,3 +119,49 @@ def test_missing_staged_package_preserves_existing_target(monkeypatch, tmp_path)
     assert package_extension.main() == 1
     assert target.read_bytes() == b"known-good-package"
     assert not staged.exists()
+
+
+def test_config_mutate_bootstraps_when_token_file_missing(isolated_home):
+    assert not config_broker.broker_token_path().exists()
+    result = config_broker.mutate(
+        {
+            "schema_version": 1,
+            "request_id": "bootstrap-1",
+            "operation": "set_manager_fields",
+            "arguments": {"fields": {"favorites": ["A/m"]}},
+        }
+    )
+    assert result["ok"] is True
+    token_path = config_broker.broker_token_path()
+    assert token_path.is_file()
+    if os.name != "nt":
+        assert token_path.stat().st_mode & 0o077 == 0
+    assert core.load_manager_config()["favorites"] == ["A/m"]
+
+
+def test_config_mutate_rejects_wrong_token_and_accepts_correct(isolated_home):
+    token = config_broker._create_broker_token()
+    denied = config_broker.mutate(
+        {
+            "schema_version": 1,
+            "request_id": "denied-1",
+            "token": "wrong-token-value",
+            "operation": "set_manager_fields",
+            "arguments": {"fields": {"favorites": ["B/m"]}},
+        }
+    )
+    assert denied["ok"] is False
+    assert "token" in denied["error"]
+    assert core.load_manager_config()["favorites"] == []
+
+    accepted = config_broker.mutate(
+        {
+            "schema_version": 1,
+            "request_id": "accepted-1",
+            "token": token,
+            "operation": "set_manager_fields",
+            "arguments": {"fields": {"favorites": ["B/m"]}},
+        }
+    )
+    assert accepted["ok"] is True
+    assert core.load_manager_config()["favorites"] == ["B/m"]

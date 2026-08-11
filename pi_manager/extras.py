@@ -98,10 +98,23 @@ def get_proxy_settings() -> dict[str, Any]:
     }
 
 
+def _validate_proxy_url(url: str) -> str:
+    """Validate a proxy URL; return an error message, or "" when acceptable."""
+    url = (url or "").strip()
+    if not url:
+        return ""
+    return core.validate_proxy_url(url)
+
+
 def set_proxy_settings(enabled: bool, url: str) -> dict[str, Any]:
+    url = (url or "").strip()
+    if url:
+        proxy_error = _validate_proxy_url(url)
+        if proxy_error:
+            raise ValueError(proxy_error)
     cfg = core.load_manager_config()
     cfg["proxy_enabled"] = bool(enabled)
-    cfg["proxy_url"] = (url or "").strip()
+    cfg["proxy_url"] = url
     core.save_manager_config(cfg)
     # apply to process env for child pi processes when enabled
     apply_proxy_env()
@@ -516,6 +529,45 @@ def _atomic_replace_bytes(path: Path, content: bytes, *, private: bool = False) 
         temp.unlink(missing_ok=True)
 
 
+def _is_private_or_link_local_host(host: str) -> bool:
+    import ipaddress
+
+    host = (host or "").strip().lower().rstrip(".")
+    if not host:
+        return True
+    if host == "localhost" or host.endswith((".localhost", ".local")):
+        return True
+    if host.startswith("::ffff:"):
+        host = host[7:]
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return bool(
+        ip.is_private
+        or ip.is_link_local
+        or ip.is_loopback
+        or ip.is_multicast
+        or ip.is_unspecified
+        or ip.is_reserved
+    )
+
+
+def _validate_model_base_url(url: str) -> str:
+    """Return an error message for an imported provider baseUrl, or "" when OK."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return "URL 格式不合法"
+    if parsed.scheme not in ("http", "https"):
+        return "仅支持 http/https 协议"
+    if not parsed.hostname:
+        return "缺少有效主机名"
+    if _is_private_or_link_local_host(str(parsed.hostname)):
+        return "不允许指向本地或内网地址"
+    return ""
+
+
 def _validate_models(models: dict[str, Any]) -> None:
     providers = models.get("providers", {})
     if not isinstance(providers, dict):
@@ -529,6 +581,14 @@ def _validate_models(models: dict[str, Any]) -> None:
             raise ValueError(f"Provider {name} 的 apiKey 必须是字符串")
         if core.is_executable_config_value(entry.get("apiKey")):
             raise ValueError(f"Provider {name} 包含已禁用的 !command 凭据")
+        base_url = str(entry.get("baseUrl") or "")
+        if base_url:
+            base_error = _validate_model_base_url(base_url)
+            if base_error:
+                raise ValueError(
+                    f"Provider {name} 的 baseUrl 无效：{base_error}；"
+                    "如需本地模型服务，请直接在设置中手动添加该模型地址"
+                )
         headers = entry.get("headers", {})
         if headers and not isinstance(headers, dict):
             raise ValueError(f"Provider {name} 的 headers 必须是对象")
@@ -574,6 +634,10 @@ def import_config_bundle(
         manager = _parse_bundle_json(files, "pi-manager.json")
         if models is not None:
             _validate_models(models)
+        if manager is not None:
+            proxy_error = _validate_proxy_url(str(manager.get("proxy_url") or ""))
+            if proxy_error:
+                raise ValueError(f"pi-manager.json 的代理地址无效：{proxy_error}")
         theme_data: dict[str, dict[str, Any]] = {}
         for name in files:
             if name.startswith("themes/"):
@@ -862,7 +926,19 @@ def _pick_release_asset(assets: list[dict[str, Any]]) -> dict[str, str]:
 def check_manager_update() -> dict[str, Any]:
     """Check the official release feed without trusting it for installation."""
     cfg = core.load_manager_config()
+    settings = core.load_settings()
     url = ""
+    manifest_url = str(cfg.get("update_manifest_url") or "").strip()
+    if not manifest_url:
+        manifest_url = str(settings.get("update_manifest_url") or "").strip()
+    try:
+        parsed = urlsplit(manifest_url)
+        if parsed.scheme in ("http", "https") and parsed.hostname:
+            url = manifest_url
+    except ValueError:
+        url = ""
+    if not url:
+        url = UPDATE_MANIFEST_URL
     local = APP_VERSION
     result: dict[str, Any] = {
         "ok": True,
@@ -880,17 +956,33 @@ def check_manager_update() -> dict[str, Any]:
     core.save_manager_config(cfg)
 
     try:
-        data = _http_get_json(GITHUB_RELEASES_API)
-        tag = str(data.get("tag_name") or data.get("name") or "").strip()
-        remote = tag.lstrip("vV")
-        result["source"] = "github-notification-only"
-        result["remote"] = remote
-        result["notes"] = str(data.get("body") or "")[:2000]
-        result["url"] = str(data.get("html_url") or GITHUB_RELEASES_PAGE)
-        assets = data.get("assets") if isinstance(data.get("assets"), list) else []
-        picked = _pick_release_asset([a for a in assets if isinstance(a, dict)])
-        result["asset_name"] = picked.get("name") or ""
-        result["download"] = ""
+        if url:
+            data = _http_get_json(url)
+            tag = str(
+                data.get("version")
+                or data.get("tag_name")
+                or data.get("name")
+                or ""
+            ).strip()
+            remote = tag.lstrip("vV")
+            result["source"] = "manifest"
+            result["remote"] = remote
+            result["notes"] = str(data.get("notes") or data.get("body") or "")[:2000]
+            result["url"] = str(data.get("url") or GITHUB_RELEASES_PAGE)
+            result["download"] = ""
+            result["asset_name"] = ""
+        else:
+            data = _http_get_json(GITHUB_RELEASES_API)
+            tag = str(data.get("tag_name") or data.get("name") or "").strip()
+            remote = tag.lstrip("vV")
+            result["source"] = "github-notification-only"
+            result["remote"] = remote
+            result["notes"] = str(data.get("body") or "")[:2000]
+            result["url"] = str(data.get("html_url") or GITHUB_RELEASES_PAGE)
+            assets = data.get("assets") if isinstance(data.get("assets"), list) else []
+            picked = _pick_release_asset([a for a in assets if isinstance(a, dict)])
+            result["asset_name"] = picked.get("name") or ""
+            result["download"] = ""
 
         remote = str(result.get("remote") or "")
         if remote and core.parse_semver(remote) > core.parse_semver(local):
@@ -908,13 +1000,6 @@ def check_manager_update() -> dict[str, Any]:
     return result
 
 
-def download_manager_update(download_url: str, dest_dir: str | Path | None = None) -> dict[str, Any]:
-    """Reject unverified update downloads until signed manifests are supported."""
-    raise RuntimeError(
-        "签名更新链尚未启用，已禁止应用内下载。请从官方 Release 页面手动更新。"
-    )
-
-
 def _install_root() -> Path:
     """当前安装根目录（frozen）或源码根。"""
     import sys
@@ -928,310 +1013,12 @@ def _install_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def _safe_archive_target(dest: Path, member_name: str, seen: set[str]) -> Path:
-    normalized = member_name.replace("\\", "/")
-    member = PurePosixPath(normalized)
-    if (
-        not normalized
-        or member.is_absolute()
-        or normalized.startswith("//")
-        or any(part in {"", ".", ".."} for part in member.parts)
-        or (member.parts and ":" in member.parts[0])
-    ):
-        raise ValueError(f"更新包包含非法路径: {member_name}")
-    key = normalized.casefold()
-    if key in seen:
-        raise ValueError(f"更新包包含重复或大小写冲突路径: {member_name}")
-    seen.add(key)
-    target = (dest / Path(*member.parts)).resolve()
-    root = dest.resolve()
-    try:
-        target.relative_to(root)
-    except ValueError as exc:
-        raise ValueError(f"更新包成员逃逸解压目录: {member_name}") from exc
-    return target
-
-
-def _copy_archive_stream(source, target: Path, expected_size: int, budget: list[int]) -> None:
-    if expected_size > 256 * 1024 * 1024:
-        raise ValueError(f"更新包单个文件超过限制: {target.name}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    written = 0
-    with target.open("xb") as output:
-        while True:
-            chunk = source.read(64 * 1024)
-            if not chunk:
-                break
-            written += len(chunk)
-            budget[0] += len(chunk)
-            if written > expected_size or budget[0] > 1024 * 1024 * 1024:
-                raise ValueError("更新包解压后大小超过限制")
-            output.write(chunk)
-    if written != expected_size:
-        raise ValueError(f"更新包成员长度异常: {target.name}")
-
-
-def _extract_update_archive(archive: Path, dest: Path) -> Path:
-    """Safely extract an update archive into an empty staging directory."""
-    import shutil
-    import stat
-    import tarfile
-
-    dest.mkdir(parents=True, exist_ok=True)
-    for child in dest.iterdir():
-        if child.is_dir() and not child.is_symlink():
-            shutil.rmtree(child, ignore_errors=True)
-        else:
-            child.unlink(missing_ok=True)
-
-    seen: set[str] = set()
-    budget = [0]
-    name = archive.name.lower()
-    if name.endswith(".zip"):
-        with zipfile.ZipFile(archive, "r") as zf:
-            infos = zf.infolist()
-            if len(infos) > 20_000:
-                raise ValueError("更新包成员数超过限制")
-            for info in infos:
-                target = _safe_archive_target(dest, info.filename, seen)
-                mode = (info.external_attr >> 16) & 0xFFFF
-                if stat.S_ISLNK(mode):
-                    raise ValueError(f"更新包不允许符号链接: {info.filename}")
-                if info.is_dir():
-                    target.mkdir(parents=True, exist_ok=True)
-                    continue
-                compressed = max(1, int(info.compress_size or 0))
-                if info.file_size > compressed * 100 and info.file_size > 1024 * 1024:
-                    raise ValueError(f"更新包成员压缩比超过限制: {info.filename}")
-                with zf.open(info, "r") as source:
-                    _copy_archive_stream(source, target, info.file_size, budget)
-    elif name.endswith(".tar.gz") or name.endswith(".tgz"):
-        with tarfile.open(archive, "r:gz") as tf:
-            members = tf.getmembers()
-            if len(members) > 20_000:
-                raise ValueError("更新包成员数超过限制")
-            for member in members:
-                target = _safe_archive_target(dest, member.name, seen)
-                if member.issym() or member.islnk() or not (member.isdir() or member.isfile()):
-                    raise ValueError(f"更新包包含不允许的特殊成员: {member.name}")
-                if member.isdir():
-                    target.mkdir(parents=True, exist_ok=True)
-                    continue
-                source = tf.extractfile(member)
-                if source is None:
-                    raise ValueError(f"无法读取更新包成员: {member.name}")
-                with source:
-                    _copy_archive_stream(source, target, member.size, budget)
-    else:
-        target = dest / archive.name
-        shutil.copy2(archive, target)
-        return target
-
-    # 优先找 .app / PiManager.exe / PiManager 目录
-    apps = list(dest.rglob("*.app"))
-    if apps:
-        return apps[0]
-    exes = [p for p in dest.rglob("PiManager.exe")]
-    if exes:
-        return exes[0].parent
-    bins = [p for p in dest.rglob("PiManager") if p.is_file() and os.access(p, os.X_OK)]
-    if bins:
-        # 排除 .app 内的二进制已处理
-        for b in bins:
-            if ".app/" in str(b).replace("\\", "/") or str(b).endswith(".app"):
-                continue
-            return b.parent
-    # 单层子目录
-    subs = [p for p in dest.iterdir() if p.is_dir()]
-    if len(subs) == 1:
-        return subs[0]
-    return dest
-
-
-def _write_inplace_updater(
-    *,
-    pid: int,
-    source_root: Path,
-    install_root: Path,
-    relaunch: Path,
-    work_dir: Path,
-) -> Path:
-    """写入平台更新脚本，返回脚本路径。"""
-    import sys
-
-    work_dir.mkdir(parents=True, exist_ok=True)
-    src = str(source_root)
-    dst = str(install_root)
-    exe = str(relaunch)
-
-    if sys.platform == "win32":
-        script = work_dir / "apply_update.ps1"
-        # 等待进程退出后 robocopy 覆盖，再启动
-        ps = f"""$ErrorActionPreference = 'Continue'
-$pidWait = {pid}
-$src = '{src.replace("'", "''")}'
-$dst = '{dst.replace("'", "''")}'
-$exe = '{exe.replace("'", "''")}'
-$log = Join-Path $env:TEMP 'pimanager-update.log'
-Function Log($m) {{ Add-Content -Path $log -Value ("[{{0}}] {{1}}" -f (Get-Date -Format o), $m) }}
-Log "waiting for pid $pidWait"
-for ($i=0; $i -lt 120; $i++) {{
-  $p = Get-Process -Id $pidWait -ErrorAction SilentlyContinue
-  if (-not $p) {{ break }}
-  Start-Sleep -Seconds 1
-}}
-Start-Sleep -Seconds 1
-Log "copy $src -> $dst"
-if (Test-Path $src -PathType Leaf) {{
-  New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
-  Copy-Item -Force -Path $src -Destination $dst
-}} else {{
-  New-Item -ItemType Directory -Force -Path $dst | Out-Null
-  & robocopy $src $dst /E /R:2 /W:1 /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
-}}
-Log "relaunch $exe"
-if (Test-Path $exe) {{
-  Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)
-}} else {{
-  Log "exe missing: $exe"
-}}
-Log "done"
-"""
-        script.write_text(ps, encoding="utf-8")
-        return script
-
-    script = work_dir / "apply_update.sh"
-    sh = f"""#!/usr/bin/env bash
-set -euo pipefail
-PID={pid}
-SRC={repr(src)}
-DST={repr(dst)}
-EXE={repr(exe)}
-LOG="${{TMPDIR:-/tmp}}/pimanager-update.log"
-log() {{ echo "[$(date -Iseconds)] $*" >> "$LOG"; }}
-log "waiting for pid $PID"
-for i in $(seq 1 120); do
-  if ! kill -0 "$PID" 2>/dev/null; then break; fi
-  sleep 1
-done
-sleep 1
-log "copy $SRC -> $DST"
-if [[ -f "$SRC" ]]; then
-  mkdir -p "$(dirname "$DST")"
-  cp -f "$SRC" "$DST"
-elif [[ "$SRC" == *.app || -d "$SRC" ]]; then
-  # macOS .app or directory
-  if [[ "$SRC" == *.app ]]; then
-    rm -rf "$DST"
-    cp -R "$SRC" "$DST"
-  else
-    mkdir -p "$DST"
-    rsync -a --delete "$SRC"/ "$DST"/ 2>/dev/null || cp -R "$SRC"/. "$DST"/
-  fi
-fi
-log "relaunch $EXE"
-if [[ -x "$EXE" ]]; then
-  (cd "$(dirname "$EXE")" && nohup "$EXE" >/dev/null 2>&1 &)
-elif [[ -d "$EXE" && "$EXE" == *.app ]]; then
-  open "$EXE"
-fi
-log done
-"""
-    script.write_text(sh, encoding="utf-8")
-    os.chmod(script, 0o755)
-    return script
-
-
 def apply_manager_update_inplace(archive_path: str | Path) -> dict[str, Any]:
     """Reject in-place installation until signed package verification exists."""
     return {
         "ok": False,
         "need_exit": False,
         "message": "签名更新链尚未启用，已禁止原地安装。请从官方 Release 页面手动更新。",
-    }
-
-
-def _legacy_apply_manager_update_inplace(archive_path: str | Path) -> dict[str, Any]:
-    """Legacy updater retained temporarily but unreachable from product code."""
-    import sys
-    import subprocess
-
-    archive = Path(archive_path).resolve()
-    if not archive.exists():
-        raise FileNotFoundError(str(archive))
-
-    work = Path.home() / "Downloads" / "PiManager-updates" / f"stage-{int(time.time())}"
-    extract_dir = work / "extracted"
-    source_root = _extract_update_archive(archive, extract_dir)
-    install_root = _install_root()
-
-    # 启动路径
-    if getattr(sys, "frozen", False):
-        relaunch = Path(sys.executable).resolve()
-        if sys.platform == "darwin" and install_root.suffix == ".app":
-            relaunch = install_root  # open .app
-    else:
-        # 源码模式：不覆盖，仅提示
-        return {
-            "ok": False,
-            "need_exit": False,
-            "message": "当前为源码运行，请 git pull / 重新打包，不支持 in-place 覆盖。",
-            "source": str(source_root),
-            "install_root": str(install_root),
-        }
-
-    # onefile：source 可能是单文件
-    if source_root.is_file() and relaunch.is_file():
-        copy_src = source_root
-        copy_dst = relaunch
-    else:
-        copy_src = source_root
-        copy_dst = install_root
-
-    script = _write_inplace_updater(
-        pid=os.getpid(),
-        source_root=copy_src,
-        install_root=copy_dst,
-        relaunch=relaunch if relaunch.suffix == ".app" or relaunch.is_file() else install_root,
-        work_dir=work,
-    )
-
-    if sys.platform == "win32":
-        # 独立 PowerShell 进程，不随父进程结束
-        creationflags = 0
-        if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-            creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-        if hasattr(subprocess, "DETACHED_PROCESS"):
-            creationflags |= subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
-        subprocess.Popen(
-            [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(script),
-            ],
-            close_fds=True,
-            creationflags=creationflags,
-            cwd=str(work),
-        )
-    else:
-        subprocess.Popen(
-            ["/bin/bash", str(script)],
-            start_new_session=True,
-            cwd=str(work),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-    return {
-        "ok": True,
-        "need_exit": True,
-        "script": str(script),
-        "source": str(source_root),
-        "install_root": str(install_root),
-        "message": "更新器已启动，程序将退出并自动替换后重启。",
     }
 
 
@@ -1272,9 +1059,9 @@ def collect_model_pairs(scope: str = "favorites", selected: list[tuple[str, str]
     if scope == "favorites":
         mgr = core.load_manager_config()
         for key in mgr.get("favorites") or []:
-            if "/" in str(key):
-                p, m = str(key).split("/", 1)
-                add(p, m)
+            parsed = core.parse_favorite_key(str(key))
+            if parsed:
+                add(parsed[0], parsed[1])
         if not pairs:
             p, m, _ = core.get_default_model()
             add(p, m)
@@ -1344,7 +1131,7 @@ def run_health_check(
     results = test_models_batch_concurrent(
         pairs,
         mode=mode,
-        timeout=45,
+        timeout=90 if (mode or "auto").lower().strip() == "pi" else 45,
         max_workers=get_test_concurrency(),
         on_one=_on_one,
         append_history_each=False,
@@ -1372,27 +1159,44 @@ def run_health_check(
     return {"ok": True, "results": results, "health": health, "scope": scope, "count": len(pairs)}
 
 
+def _confined_session_path(path: str) -> Path | None:
+    root = Path(os.path.realpath(str(core.sessions_dir())))
+    real = Path(os.path.realpath(str(path)))
+    try:
+        real.relative_to(root)
+    except ValueError:
+        return None
+    return real
+
+
 def session_delete(path: str) -> bool:
-    p = Path(path)
-    if p.exists() and p.is_file():
-        p.unlink()
-        return True
-    return False
+    real = _confined_session_path(path)
+    if real is None or not real.exists() or not real.is_file():
+        return False
+    real.unlink()
+    return True
 
 
 def session_rename(path: str, new_name: str) -> str:
-    p = Path(path)
-    if not p.exists():
+    real = _confined_session_path(path)
+    if real is None or not real.exists():
         raise FileNotFoundError(path)
     new_name = (new_name or "").strip()
     if not new_name:
         raise ValueError("名称为空")
+    if (
+        ".." in new_name
+        or os.sep in new_name
+        or (os.altsep and os.altsep in new_name)
+        or os.path.isabs(new_name)
+    ):
+        raise ValueError("非法的会话名称")
     if not Path(new_name).suffix:
-        new_name = new_name + p.suffix
-    dest = p.with_name(new_name)
+        new_name = new_name + real.suffix
+    dest = real.with_name(new_name)
     if dest.exists():
         raise FileExistsError(str(dest))
-    p.rename(dest)
+    real.rename(dest)
     return str(dest)
 
 
@@ -1457,17 +1261,6 @@ def chat_once(
     }
 
 
-def _parse_pm_key(key: str) -> tuple[str, str] | None:
-    key = (key or "").strip()
-    if "/" not in key:
-        return None
-    p, m = key.split("/", 1)
-    p, m = p.strip(), m.strip()
-    if not p or not m:
-        return None
-    return p, m
-
-
 def failover_chain(start_provider: str | None = None, start_model: str | None = None) -> list[tuple[str, str]]:
     """故障切换候选链：当前模型 → 收藏 → enabledModels → 默认，去重保序。"""
     chain: list[tuple[str, str]] = []
@@ -1487,13 +1280,13 @@ def failover_chain(start_provider: str | None = None, start_model: str | None = 
     add(start_provider, start_model)
     mgr = core.load_manager_config()
     for key in mgr.get("favorites") or []:
-        parsed = _parse_pm_key(str(key))
+        parsed = core.parse_favorite_key(str(key))
         if parsed:
             add(parsed[0], parsed[1])
     try:
         settings = core.load_settings()
         for key in settings.get("enabledModels") or []:
-            parsed = _parse_pm_key(str(key))
+            parsed = core.parse_favorite_key(str(key))
             if parsed:
                 add(parsed[0], parsed[1])
         dp = str(settings.get("defaultProvider") or "")

@@ -74,6 +74,104 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _windows_file_attributes(path: str) -> int | None:
+    try:
+        import ctypes
+
+        func = ctypes.windll.kernel32.GetFileAttributesW
+        func.argtypes = [ctypes.c_wchar_p]
+        func.restype = ctypes.c_uint32
+    except Exception:
+        return None
+    try:
+        value = func(path)
+    except Exception:
+        return None
+    if value == 0xFFFFFFFF:
+        return None
+    return int(value)
+
+
+def _open_output_file_win32(path: str) -> int:
+    """Open an existing output file without following reparse points (no race)."""
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        get_file_info = kernel32.GetFileInformationByHandle
+        get_file_info.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        get_file_info.restype = wintypes.BOOL
+
+        class BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("dwFileAttributes", wintypes.DWORD),
+                ("ftCreationTime", wintypes.FILETIME),
+                ("ftLastAccessTime", wintypes.FILETIME),
+                ("ftLastWriteTime", wintypes.FILETIME),
+                ("dwVolumeSerialNumber", wintypes.DWORD),
+                ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD),
+                ("nNumberOfLinks", wintypes.DWORD),
+                ("nFileIndexHigh", wintypes.DWORD),
+                ("nFileIndexLow", wintypes.DWORD),
+            ]
+
+        GENERIC_WRITE = 0x40000000
+        FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        FILE_SHARE_DELETE = 0x00000004
+        OPEN_EXISTING = 3
+        FILE_ATTRIBUTE_NORMAL = 0x80
+        FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+
+        handle = create_file(
+            path,
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        if not handle or handle == wintypes.HANDLE(-1).value:
+            if kernel32.GetLastError() == 2:
+                raise FileNotFoundError(path)
+            raise OSError(f"CreateFileW failed: {path}")
+        try:
+            info = BY_HANDLE_FILE_INFORMATION()
+            if not get_file_info(handle, ctypes.byref(info)):
+                raise OSError(f"GetFileInformationByHandle failed: {path}")
+            if info.dwFileAttributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+                raise ValueError("helper output file must not be a reparse point")
+            fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+            os.ftruncate(fd, 0)
+            return fd
+        except Exception:
+            kernel32.CloseHandle(handle)
+            raise
+    except (AttributeError, ImportError):
+        attributes = _windows_file_attributes(path)
+        if attributes is not None and attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise ValueError("helper output file must not be a reparse point")
+        return os.open(path, os.O_WRONLY | os.O_TRUNC)
+
+
 def _emit(payload: dict[str, object], output: str | None) -> None:
     text = json.dumps(payload, ensure_ascii=False)
     if not output:
@@ -81,11 +179,14 @@ def _emit(payload: dict[str, object], output: str | None) -> None:
         return
     # Open the pre-created response file directly (no exists()/open() gap) and
     # refuse symlinks so a tmp-dir race cannot redirect the secret elsewhere.
-    flags = os.O_WRONLY | os.O_TRUNC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(output, flags)
+        if os.name == "nt":
+            fd = _open_output_file_win32(output)
+        else:
+            flags = os.O_WRONLY | os.O_TRUNC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(output, flags)
     except FileNotFoundError:
         raise ValueError("helper output file must already exist") from None
     except OSError as exc:
@@ -94,6 +195,12 @@ def _emit(payload: dict[str, object], output: str | None) -> None:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise ValueError("helper output file must be a regular file")
+        if hasattr(os, "getuid"):
+            try:
+                if os.fstat(fd).st_uid != os.getuid():
+                    raise ValueError("helper output file must be owned by the current user")
+            except (AttributeError, OSError):
+                pass
         if hasattr(os, "fchmod"):
             try:
                 os.fchmod(fd, 0o600)

@@ -16,6 +16,26 @@ from typing import Any, Callable, Iterator, Literal
 _LOCKS_GUARD = threading.Lock()
 _LOCKS: dict[str, threading.RLock] = {}
 
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _windows_file_attributes(path: Path) -> int | None:
+    try:
+        import ctypes
+
+        func = ctypes.windll.kernel32.GetFileAttributesW
+        func.argtypes = [ctypes.c_wchar_p]
+        func.restype = ctypes.c_uint32
+    except Exception:
+        return None
+    try:
+        value = func(str(path))
+    except Exception:
+        return None
+    if value == 0xFFFFFFFF:
+        return None
+    return int(value)
+
 
 class CorruptJsonError(ValueError):
     """Raised when an existing JSON document cannot be safely loaded."""
@@ -36,6 +56,82 @@ def _thread_lock(path: Path) -> threading.RLock:
         return _LOCKS.setdefault(key, threading.RLock())
 
 
+def _open_lock_file_win32(path: Path):
+    """Open a lock file without following reparse points (no check/open race)."""
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        get_file_info = kernel32.GetFileInformationByHandle
+        get_file_info.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        get_file_info.restype = wintypes.BOOL
+
+        class BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("dwFileAttributes", wintypes.DWORD),
+                ("ftCreationTime", wintypes.FILETIME),
+                ("ftLastAccessTime", wintypes.FILETIME),
+                ("ftLastWriteTime", wintypes.FILETIME),
+                ("dwVolumeSerialNumber", wintypes.DWORD),
+                ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD),
+                ("nNumberOfLinks", wintypes.DWORD),
+                ("nFileIndexHigh", wintypes.DWORD),
+                ("nFileIndexLow", wintypes.DWORD),
+            ]
+
+        GENERIC_READ = 0x80000000
+        GENERIC_WRITE = 0x40000000
+        FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        FILE_SHARE_DELETE = 0x00000004
+        OPEN_ALWAYS = 4
+        FILE_ATTRIBUTE_NORMAL = 0x80
+        FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+
+        handle = create_file(
+            str(path),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        if not handle or handle == wintypes.HANDLE(-1).value:
+            raise OSError(f"CreateFileW failed for lock file: {path}")
+        try:
+            info = BY_HANDLE_FILE_INFORMATION()
+            if not get_file_info(handle, ctypes.byref(info)):
+                raise OSError(f"GetFileInformationByHandle failed for lock file: {path}")
+            if info.dwFileAttributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+                raise OSError("lock file must not be a reparse point")
+            return os.fdopen(
+                msvcrt.open_osfhandle(handle, os.O_RDWR | os.O_APPEND | os.O_BINARY), "a+b"
+            )
+        except Exception:
+            kernel32.CloseHandle(handle)
+            raise
+    except (AttributeError, ImportError):
+        attributes = _windows_file_attributes(path)
+        if attributes is not None and attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OSError("lock file must not be a reparse point")
+        return path.open("a+b")
+
+
 @contextmanager
 def locked(path: Path) -> Iterator[None]:
     """Hold a per-path thread lock and a best-effort inter-process lock."""
@@ -45,7 +141,13 @@ def locked(path: Path) -> Iterator[None]:
     with thread_lock:
         lock_path = path.with_name(f".{path.name}.lock")
         try:
-            lock_file = lock_path.open("a+b")
+            if os.name == "nt":
+                lock_file = _open_lock_file_win32(lock_path)
+            else:
+                flags = os.O_RDWR | os.O_CREAT
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                lock_file = os.fdopen(os.open(lock_path, flags, 0o600), "a+b")
         except OSError:
             # Read-only or sandboxed directories cannot create a sidecar lock.
             # The in-process lock still protects threads; the actual read/write
@@ -169,11 +271,8 @@ def _write_unlocked(path: Path, data: Any, *, private: bool = False) -> None:
         except OSError:
             previous_mode = None
     try:
-        if private:
-            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            handle = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
-        else:
-            handle = temp.open("w", encoding="utf-8", newline="\n")
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        handle = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
         with handle:
             json.dump(data, handle, ensure_ascii=False, indent=2)
             handle.write("\n")

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import io
-import tarfile
 import zipfile
 from types import SimpleNamespace
 
@@ -187,6 +185,17 @@ def test_exhausted_key_pool_counts_failure_and_switches_model(
     assert result["attempts"][0]["fail_count"] == 1
 
 
+def test_unsigned_install_is_disabled(isolated_home, tmp_path):
+    dummy = tmp_path / "fake.zip"
+    with zipfile.ZipFile(dummy, "w") as zf:
+        zf.writestr("PiManager/README.txt", "x")
+
+    out = extras.apply_manager_update_inplace(dummy)
+    assert out["ok"] is False
+    assert out.get("need_exit") is False
+    assert "签名更新链" in out["message"]
+
+
 def test_two_failed_keys_count_as_one_model_failure_before_switch(
     isolated_home, monkeypatch
 ):
@@ -230,64 +239,3 @@ def test_two_failed_keys_count_as_one_model_failure_before_switch(
         "invalid",
         "invalid",
     ]
-
-
-def test_unsigned_download_and_install_are_disabled(isolated_home, tmp_path):
-    dummy = tmp_path / "fake.zip"
-    with zipfile.ZipFile(dummy, "w") as zf:
-        zf.writestr("PiManager/README.txt", "x")
-
-    with pytest.raises(RuntimeError, match="签名更新链"):
-        extras.download_manager_update("https://example.invalid/update.zip", tmp_path)
-    out = extras.apply_manager_update_inplace(dummy)
-    assert out["ok"] is False
-    assert out.get("need_exit") is False
-    assert "签名更新链" in out["message"]
-
-
-@pytest.mark.parametrize("member", ["../outside.txt", "/absolute.txt", "C:/escape.txt"])
-def test_update_zip_rejects_escaping_paths(tmp_path, member):
-    archive = tmp_path / "bad.zip"
-    with zipfile.ZipFile(archive, "w") as bundle:
-        bundle.writestr(member, "bad")
-    with pytest.raises(ValueError, match="非法路径"):
-        extras._extract_update_archive(archive, tmp_path / "stage")
-    assert not (tmp_path / "outside.txt").exists()
-
-
-def test_update_zip_rejects_symlinks_and_case_collisions(tmp_path):
-    symlink_archive = tmp_path / "symlink.zip"
-    link = zipfile.ZipInfo("PiManager/link")
-    link.create_system = 3
-    link.external_attr = (0o120777 << 16)
-    with zipfile.ZipFile(symlink_archive, "w") as bundle:
-        bundle.writestr(link, "../../outside")
-    with pytest.raises(ValueError, match="符号链接"):
-        extras._extract_update_archive(symlink_archive, tmp_path / "symlink-stage")
-
-    collision_archive = tmp_path / "collision.zip"
-    with zipfile.ZipFile(collision_archive, "w") as bundle:
-        bundle.writestr("PiManager/A.txt", "a")
-        bundle.writestr("pimanager/a.TXT", "b")
-    with pytest.raises(ValueError, match="大小写冲突"):
-        extras._extract_update_archive(collision_archive, tmp_path / "collision-stage")
-
-
-def test_update_tar_rejects_path_links_and_special_members(tmp_path):
-    cases = [
-        ("../outside.txt", tarfile.REGTYPE, b"bad", "非法路径"),
-        ("PiManager/link", tarfile.SYMTYPE, b"", "特殊成员"),
-        ("PiManager/hard", tarfile.LNKTYPE, b"", "特殊成员"),
-    ]
-    for index, (name, kind, data, message) in enumerate(cases):
-        archive = tmp_path / f"bad-{index}.tar.gz"
-        with tarfile.open(archive, "w:gz") as bundle:
-            info = tarfile.TarInfo(name)
-            info.type = kind
-            info.size = len(data)
-            if kind in {tarfile.SYMTYPE, tarfile.LNKTYPE}:
-                info.linkname = "../../outside.txt"
-            bundle.addfile(info, io.BytesIO(data) if data else None)
-        with pytest.raises(ValueError, match=message):
-            extras._extract_update_archive(archive, tmp_path / f"stage-{index}")
-    assert not (tmp_path / "outside.txt").exists()

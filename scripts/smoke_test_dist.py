@@ -48,6 +48,43 @@ def resolve_binary(dist: Path, plat: str) -> Path:
     raise FileNotFoundError(f"no packaged binary under {dist} for platform={plat}")
 
 
+def resolve_onefile(dist: Path, plat: str) -> Path | None:
+    if plat == "windows":
+        candidate = dist / "PiManager.exe"
+    elif plat == "macos":
+        candidate = dist / "PiManager.app" / "Contents" / "MacOS" / "PiManager"
+    else:
+        candidate = dist / "PiManager"
+    return candidate if candidate.exists() else None
+
+
+def run_self_check(binary: Path, plat: str, env: dict[str, str], timeout: int) -> tuple[int, str]:
+    cmd = [str(binary), "--self-check"]
+    if plat == "linux":
+        # Prefer xvfb when available for extra realism, still keep offscreen fallback.
+        if subprocess.call(["bash", "-lc", "command -v xvfb-run >/dev/null"], stdout=subprocess.DEVNULL) == 0:
+            cmd = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24", str(binary), "--self-check"]
+    started = time.time()
+    proc = subprocess.run(
+        cmd,
+        env=env,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=timeout,
+        check=False,
+    )
+    elapsed = time.time() - started
+    print(f"exit={proc.returncode} elapsed={elapsed:.1f}s")
+    if proc.stdout:
+        print("--- stdout ---")
+        print(proc.stdout)
+    if proc.stderr:
+        print("--- stderr ---")
+        print(proc.stderr)
+    return proc.returncode, proc.stdout or ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--platform", default=detect_platform())
@@ -74,35 +111,12 @@ def main() -> int:
         existing = env.get("LD_LIBRARY_PATH", "")
         env["LD_LIBRARY_PATH"] = ":".join([d for d in lib_dirs if Path(d).is_dir()] + ([existing] if existing else []))
 
-    cmd = [str(binary), "--self-check"]
-    if plat == "linux":
-        # Prefer xvfb when available for extra realism, still keep offscreen fallback.
-        if subprocess.call(["bash", "-lc", "command -v xvfb-run >/dev/null"], stdout=subprocess.DEVNULL) == 0:
-            cmd = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24", str(binary), "--self-check"]
-
-    started = time.time()
-    proc = subprocess.run(
-        cmd,
-        env=env,
-        capture_output=True,
-        text=True,
-        errors="replace",
-        timeout=args.timeout,
-        check=False,
-    )
-    elapsed = time.time() - started
-    print(f"exit={proc.returncode} elapsed={elapsed:.1f}s")
-    if proc.stdout:
-        print("--- stdout ---")
-        print(proc.stdout)
-    if proc.stderr:
-        print("--- stderr ---")
-        print(proc.stderr)
-    if proc.returncode != 0:
-        return proc.returncode
+    returncode, stdout = run_self_check(binary, plat, env, args.timeout)
+    if returncode != 0:
+        return returncode
     if args.expected_version:
         marker = f"version={args.expected_version}"
-        if marker not in (proc.stdout or ""):
+        if marker not in stdout:
             print(
                 f"FAIL: packaged version mismatch; expected {marker!r}",
                 file=sys.stderr,
@@ -136,6 +150,22 @@ def main() -> int:
             # Older layout may keep libs next to binary; warn only if completely empty tree
             if len(list(binary.parent.iterdir())) < 3:
                 print("FAIL: Linux onedir looks incomplete", file=sys.stderr)
+                return 2
+
+    # onefile products land directly in dist/ root; validate them too when present.
+    onefile = resolve_onefile(dist, plat)
+    if onefile is not None and onefile != binary:
+        print(f"smoke onefile: {onefile}")
+        returncode, stdout = run_self_check(onefile, plat, env, args.timeout)
+        if returncode != 0:
+            return returncode
+        if args.expected_version:
+            marker = f"version={args.expected_version}"
+            if marker not in stdout:
+                print(
+                    f"FAIL: packaged onefile version mismatch; expected {marker!r}",
+                    file=sys.stderr,
+                )
                 return 2
 
     print("smoke-test: OK")

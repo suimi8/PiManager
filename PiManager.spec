@@ -6,12 +6,18 @@ macOS            -> dist/PiManager.app
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 project_root = Path(SPECPATH)
+extras_source = (project_root / "pi_manager" / "extras.py").read_text(encoding="utf-8")
+match = re.search(r"APP_VERSION\s*=\s*\"([^\"]+)\"", extras_source)
+if not match:
+    raise SystemExit("cannot extract APP_VERSION from pi_manager/extras.py")
+APP_VERSION = match.group(1)
 datas = [(str(project_root / "assets"), "assets")]
 datas += collect_data_files("certifi")
 
@@ -191,8 +197,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "PiManager",
             "CFBundleDisplayName": "PiManager",
-            "CFBundleShortVersionString": "1.8.0",
-            "CFBundleVersion": "1.8.0",
+            "CFBundleShortVersionString": APP_VERSION,
+            "CFBundleVersion": APP_VERSION,
             "CFBundlePackageType": "APPL",
             "CFBundleExecutable": "PiManager",
             "LSMinimumSystemVersion": "12.0",

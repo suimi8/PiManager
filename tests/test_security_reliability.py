@@ -6,6 +6,7 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
@@ -64,12 +65,14 @@ def test_tampered_vault_fails_closed_and_is_not_overwritten(isolated_home):
 
 def test_config_broker_concurrent_field_mutations_preserve_settings(isolated_home):
     core.save_settings({"unrelated": "keep", "enabledModels": ["Base/m"]})
+    token = config_broker._create_broker_token()
 
     def switch(index: int):
         result = config_broker.mutate(
             {
                 "schema_version": 1,
                 "request_id": str(index),
+                "token": token,
                 "operation": "set_default_model",
                 "arguments": {
                     "provider": "P",
@@ -132,6 +135,62 @@ def test_private_write_clamps_backup_of_previously_wide_file(isolated_home, tmp_
         assert (tmp_path / "cfg.json.bak.1").stat().st_mode & 0o077 == 0
 
 
+def test_session_delete_and_rename_are_confined_to_sessions_dir(isolated_home):
+    from pi_manager import extras
+
+    sessions = core.sessions_dir()
+    sessions.mkdir(parents=True)
+    inside = sessions / "inside.json"
+    inside.write_text("{}", encoding="utf-8")
+    outside = Path(isolated_home) / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+
+    assert extras.session_delete(str(inside)) is True
+    assert not inside.exists()
+    assert extras.session_delete(str(outside)) is False
+    assert outside.exists()
+
+    keep = sessions / "keep.json"
+    keep.write_text("{}", encoding="utf-8")
+    renamed = extras.session_rename(str(keep), "renamed")
+    assert Path(renamed).name == "renamed.json"
+    assert (sessions / "renamed.json").exists()
+
+    with pytest.raises(ValueError):
+        extras.session_rename(str(renamed), "../escape")
+    with pytest.raises(ValueError):
+        extras.session_rename(str(renamed), "sub/name")
+    with pytest.raises(ValueError):
+        extras.session_rename(str(renamed), "")
+
+
+def test_proxy_settings_reject_non_http_schemes(isolated_home):
+    from pi_manager import extras
+
+    with pytest.raises(ValueError, match="代理"):
+        extras.set_proxy_settings(True, "file:///etc/passwd")
+    with pytest.raises(ValueError, match="代理"):
+        extras.set_proxy_settings(True, "not-a-url")
+    assert extras.set_proxy_settings(True, "http://proxy.example:8080")["url"] == (
+        "http://proxy.example:8080"
+    )
+    assert extras.set_proxy_settings(False, "")["url"] == ""
+
+
+def test_failure_reason_strips_control_characters(isolated_home):
+    core.upsert_custom_provider(
+        "Sanitize",
+        base_url="https://example.invalid/v1",
+        api_key="sk-sanitize",
+        models=[{"id": "m"}],
+    )
+    row = core.list_provider_api_keys("Sanitize")[0]
+    evil = "boom\x00\x01\x1b[31m\x07\u0007\nnext"
+    secrets.mark_provider_key_failed("Sanitize", row["id"], evil)
+    stored = core.list_provider_api_keys("Sanitize")[0]["failure_reason"]
+    assert stored == "boom[31m\nnext"
+
+
 def test_import_write_path_keeps_manager_config_private(isolated_home, tmp_path):
     from pi_manager import extras
 
@@ -168,13 +227,58 @@ def test_provider_env_output_must_be_existing_regular_file(isolated_home, tmp_pa
     with pytest.raises(ValueError):
         provider_env._emit({"ok": True}, str(tmp_path / "missing.json"))
 
-    if os.name != "nt":
-        real = tmp_path / "real.json"
-        real.write_text("", encoding="utf-8")
-        link = tmp_path / "link.json"
+    real = tmp_path / "real.json"
+    real.write_text("", encoding="utf-8")
+    link = tmp_path / "link.json"
+    try:
         link.symlink_to(real)
-        with pytest.raises(ValueError):
-            provider_env._emit({"ok": True}, str(link))
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is unavailable")
+    with pytest.raises(ValueError):
+        provider_env._emit({"ok": True}, str(link))
+
+
+def test_lock_file_symlink_is_never_followed(isolated_home, tmp_path):
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"")
+    lock = tmp_path / ".cfg.json.lock"
+    try:
+        lock.symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is unavailable")
+    cfg = tmp_path / "cfg.json"
+    storage.save_json(cfg, {"ok": True})
+    assert target.read_bytes() == b""
+    assert json.loads(cfg.read_text(encoding="utf-8")) == {"ok": True}
+
+
+def test_master_key_reparse_point_is_rejected(isolated_home, monkeypatch):
+    if os.name != "nt":
+        pytest.skip("reparse-point checks are Windows-only")
+    monkeypatch.setattr(
+        secrets,
+        "_windows_file_attributes",
+        lambda path: secrets._FILE_ATTRIBUTE_REPARSE_POINT
+        if str(path).endswith(".vault_master_key")
+        else None,
+    )
+    with pytest.raises(secrets.VaultCorruptError):
+        secrets._load_or_create_master_key()
+
+
+def test_master_key_check_skips_when_api_unavailable(isolated_home, monkeypatch):
+    monkeypatch.setattr(secrets, "_windows_file_attributes", lambda path: None)
+    key = secrets._load_or_create_master_key()
+    assert len(key) == 32
+
+
+def test_broker_token_creation_is_exclusive(isolated_home):
+    token = config_broker._create_broker_token()
+    assert len(token) == 64
+    with pytest.raises(FileExistsError):
+        config_broker._create_broker_token()
+    assert config_broker._verify_broker_token(token) is True
+    assert config_broker._verify_broker_token("wrong-token") is False
 
 
 def test_provider_redirect_does_not_replay_credentials(monkeypatch):

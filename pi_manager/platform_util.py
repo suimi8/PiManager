@@ -2,6 +2,7 @@
 """Cross-platform helpers for Pi Manager (Windows / macOS / Linux)."""
 from __future__ import annotations
 
+import logging
 import os
 import shlex
 import shutil
@@ -10,6 +11,8 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Iterable
+
+logger = logging.getLogger(__name__)
 
 
 def is_windows() -> bool:
@@ -40,7 +43,7 @@ def subprocess_no_window_kwargs() -> dict:
     return {}
 
 
-def open_path(path: str | Path, *, select_if_file: bool = False) -> None:
+def open_path(path: str | Path, *, select_if_file: bool = False) -> bool:
     p = Path(path).expanduser()
     if not p.exists():
         try:
@@ -48,33 +51,43 @@ def open_path(path: str | Path, *, select_if_file: bool = False) -> None:
                 p.parent.mkdir(parents=True, exist_ok=True)
             else:
                 p.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.warning("创建路径失败: %s: %s", p, exc)
+            return False
 
     if is_windows():
-        if select_if_file and p.is_file():
-            subprocess.Popen(["explorer", "/select,", str(p)])
-        else:
-            os.startfile(str(p if p.exists() else p.parent))  # type: ignore[attr-defined]
-        return
+        try:
+            if select_if_file and p.is_file():
+                subprocess.Popen(["explorer", "/select,", str(p)])
+            else:
+                os.startfile(str(p if p.exists() else p.parent))  # type: ignore[attr-defined]
+        except OSError as exc:
+            logger.warning("打开路径失败: %s: %s", p, exc)
+            return False
+        return True
 
     if is_macos():
-        if select_if_file and p.is_file():
-            subprocess.Popen(["open", "-R", str(p)])
-        else:
-            target = p if p.exists() else p.parent
-            subprocess.Popen(["open", str(target)])
-        return
+        try:
+            if select_if_file and p.is_file():
+                subprocess.Popen(["open", "-R", str(p)])
+            else:
+                target = p if p.exists() else p.parent
+                subprocess.Popen(["open", str(target)])
+        except OSError as exc:
+            logger.warning("打开路径失败: %s: %s", p, exc)
+            return False
+        return True
 
     target = p if p.is_dir() or not p.exists() else (p.parent if select_if_file and p.is_file() else p)
     target_s = str(target if target.exists() else p.parent)
     for args in (["xdg-open", target_s], ["gio", "open", target_s]):
         try:
             subprocess.Popen(args)
-            return
+            return True
         except FileNotFoundError:
             continue
-    raise FileNotFoundError("未找到 xdg-open，无法打开路径")
+    logger.warning("未找到 xdg-open 或 gio，无法打开路径: %s", target_s)
+    return False
 
 
 def which_many(names: Iterable[str]) -> str | None:
@@ -228,29 +241,14 @@ def _linux_terminal_prefix(mode: str = "auto") -> tuple[str, list[str]] | None:
     return None
 
 
-def _proxy_port_reachable(proxy_url: str, timeout: float = 0.4) -> bool:
-    """Quick TCP probe of a proxy endpoint (no core import — avoids cycles)."""
-    import socket
-    from urllib.parse import urlsplit
-
-    try:
-        parts = urlsplit(str(proxy_url or ""))
-        if parts.scheme not in {"http", "https"}:
-            return False
-        host = parts.hostname or "127.0.0.1"
-        port = parts.port or (443 if parts.scheme == "https" else 80)
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except Exception:
-        return False
-
-
 def launch_in_terminal(
     argv: list[str],
     workdir: str,
     terminal: str = "auto",
     env: dict[str, str] | None = None,
 ) -> str:
+    from .core import proxy_reachable
+
     workdir = str(Path(workdir).expanduser())
     Path(workdir).mkdir(parents=True, exist_ok=True)
     full_env = os.environ.copy()
@@ -265,7 +263,7 @@ def launch_in_terminal(
     # directly instead.
     for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
         value = full_env.get(var)
-        if value and not _proxy_port_reachable(value):
+        if value and not proxy_reachable(value):
             full_env.pop(var, None)
     mode = (terminal or "auto").lower()
     if is_windows():
@@ -355,10 +353,17 @@ def _launch_macos(argv: list[str], workdir: str, mode: str, env: dict[str, str])
     if changed_env:
         # Terminal.app may be an already-running app and therefore not inherit
         # the caller's environment. Keep the secret out of AppleScript and the
-        # visible command line: a mode-0700 wrapper self-deletes on start.
+        # visible command line: a 0600 wrapper (invoked via sh, no exec bit
+        # needed) self-deletes on start.
         fd, wrapper_name = tempfile.mkstemp(prefix="pi-manager-", suffix=".sh")
         wrapper = Path(wrapper_name)
         try:
+            # mkstemp already creates 0600; clamp explicitly before writing so
+            # no wider umask window exists, and never follow symlinks.
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
             lines = ["#!/bin/sh", "set -eu"]
             for key, value in changed_env.items():
                 if not key or not key.replace("_", "").isalnum():
@@ -374,7 +379,12 @@ def _launch_macos(argv: list[str], workdir: str, mode: str, env: dict[str, str])
             )
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write("\n".join(lines))
-            os.chmod(wrapper, 0o700)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.chmod(wrapper, 0o600)
+            except OSError:
+                pass
         except Exception:
             try:
                 os.close(fd)

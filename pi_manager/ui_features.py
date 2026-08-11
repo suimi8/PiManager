@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -22,6 +23,9 @@ from PySide6.QtWidgets import (
 from . import core
 from . import extras
 from . import help_docs
+
+
+logger = logging.getLogger(__name__)
 
 
 def _make_tray_icon(color: str = "#3d8bfd") -> QIcon:
@@ -69,8 +73,8 @@ class FeatureMixin:
         self.health_timer = None
         try:
             extras.apply_proxy_env()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("apply proxy env failed: %s", e)
 
     def setup_system_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -142,6 +146,7 @@ class FeatureMixin:
         if self.tray:
             self.tray.hide()
         self._shutdown_background_tasks()
+        self._close_rpc_session()
         from PySide6.QtWidgets import QApplication
 
         QApplication.instance().quit()
@@ -174,9 +179,19 @@ class FeatureMixin:
         if self.tray:
             self.tray.hide()
         self._shutdown_background_tasks()
+        self._close_rpc_session()
         event.accept()
         from PySide6.QtWidgets import QApplication
         QApplication.instance().quit()
+
+    def _close_rpc_session(self):
+        """Terminate the persistent pi RPC child so it does not outlive the app."""
+        try:
+            from . import rpc_session
+
+            rpc_session.reset_chat_session()
+        except Exception as e:
+            logger.warning("close rpc session failed: %s", e)
 
     def _setup_health_timer(self):
         mins = 0
@@ -542,8 +557,8 @@ class FeatureMixin:
             # 测试前同步输入框中的 Key，避免用户忘记点「保存设置」
             try:
                 core.set_zhipu_api_key(key)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("sync zhipu api key from input failed: %s", e)
         if not core.zhipu_api_key():
             QMessageBox.warning(
                 self,
@@ -799,67 +814,6 @@ class FeatureMixin:
             except Exception:
                 core.open_path(page)
 
-    def _download_manager_update(self, res: dict | None = None, apply_inplace: bool = False):
-        res = res or getattr(self, "_last_manager_update", {}) or {}
-        url = str(res.get("download") or res.get("url") or "").strip()
-        if not url:
-            QMessageBox.information(self, "提示", "没有可用的下载地址")
-            return
-        self.status.showMessage("正在下载更新包…")
-
-        def job():
-            return extras.download_manager_update(url)
-
-        w = self._track(self._worker_fn(job))
-
-        def _done(r: dict):
-            path = str((r or {}).get("path") or "")
-            self.status.showMessage((r or {}).get("message") or "下载完成")
-            if apply_inplace and path:
-                self._apply_manager_update_inplace(path)
-                return
-            ret = QMessageBox.question(
-                self,
-                "下载完成",
-                f"{(r or {}).get('message') or path}\n\n"
-                "可「立即更新并重启」（推荐打包版），或打开文件夹手动替换。\n是否打开所在文件夹？",
-            )
-            if ret == QMessageBox.Yes and path:
-                core.open_in_explorer(path)
-
-        w.done.connect(_done)
-        w.failed.connect(lambda e: QMessageBox.warning(self, "下载失败", e))
-        w.start()
-
-    def _apply_manager_update_inplace(self, archive_path: str):
-        try:
-            out = extras.apply_manager_update_inplace(archive_path)
-        except Exception as e:
-            QMessageBox.warning(self, "更新失败", str(e))
-            return
-        if not out.get("ok"):
-            QMessageBox.information(self, "无法自动更新", out.get("message") or "请手动替换安装包")
-            if out.get("source"):
-                try:
-                    core.open_in_explorer(str(out.get("source")))
-                except Exception:
-                    pass
-            return
-        QMessageBox.information(
-            self,
-            "即将重启更新",
-            out.get("message") or "程序将退出，更新器会覆盖安装目录并重新启动。",
-        )
-        # 退出，让外部脚本完成覆盖
-        try:
-            from PySide6.QtWidgets import QApplication
-
-            QApplication.instance().quit()
-        except Exception:
-            import sys
-
-            sys.exit(0)
-
     # ---- sessions extras ----
     def session_selected_path(self) -> str | None:
         rows = self.sessions_table.selectionModel().selectedRows()
@@ -991,8 +945,8 @@ class FeatureMixin:
             from . import rpc_session
 
             rpc_session.reset_chat_session()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("reset chat session failed: %s", e)
         self.status.showMessage("已清空对话历史")
 
     def _describe_attachments(
