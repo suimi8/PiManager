@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 
 from pi_manager import core
@@ -73,6 +74,8 @@ def test_cmd_launch_creates_console_without_nested_shell(monkeypatch, tmp_path):
 
 def test_launch_drops_unreachable_proxy_vars(monkeypatch, tmp_path):
     calls = []
+    monkeypatch.setattr(platform_util, "is_windows", lambda: True)
+    monkeypatch.setattr(platform_util, "is_macos", lambda: False)
     monkeypatch.setattr(platform_util.shutil, "which", lambda name: None)
     monkeypatch.setattr(
         core,
@@ -99,6 +102,8 @@ def test_launch_drops_unreachable_proxy_vars(monkeypatch, tmp_path):
 
 def test_launch_keeps_reachable_proxy_vars(monkeypatch, tmp_path):
     calls = []
+    monkeypatch.setattr(platform_util, "is_windows", lambda: True)
+    monkeypatch.setattr(platform_util, "is_macos", lambda: False)
     monkeypatch.setattr(platform_util.shutil, "which", lambda name: None)
     monkeypatch.setattr(core, "proxy_reachable", lambda url, timeout=0.4: True)
     monkeypatch.setattr(
@@ -118,6 +123,38 @@ def test_launch_keeps_reachable_proxy_vars(monkeypatch, tmp_path):
     assert calls[0][1]["env"]["HTTPS_PROXY"] == "http://127.0.0.1:7890"
 
 
+def test_launch_macos_wrapper_omits_unreachable_proxy(monkeypatch, tmp_path):
+    calls = []
+    wrapper = tmp_path / "pi-manager-launch-test.sh"
+    monkeypatch.setattr(platform_util, "is_windows", lambda: False)
+    monkeypatch.setattr(platform_util, "is_macos", lambda: True)
+    monkeypatch.setattr(core, "proxy_reachable", lambda url, timeout=0.4: False)
+
+    def fake_mkstemp(prefix, suffix):
+        fd = os.open(str(wrapper), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        return fd, str(wrapper)
+
+    monkeypatch.setattr(os, "fchmod", lambda fd, mode: None, raising=False)
+    monkeypatch.setattr(platform_util.tempfile, "mkstemp", fake_mkstemp)
+    monkeypatch.setattr(
+        platform_util.subprocess,
+        "Popen",
+        lambda args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    platform_util.launch_in_terminal(
+        ["pi"],
+        str(tmp_path),
+        terminal="auto",
+        env={"HTTPS_PROXY": "http://127.0.0.1:1", "KEEP": "1"},
+    )
+
+    content = wrapper.read_text(encoding="utf-8")
+    assert "HTTPS_PROXY" not in content
+    assert "export KEEP=1" in content
+    assert calls
+
+
 def test_open_path_returns_false_without_opener(monkeypatch, tmp_path):
     monkeypatch.setattr(platform_util, "is_windows", lambda: False)
     monkeypatch.setattr(platform_util, "is_macos", lambda: False)
@@ -135,7 +172,7 @@ def test_open_path_windows_opens_existing_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(platform_util, "is_windows", lambda: True)
     monkeypatch.setattr(platform_util, "is_macos", lambda: False)
     monkeypatch.setattr(
-        platform_util.os, "startfile", lambda p: calls.append(str(p))
+        platform_util.os, "startfile", lambda p: calls.append(str(p)), raising=False
     )
 
     assert platform_util.open_path(str(tmp_path)) is True

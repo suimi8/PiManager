@@ -170,6 +170,8 @@ def test_sanitize_proxy_env_is_public_with_private_alias(monkeypatch):
 
 
 def test_project_name_from_path_is_public_with_private_alias():
-    assert core.project_name_from_path(r"C:\Users\me\app") == "app"
-    assert core._project_name_from_path(r"C:\Users\me\app") == "app"
-    assert core.project_name_from_path("C:\\") == "C:"
+    assert core.project_name_from_path("/home/user/app") == "app"
+    assert core._project_name_from_path("/home/user/app") == "app"
+    if core.sys.platform == "win32":
+        assert core.project_name_from_path(r"C:\Users\me\app") == "app"
+        assert core.project_name_from_path("C:\\") == "C:"
