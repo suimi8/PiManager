@@ -229,6 +229,14 @@ function providerHelperCommand() {
   return managerHelperCommand("--print-provider-env");
 }
 
+function brokerToken() {
+  try {
+    return fs.readFileSync(path.join(agentDir(), ".broker-token"), "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
 function invokeConfigBroker(operation, args) {
   const command = managerHelperCommand("--config-mutate");
   if (!command) {
@@ -236,53 +244,64 @@ function invokeConfigBroker(operation, args) {
       new Error("未找到 Pi Manager Config Broker。请先启动一次 Pi Manager，或设置 pi.providerEnvCommand。")
     );
   }
-  const requestPath = path.join(
-    os.tmpdir(),
-    `pi-manager-config-${process.pid}-${Date.now()}-${crypto.randomUUID()}.json`
-  );
-  const request = {
-    schema_version: 1,
-    request_id: `${process.pid}-${Date.now()}-${crypto.randomUUID()}`,
-    operation,
-    arguments: args || {},
-  };
-  try {
-    fs.writeFileSync(requestPath, JSON.stringify(request), { encoding: "utf8", mode: 0o600, flag: "wx" });
-  } catch (error) {
-    return Promise.reject(new Error(`无法创建 Config Broker 请求：${error.message}`));
-  }
-  const responsePath = path.join(
-    os.tmpdir(),
-    `pi-manager-config-response-${process.pid}-${Date.now()}-${crypto.randomUUID()}.json`
-  );
-  try {
-    const fd = fs.openSync(responsePath, "wx", 0o600);
-    fs.closeSync(fd);
-  } catch (error) {
-    try { fs.unlinkSync(requestPath); } catch {}
-    return Promise.reject(new Error(`无法创建 Config Broker 响应文件：${error.message}`));
-  }
   const [bin, ...baseArgs] = command;
-  return new Promise((resolve, reject) => {
-    execFile(
-      bin,
-      [...baseArgs, requestPath, "--output", responsePath],
-      { windowsHide: true, timeout: 20000 },
-      (error, stdout) => {
-        try {
-          const text = fs.readFileSync(responsePath, "utf8") || String(stdout || "{}");
-          const payload = JSON.parse(text);
-          if (!payload.ok) throw new Error(payload.error || "Config Broker mutation failed");
-          resolve(payload);
-        } catch (parseError) {
-          reject(new Error(error ? `Config Broker 启动失败：${error.message}` : parseError.message));
-        } finally {
-          try { fs.unlinkSync(requestPath); } catch {}
-          try { fs.unlinkSync(responsePath); } catch {}
-        }
+  let retried = false;
+  const runOnce = (token) =>
+    new Promise((resolve, reject) => {
+      const requestPath = path.join(
+        os.tmpdir(),
+        `pi-manager-config-${process.pid}-${Date.now()}-${crypto.randomUUID()}.json`
+      );
+      const request = {
+        schema_version: 1,
+        request_id: `${process.pid}-${Date.now()}-${crypto.randomUUID()}`,
+        operation,
+        arguments: args || {},
+      };
+      if (token) request.token = token;
+      try {
+        fs.writeFileSync(requestPath, JSON.stringify(request), { encoding: "utf8", mode: 0o600, flag: "wx" });
+      } catch (error) {
+        return Promise.reject(new Error(`无法创建 Config Broker 请求：${error.message}`));
       }
-    );
-  });
+      const responsePath = path.join(
+        os.tmpdir(),
+        `pi-manager-config-response-${process.pid}-${Date.now()}-${crypto.randomUUID()}.json`
+      );
+      try {
+        const fd = fs.openSync(responsePath, "wx", 0o600);
+        fs.closeSync(fd);
+      } catch (error) {
+        try { fs.unlinkSync(requestPath); } catch {}
+        return Promise.reject(new Error(`无法创建 Config Broker 响应文件：${error.message}`));
+      }
+      execFile(
+        bin,
+        [...baseArgs, requestPath, "--output", responsePath],
+        { windowsHide: true, timeout: 20000 },
+        (error, stdout) => {
+          try {
+            const text = fs.readFileSync(responsePath, "utf8") || String(stdout || "{}");
+            const payload = JSON.parse(text);
+            if (!payload.ok) {
+              if (!retried && /token/i.test(payload.error || "")) {
+                retried = true;
+                resolve(runOnce(brokerToken()));
+                return;
+              }
+              throw new Error(payload.error || "Config Broker mutation failed");
+            }
+            resolve(payload);
+          } catch (parseError) {
+            reject(new Error(error ? `Config Broker 启动失败：${error.message}` : parseError.message));
+          } finally {
+            try { fs.unlinkSync(requestPath); } catch {}
+            try { fs.unlinkSync(responsePath); } catch {}
+          }
+        }
+      );
+    });
+  return runOnce(brokerToken());
 }
 
 function providerNeedsManagerEnv(provider) {

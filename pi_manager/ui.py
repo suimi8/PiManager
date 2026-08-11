@@ -2717,7 +2717,7 @@ def run_app():
     # PI_MANAGER_DISABLE_SINGLE_INSTANCE=1 可跳过（供测试与嵌入场景使用）。
     server = None
     if os.environ.get("PI_MANAGER_DISABLE_SINGLE_INSTANCE") != "1":
-        from PySide6.QtCore import QLocalServer, QLocalSocket
+        from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
         core.ensure_agent_dir()
         server = QLocalServer(app)
