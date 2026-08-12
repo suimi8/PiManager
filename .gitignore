@@ -40,7 +40,9 @@ desktop.ini
 **/secrets.dpapi
 **/auth.json
 **/.secrets.*
-**/*.lock
+# Lock files (keep specific; avoid over-broad *.lock)
+*.mutation.lock
+*.broker.lock
 
 # Local workbench & build artifacts (not part of the open-source tree)
 work/

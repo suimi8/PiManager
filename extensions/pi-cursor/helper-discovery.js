@@ -60,13 +60,17 @@ function registeredHelperCommand({
   if (command.length > 1 && /\.py$/i.test(command[1])) {
     if (!path.isAbsolute(command[1]) || !pathExists(command[1])) return null;
   }
-  if (platform !== "win32") {
-    const owner = uid !== undefined ? uid : defaultUid();
-    if (!statAllows(statFile(registryFile), owner)) return null;
-    if (!statAllows(statFile(command[0]), owner, { allowRoot: true })) return null;
-    if (command.length > 1 && /\.py$/i.test(command[1])) {
-      if (!statAllows(statFile(command[1]), owner, { allowRoot: true })) return null;
-    }
+  // On all platforms the registry file and executable must not be writable by
+  // others (mode & 0o002).  On POSIX we additionally require the current user
+  // (or root for interpreter paths) to own them.  Windows has no reliable uid
+  // mapping, so ownership is skipped there; the other-write bit check still
+  // guards against globally-writable files and reparse points are rejected by
+  // requiring a regular file via the stat result.
+  const owner = platform === "win32" ? null : (uid !== undefined ? uid : defaultUid());
+  if (!statAllows(statFile(registryFile), owner)) return null;
+  if (!statAllows(statFile(command[0]), owner, { allowRoot: true })) return null;
+  if (command.length > 1 && /\.py$/i.test(command[1])) {
+    if (!statAllows(statFile(command[1]), owner, { allowRoot: true })) return null;
   }
   return command;
 }

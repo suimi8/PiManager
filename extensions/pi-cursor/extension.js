@@ -32,6 +32,8 @@ let viewProvider;
 let askOutput;
 let askRunning = false;
 
+const ownedTempFiles = new Set();
+
 function agentDir() {
   return path.join(os.homedir(), ".pi", "agent");
 }
@@ -261,6 +263,7 @@ function invokeConfigBroker(operation, args) {
       if (token) request.token = token;
       try {
         fs.writeFileSync(requestPath, JSON.stringify(request), { encoding: "utf8", mode: 0o600, flag: "wx" });
+        ownedTempFiles.add(requestPath);
       } catch (error) {
         return Promise.reject(new Error(`无法创建 Config Broker 请求：${error.message}`));
       }
@@ -271,8 +274,9 @@ function invokeConfigBroker(operation, args) {
       try {
         const fd = fs.openSync(responsePath, "wx", 0o600);
         fs.closeSync(fd);
+        ownedTempFiles.add(responsePath);
       } catch (error) {
-        try { fs.unlinkSync(requestPath); } catch {}
+        ownedTempFiles.delete(requestPath); try { fs.unlinkSync(requestPath); } catch {}
         return Promise.reject(new Error(`无法创建 Config Broker 响应文件：${error.message}`));
       }
       execFile(
@@ -295,8 +299,8 @@ function invokeConfigBroker(operation, args) {
           } catch (parseError) {
             reject(new Error(error ? `Config Broker 启动失败：${error.message}` : parseError.message));
           } finally {
-            try { fs.unlinkSync(requestPath); } catch {}
-            try { fs.unlinkSync(responsePath); } catch {}
+            ownedTempFiles.delete(requestPath); try { fs.unlinkSync(requestPath); } catch {}
+            ownedTempFiles.delete(responsePath); try { fs.unlinkSync(responsePath); } catch {}
           }
         }
       );
@@ -326,6 +330,7 @@ function invokeProviderHelper(provider, helperArgs = []) {
     try {
       const fd = fs.openSync(output, "wx", 0o600);
       fs.closeSync(fd);
+      ownedTempFiles.add(output);
     } catch (err) {
       reject(new Error(`无法创建 Pi Manager 临时响应文件：${err.message}`));
       return;
@@ -347,6 +352,7 @@ function invokeProviderHelper(provider, helperArgs = []) {
           return;
         } finally {
           try {
+            ownedTempFiles.delete(output);
             fs.unlinkSync(output);
           } catch {}
         }
@@ -1231,22 +1237,12 @@ class PiManagerViewProvider {
 
 function cleanupStaleTempFiles() {
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  let names;
-  try {
-    names = fs.readdirSync(os.tmpdir());
-  } catch {
-    return;
-  }
-  for (const name of names) {
-    if (
-      !name.startsWith("pi-manager-env-") &&
-      !name.startsWith("pi-manager-config-response-")
-    ) {
-      continue;
-    }
-    const file = path.join(os.tmpdir(), name);
+  for (const file of ownedTempFiles) {
     try {
-      if (fs.statSync(file).mtimeMs < cutoff) fs.unlinkSync(file);
+      if (fs.statSync(file).mtimeMs < cutoff) {
+        fs.unlinkSync(file);
+        ownedTempFiles.delete(file);
+      }
     } catch {}
   }
 }

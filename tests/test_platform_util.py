@@ -125,21 +125,29 @@ def test_launch_keeps_reachable_proxy_vars(monkeypatch, tmp_path):
 
 def test_launch_macos_wrapper_omits_unreachable_proxy(monkeypatch, tmp_path):
     calls = []
-    wrapper = tmp_path / "pi-manager-launch-test.sh"
+    wrapper_dir = tmp_path / "pi-manager-wrapper-dir"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "wrapper.sh"
     monkeypatch.setattr(platform_util, "is_windows", lambda: False)
     monkeypatch.setattr(platform_util, "is_macos", lambda: True)
     monkeypatch.setattr(core, "proxy_reachable", lambda url, timeout=0.4: False)
 
-    def fake_mkstemp(prefix, suffix):
-        fd = os.open(str(wrapper), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        return fd, str(wrapper)
+    def fake_mkdtemp(prefix):
+        return str(wrapper_dir)
+
+    def fake_popen(args, **kwargs):
+        calls.append((args, kwargs))
+        class _FakeProc:
+            returncode = 0
+            pid = 12345
+        return _FakeProc()
 
     monkeypatch.setattr(os, "fchmod", lambda fd, mode: None, raising=False)
-    monkeypatch.setattr(platform_util.tempfile, "mkstemp", fake_mkstemp)
+    monkeypatch.setattr(platform_util.tempfile, "mkdtemp", fake_mkdtemp)
     monkeypatch.setattr(
         platform_util.subprocess,
         "Popen",
-        lambda args, **kwargs: calls.append((args, kwargs)),
+        fake_popen,
     )
 
     platform_util.launch_in_terminal(

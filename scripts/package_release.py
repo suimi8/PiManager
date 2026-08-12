@@ -173,12 +173,14 @@ def main() -> int:
         _ensure_executable(binary)
         # Ad-hoc sign for local consistency (not a Developer ID signature).
         if shutil.which("codesign"):
-            subprocess.run(
-                ["codesign", "--force", "--deep", "--sign", "-", str(app)],
+            result = subprocess.run(
+                ["codesign", "--force", "--sign", "-", str(app)],
                 check=False,
                 capture_output=True,
                 text=True,
             )
+            if result.returncode != 0:
+                print(f"warning: codesign failed: {result.stderr.strip()}", file=sys.stderr)
         machine = platform.machine().lower()
         if machine in {"arm64", "aarch64"}:
             target = out / f"PiManager-v{version}-macos-arm64.zip"

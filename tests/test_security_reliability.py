@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -430,3 +432,182 @@ def test_provider_key_state_machine(isolated_home):
 
     assert core.classify_provider_key_failure(1, "", "HTTP 500 upstream")["status"] == ""
     assert core.classify_provider_key_failure(1, "", "connect timed out")["status"] == ""
+
+
+def test_plaintext_vault_is_accepted_for_backward_compat(tmp_path, monkeypatch):
+    """A vault file that is plain JSON (no encryption prefix) is accepted
+    for backward compatibility, but encrypted files that fail to decrypt
+    raise VaultCorruptError."""
+    from pi_manager import secrets as secretstore
+
+    monkeypatch.setattr(secretstore, "_vault_path", lambda: tmp_path / "secrets.vault")
+    monkeypatch.setattr(secretstore, "_master_key_path", lambda: tmp_path / ".vault_master_key")
+    monkeypatch.setattr(secretstore, "_index_path", lambda: tmp_path / "secrets.index.json")
+    monkeypatch.setattr(secretstore, "_legacy_vault_path", lambda: tmp_path / "secrets.dpapi")
+    monkeypatch.setattr(secretstore, "_mutation_lock_path", lambda: tmp_path / "secrets.mutation")
+
+    # Plain JSON without encryption prefix should work (backward compat)
+    plain_data = {"test_key": "test_value"}
+    (tmp_path / "secrets.vault").write_text(json.dumps(plain_data), encoding="utf-8")
+    result = secretstore.load_vault()
+    assert result.get("test_key") == "test_value"
+
+
+def test_corrupt_encrypted_vault_fails_closed(tmp_path, monkeypatch):
+    """An encrypted vault with tampered ciphertext must fail closed."""
+    from pi_manager import secrets as secretstore
+
+    monkeypatch.setattr(secretstore, "_vault_path", lambda: tmp_path / "secrets.vault")
+    monkeypatch.setattr(secretstore, "_master_key_path", lambda: tmp_path / ".vault_master_key")
+    monkeypatch.setattr(secretstore, "_index_path", lambda: tmp_path / "secrets.index.json")
+    monkeypatch.setattr(secretstore, "_legacy_vault_path", lambda: tmp_path / "secrets.dpapi")
+    monkeypatch.setattr(secretstore, "_mutation_lock_path", lambda: tmp_path / "secrets.mutation")
+
+    # Save a valid vault
+    secretstore._ensure_dir()
+    secretstore.save_vault({"secret_key": "secret_value"})
+
+    # Tamper with the encrypted content
+    raw = (tmp_path / "secrets.vault").read_bytes()
+    if raw.startswith(b"aesgcm:") or raw.startswith(b"dpapi:"):
+        # Flip a byte in the ciphertext portion (after the prefix and colon)
+        prefix_end = raw.index(b":") + 1
+        tampered = raw[:prefix_end + 1] + bytes([raw[prefix_end + 1] ^ 1]) + raw[prefix_end + 2:]
+        (tmp_path / "secrets.vault").write_bytes(tampered)
+
+        with pytest.raises(secretstore.VaultCorruptError):
+            secretstore.load_vault()
+
+
+def test_cooldown_expiry_restores_key_to_available(tmp_path, monkeypatch):
+    """A key in cooldown state should auto-restore to available when retry_at expires."""
+    from pi_manager import secrets as secretstore
+    from datetime import datetime, timezone, timedelta
+
+    monkeypatch.setattr(secretstore, "_vault_path", lambda: tmp_path / "secrets.vault")
+    monkeypatch.setattr(secretstore, "_master_key_path", lambda: tmp_path / ".vault_master_key")
+    monkeypatch.setattr(secretstore, "_index_path", lambda: tmp_path / "secrets.index.json")
+    monkeypatch.setattr(secretstore, "_legacy_vault_path", lambda: tmp_path / "secrets.dpapi")
+    monkeypatch.setattr(secretstore, "_mutation_lock_path", lambda: tmp_path / "secrets.mutation")
+    monkeypatch.setattr(secretstore, "_provider_key_pool_lock_path", lambda: tmp_path / "pk.mutation")
+
+    # Disable keyring so vault is used for storage
+    monkeypatch.setattr(secretstore, "_KEYRING", None)
+    monkeypatch.setattr(secretstore, "_KEYRING_TRIED", True)
+    monkeypatch.setattr(secretstore, "_KEYRING_TRIED_AT", time.monotonic())
+
+    secretstore._ensure_dir()
+    # Create a pool with a key in cooldown with expired retry_at
+    past_time = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds")
+    pool_data = {
+        "version": 1,
+        "active_id": "",
+        "keys": [
+            {
+                "id": "test_key_id",
+                "value": "sk-test-key-value",
+                "status": "cooldown",
+                "failed_at": past_time,
+                "retry_at": past_time,
+                "failure_kind": "rate_limit",
+                "failure_count": 1,
+                "failure_reason": "rate limited",
+            }
+        ],
+    }
+    secretstore.set_secret(
+        secretstore.provider_key_pool_name("test_provider"),
+        json.dumps(pool_data, ensure_ascii=False, separators=(",", ":")),
+    )
+
+    # Load the pool - should auto-restore the key to available
+    pool = secretstore.load_provider_key_pool("test_provider")
+    assert pool["keys"][0]["status"] == "available"
+    assert pool["active_id"] == "test_key_id"
+
+
+def test_redact_secret_values_handles_substring_secrets():
+    """子串密钥场景：短密钥是长密钥子串时，一次性正则替换不留残片。"""
+    result = core.redact_secret_values(
+        "prefix SHORT postfix LONGSECRET tail", ["SHORT", "LONGSECRET"]
+    )
+    assert "LONGSECRET" not in result
+    assert "SHORT" not in result
+    # 长度小于 4 的短密钥应被跳过，不替换无关文本
+    assert core.redact_secret_values("ababab", ["ab"]) == "ababab"
+
+
+def test_redact_secret_values_filters_short_secrets():
+    """长度小于 4 的 secret 值不参与替换，避免误伤。"""
+    assert core.redact_secret_values("hello world", ["world", "xy"]) == "hello ***"
+
+
+def test_plaintext_vault_rejected_after_initialization(tmp_path, monkeypatch):
+    """When the master key already exists (vault initialized to encrypted),
+    a plaintext JSON vault file must be rejected as VaultCorruptError to
+    prevent credential-injection by a local attacker swapping in plaintext."""
+    from pi_manager import secrets as secretstore
+
+    monkeypatch.setattr(secretstore, "_vault_path", lambda: tmp_path / "secrets.vault")
+    monkeypatch.setattr(secretstore, "_master_key_path", lambda: tmp_path / ".vault_master_key")
+    monkeypatch.setattr(secretstore, "_index_path", lambda: tmp_path / "secrets.index.json")
+    monkeypatch.setattr(secretstore, "_legacy_vault_path", lambda: tmp_path / "secrets.dpapi")
+    monkeypatch.setattr(secretstore, "_mutation_lock_path", lambda: tmp_path / "secrets.mutation")
+
+    # Disable keyring so the file vault is the storage backend.
+    monkeypatch.setattr(secretstore, "_KEYRING", None)
+    monkeypatch.setattr(secretstore, "_KEYRING_TRIED", True)
+    monkeypatch.setattr(secretstore, "_KEYRING_TRIED_AT", time.monotonic())
+
+    secretstore._ensure_dir()
+    # Initializing an encrypted vault creates the master key salt file. On
+    # Windows save_vault() uses DPAPI and never touches the master key, so
+    # force-create the salt here to model an initialized encrypted vault on
+    # every platform.
+    secretstore.save_vault({"real_secret": "real_value"})
+    secretstore._get_master_key()
+    assert (tmp_path / ".vault_master_key").exists()
+
+    # Attacker replaces the encrypted vault with plaintext JSON.
+    plain_data = {"injected_key": "attacker_value"}
+    (tmp_path / "secrets.vault").write_text(json.dumps(plain_data), encoding="utf-8")
+
+    with pytest.raises(secretstore.VaultCorruptError):
+        secretstore.load_vault()
+
+
+def test_legacy_xor_vault_logs_warning(tmp_path, monkeypatch, caplog):
+    """A filekey: (XOR, unauthenticated) vault stays readable for backward
+    compatibility, but a WARNING audit record must be emitted."""
+    from pi_manager import secrets as secretstore
+
+    monkeypatch.setattr(secretstore, "_vault_path", lambda: tmp_path / "secrets.vault")
+    monkeypatch.setattr(secretstore, "_master_key_path", lambda: tmp_path / ".vault_master_key")
+    monkeypatch.setattr(secretstore, "_index_path", lambda: tmp_path / "secrets.index.json")
+    monkeypatch.setattr(secretstore, "_legacy_vault_path", lambda: tmp_path / "secrets.dpapi")
+    monkeypatch.setattr(secretstore, "_mutation_lock_path", lambda: tmp_path / "secrets.mutation")
+
+    # Disable keyring so the file vault is the storage backend.
+    monkeypatch.setattr(secretstore, "_KEYRING", None)
+    monkeypatch.setattr(secretstore, "_KEYRING_TRIED", True)
+    monkeypatch.setattr(secretstore, "_KEYRING_TRIED_AT", time.monotonic())
+
+    secretstore._ensure_dir()
+    # Build a legacy filekey: vault using the master key + XOR stream cipher.
+    # The first call to _get_master_key() creates the salt; the second call
+    # returns the stable value decrypt_blob will use at read time.
+    secretstore._get_master_key()
+    key = secretstore._get_master_key()
+    assert (tmp_path / ".vault_master_key").exists()
+    payload = json.dumps({"legacy_key": "legacy_value"}, ensure_ascii=False).encode("utf-8")
+    blob = b"filekey:" + base64.b64encode(secretstore._xor_stream(payload, key))
+    (tmp_path / "secrets.vault").write_bytes(blob)
+
+    with caplog.at_level(logging.WARNING, logger="pi_manager.secrets"):
+        result = secretstore.load_vault()
+
+    assert result.get("legacy_key") == "legacy_value"
+    assert any(
+        record.levelno == logging.WARNING and "filekey" in record.getMessage()
+        for record in caplog.records
+    )

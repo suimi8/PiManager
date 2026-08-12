@@ -6,6 +6,7 @@ import logging
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -160,6 +161,27 @@ def find_pi_cli_js() -> Path | None:
     return None
 
 
+def _is_safe_executable(path: str) -> bool:
+    """POSIX 下校验可执行文件所有权与权限是否安全。
+
+    - other-write 位被设置则视为不安全（他人可改写该可执行文件）。
+    - 不属于当前用户、也不属于 root 时视为不安全。
+    - 任何异常都返回 True，避免在校验不可用时阻塞主流程。
+    """
+    if is_windows():
+        return True
+    try:
+        st = os.stat(path, follow_symlinks=False)
+        if st.st_mode & stat.S_IWOTH:
+            return False
+        uid = os.getuid()
+        if st.st_uid not in (uid, 0):
+            return False
+    except Exception:
+        return True
+    return True
+
+
 def find_pi_command() -> str | None:
     which = shutil.which("pi")
     if which:
@@ -171,7 +193,10 @@ def find_pi_command() -> str | None:
             node = shutil.which("node")
             if cli is not None and node:
                 return f"NODECLI::{node}::{cli}"
-        return which
+        if not _is_safe_executable(which):
+            logger.warning("跳过不安全的 pi 可执行文件（其他用户可写或非本用户拥有）: %s", which)
+        else:
+            return which
 
     for root in npm_global_roots():
         candidates = []
@@ -181,7 +206,11 @@ def find_pi_command() -> str | None:
             candidates = [root / "bin" / "pi", root / "pi"]
         for p in candidates:
             if p.is_file():
-                return str(p)
+                ps = str(p)
+                if not _is_safe_executable(ps):
+                    logger.warning("跳过不安全的 pi 可执行文件（其他用户可写或非本用户拥有）: %s", ps)
+                    continue
+                return ps
 
     cli = find_pi_cli_js()
     if cli is not None:
@@ -330,7 +359,7 @@ def _launch_windows(argv: list[str], workdir: str, mode: str, env: dict[str, str
             "-NoExit",
             "-NoProfile",
             "-ExecutionPolicy",
-            "Bypass",
+            "RemoteSigned",
             "-Command",
             ps,
         ],
@@ -355,8 +384,19 @@ def _launch_macos(argv: list[str], workdir: str, mode: str, env: dict[str, str])
         # the caller's environment. Keep the secret out of AppleScript and the
         # visible command line: a 0600 wrapper (invoked via sh, no exec bit
         # needed) self-deletes on start.
-        fd, wrapper_name = tempfile.mkstemp(prefix="pi-manager-", suffix=".sh")
-        wrapper = Path(wrapper_name)
+        # Use a private directory under the user config tree (~/.pi/agent/.tmp)
+        # instead of the shared /tmp, where directory names could be enumerated
+        # by other local users even with 0700 permissions.
+        tmp_base = Path(os.path.expanduser("~")) / ".pi" / "agent" / ".tmp"
+        try:
+            tmp_base.mkdir(parents=True, exist_ok=True)
+            private_dir = Path(tempfile.mkdtemp(prefix="pi-manager-", dir=str(tmp_base)))
+        except Exception:
+            # 创建私有基础目录失败（权限、跨平台差异等）时，回退到系统默认临时目录，
+            # 不阻塞终端启动；后续 wrapper 仍受 O_EXCL / 0600 保护。
+            private_dir = Path(tempfile.mkdtemp(prefix="pi-manager-"))
+        wrapper = private_dir / "wrapper.sh"
+        fd = os.open(str(wrapper), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             # mkstemp already creates 0600; clamp explicitly before writing so
             # no wider umask window exists, and never follow symlinks.
@@ -372,6 +412,7 @@ def _launch_macos(argv: list[str], workdir: str, mode: str, env: dict[str, str])
             lines.extend(
                 [
                     'rm -f -- "$0" 2>/dev/null || true',
+                    f'rmdir -- {shlex.quote(str(private_dir))} 2>/dev/null || true',
                     f"cd {shlex.quote(workdir)}",
                     "exec " + " ".join(shlex.quote(a) for a in argv),
                     "",
@@ -391,13 +432,14 @@ def _launch_macos(argv: list[str], workdir: str, mode: str, env: dict[str, str])
             except OSError:
                 pass
             wrapper.unlink(missing_ok=True)
+            private_dir.rmdir(missing_ok=True)
             raise
         # The wrapper self-deletes when it runs; if the terminal launch fails
         # it never runs, so a detached janitor removes the secret-bearing file
         # shortly afterwards either way.
         try:
             subprocess.Popen(
-                ["/bin/sh", "-c", f"sleep 120; rm -f -- {shlex.quote(str(wrapper))}"],
+                ["/bin/sh", "-c", f"sleep 10; rm -f -- {shlex.quote(str(wrapper))}; rmdir -- {shlex.quote(str(private_dir))} 2>/dev/null || true"],
                 start_new_session=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

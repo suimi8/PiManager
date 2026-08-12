@@ -26,6 +26,8 @@ def ensure_builtin_themes() -> list[str]:
     written = []
     for name, data in BUILTIN_THEMES.items():
         path = d / f"{name}.json"
+        if path.exists():
+            continue
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         written.append(name)
     return written

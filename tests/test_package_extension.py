@@ -123,7 +123,9 @@ def test_missing_staged_package_preserves_existing_target(monkeypatch, tmp_path)
 
 def test_config_mutate_bootstraps_when_token_file_missing(isolated_home):
     assert not config_broker.broker_token_path().exists()
-    result = config_broker.mutate(
+    # First call creates the token but must still require it — an empty
+    # token is no longer accepted (security fix: prevent race on first run).
+    result_no_token = config_broker.mutate(
         {
             "schema_version": 1,
             "request_id": "bootstrap-1",
@@ -131,11 +133,23 @@ def test_config_mutate_bootstraps_when_token_file_missing(isolated_home):
             "arguments": {"fields": {"favorites": ["A/m"]}},
         }
     )
-    assert result["ok"] is True
+    assert result_no_token["ok"] is False
     token_path = config_broker.broker_token_path()
     assert token_path.is_file()
     if os.name != "nt":
         assert token_path.stat().st_mode & 0o077 == 0
+    # Now use the created token to perform the mutation.
+    token = token_path.read_text(encoding="utf-8").strip()
+    result = config_broker.mutate(
+        {
+            "schema_version": 1,
+            "request_id": "bootstrap-2",
+            "token": token,
+            "operation": "set_manager_fields",
+            "arguments": {"fields": {"favorites": ["A/m"]}},
+        }
+    )
+    assert result["ok"] is True
     assert core.load_manager_config()["favorites"] == ["A/m"]
 
 

@@ -5,6 +5,14 @@ from __future__ import annotations
 import html
 import re
 
+_RE_CODE = re.compile(r"`([^`]+)`")
+_RE_BOLD = re.compile(r"\*\*([^*]+)\*\*")
+_RE_ITALIC = re.compile(r"\*([^*]+)\*")
+_RE_LINK = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_RE_SEP = re.compile(r":?-{3,}:?")
+_RE_UL = re.compile(r"^[-*] ")
+_RE_OL = re.compile(r"^\d+\. ")
+
 HELP_MARKDOWN = r'''# Pi Manager 使用教程与常见问题
 
 > 版本 1.8.1 · 跨平台 GUI 管理官方 Pi Coding Agent（Windows / macOS / Linux）
@@ -318,7 +326,7 @@ def markdown_to_html(md: str, mode: str = "night") -> str:
         )
         for i, row in enumerate(table_rows):
             # skip separator row
-            if all(re.fullmatch(r":?-{3,}:?", c_cell.strip() or "") for c_cell in row):
+            if all(_RE_SEP.fullmatch(c_cell.strip() or "") for c_cell in row):
                 continue
             tag = "th" if i == 0 else "td"
             style = f"border:1px solid {c['border']};padding:8px 12px;color:{c['td_fg']};"
@@ -338,12 +346,11 @@ def markdown_to_html(md: str, mode: str = "night") -> str:
             f"<code style='background:{c['code_bg']};color:{c['code_fg']};padding:2px 6px;"
             f"border-radius:6px;font-family:Consolas,monospace;'>"
         )
-        t = re.sub(r"`([^`]+)`", lambda m: f"{code_open}{m.group(1)}</code>", t)
-        t = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", t)
-        t = re.sub(r"\*([^*]+)\*", r"<i>\1</i>", t)
+        t = _RE_CODE.sub(lambda m: f"{code_open}{m.group(1)}</code>", t)
+        t = _RE_BOLD.sub(r"<b>\1</b>", t)
+        t = _RE_ITALIC.sub(r"<i>\1</i>", t)
         link_style = f'color:{c["link"]};text-decoration:none;'
-        t = re.sub(
-            r"\[([^\]]+)\]\(([^)]+)\)",
+        t = _RE_LINK.sub(
             lambda m: f'<a href="{m.group(2)}" style="{link_style}">{m.group(1)}</a>',
             t,
         )
@@ -408,12 +415,12 @@ def markdown_to_html(md: str, mode: str = "night") -> str:
         elif line.startswith("---"):
             close_ul()
             out.append(f"<hr style='border:none;border-top:1px solid {c['hr']};margin:18px 0;'/>")
-        elif re.match(r"^[-*] ", line):
+        elif _RE_UL.match(line):
             if not in_ul:
                 out.append(f"<ul style='margin:8px 0 8px 1.2em;color:{c['text']};'>")
                 in_ul = True
             out.append(f"<li style='margin:4px 0;line-height:1.5;'>{_inline(line[2:])}</li>")
-        elif re.match(r"^\d+\. ", line):
+        elif _RE_OL.match(line):
             close_ul()
             out.append(f"<p style='margin:4px 0 4px 0.5em;color:{c['text']};'>{_inline(line)}</p>")
         else:

@@ -69,7 +69,7 @@ class Worker(QThread):
             self.done.emit(self.fn(*self.args, **self.kwargs))
         except Exception as e:
             logger.exception("Worker task failed")
-            self.failed.emit(str(e))
+            self.failed.emit(str(e)[:500])
 
 
 class BatchTestWorker(QThread):
@@ -300,7 +300,7 @@ class ProviderEditorDialog(QDialog):
         if running:
             for w in running:
                 w.requestInterruption()
-            deadline = time.monotonic() + 2.0
+            deadline = time.monotonic() + 5.0
             for w in running:
                 remaining = max(0, int((deadline - time.monotonic()) * 1000))
                 if w.isRunning() and remaining:
@@ -332,7 +332,7 @@ class ProviderEditorDialog(QDialog):
     def _on_fetch_done(self, result: dict):
         self.btn_fetch.setEnabled(True)
         if not result.get("ok"):
-            self.fetch_status.setText(f"拉取失败：{result.get('error')}\nendpoint: {result.get('endpoint')}")
+            self.fetch_status.setText(f"拉取失败：{result.get('error')}")
             QMessageBox.warning(self, "拉取失败", str(result.get("error") or "unknown"))
             return
         models = result.get("models") or []
@@ -612,7 +612,7 @@ class FetchModelsDialog(QDialog):
         if running:
             for w in running:
                 w.requestInterruption()
-            deadline = time.monotonic() + 2.0
+            deadline = time.monotonic() + 5.0
             for w in running:
                 remaining = max(0, int((deadline - time.monotonic()) * 1000))
                 if w.isRunning() and remaining:
@@ -1203,6 +1203,7 @@ class MainWindow(FeatureMixin, QMainWindow):
     def _track(self, worker: Worker):
         self.workers.append(worker)
         worker.finished.connect(lambda: self._untrack(worker))
+        worker.finished.connect(worker.deleteLater)
         return worker
 
     def _untrack(self, worker: Worker):
@@ -2432,11 +2433,16 @@ class MainWindow(FeatureMixin, QMainWindow):
                     pass
             return
         # 兼容旧 tuple 返回
-        code, out, err = result
+        try:
+            code, out, err = result
+        except (TypeError, ValueError):
+            self.chat_output.appendPlainText(f"[错误] 返回格式无法解析")
+            self.status.showMessage("快速提问失败")
+            return
         if out.strip():
             self.chat_output.appendPlainText(out.strip())
         if err.strip():
-            self.chat_output.appendPlainText(f"[stderr]\n{err.strip()}")
+            self.chat_output.appendPlainText(f"[stderr]\n{err.strip()[:500]}")
         self.chat_output.appendPlainText(f"\n[exit {code}]")
         self.status.showMessage("快速提问完成")
 
@@ -2446,7 +2452,10 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.status.showMessage("快速提问失败")
 
     def session_reveal(self):
-        rows = self.sessions_table.selectionModel().selectedRows()
+        sm = self.sessions_table.selectionModel()
+        if not sm:
+            return
+        rows = sm.selectedRows()
         if not rows:
             return
         path = self._session_path_at(rows[0].row())
@@ -2454,7 +2463,10 @@ class MainWindow(FeatureMixin, QMainWindow):
             core.open_in_explorer(path)
 
     def session_open_project(self):
-        rows = self.sessions_table.selectionModel().selectedRows()
+        sm = self.sessions_table.selectionModel()
+        if not sm:
+            return
+        rows = sm.selectedRows()
         if not rows:
             QMessageBox.information(self, "提示", "请先选择会话")
             return
@@ -2469,7 +2481,10 @@ class MainWindow(FeatureMixin, QMainWindow):
         core.open_path(str(p))
 
     def session_continue(self):
-        rows = self.sessions_table.selectionModel().selectedRows()
+        sm = self.sessions_table.selectionModel()
+        if not sm:
+            return
+        rows = sm.selectedRows()
         if not rows:
             return
         path = self._session_path_at(rows[0].row())

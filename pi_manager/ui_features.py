@@ -411,8 +411,11 @@ class FeatureMixin:
     def health_retest_selected(self):
         if not hasattr(self, "health_table"):
             return
+        sm = self.health_table.selectionModel()
+        if not sm:
+            return
         pairs = []
-        for idx in self.health_table.selectionModel().selectedRows():
+        for idx in sm.selectedRows():
             item = self.health_table.item(idx.row(), 0)
             if not item:
                 continue
@@ -609,7 +612,10 @@ class FeatureMixin:
     def auth_logout_selected(self):
         if not hasattr(self, "auth_table"):
             return
-        rows = self.auth_table.selectionModel().selectedRows()
+        sm = self.auth_table.selectionModel()
+        if not sm:
+            return
+        rows = sm.selectedRows()
         if not rows:
             QMessageBox.information(self, "提示", "请先在认证状态表中选择一个 Provider")
             return
@@ -695,6 +701,9 @@ class FeatureMixin:
         )
         if not ok:
             return
+        if len(password) < 10:
+            QMessageBox.warning(self, "导出失败", "密码至少需要 10 个字符")
+            return
         confirm, ok = QInputDialog.getText(
             self,
             "确认密钥包密码",
@@ -735,6 +744,24 @@ class FeatureMixin:
         if not res.get("ok"):
             QMessageBox.critical(self, "导入失败", str(res.get("error")))
             return
+        # Validate imported models.json structure to prevent config poisoning
+        try:
+            models_cfg = core.load_models_config()
+            providers = models_cfg.get("providers") if isinstance(models_cfg, dict) else None
+            if providers is not None:
+                if not isinstance(providers, dict):
+                    QMessageBox.critical(self, "导入失败", "models.json providers 字段不是对象，已回退")
+                    return
+                for prov_name, prov_entry in providers.items():
+                    if not isinstance(prov_entry, dict):
+                        QMessageBox.critical(self, "导入失败", f"Provider「{prov_name}」条目不是对象")
+                        return
+                    base_url = str(prov_entry.get("baseUrl") or "")
+                    if base_url and not base_url.startswith(("http://", "https://")):
+                        QMessageBox.critical(self, "导入失败", f"Provider「{prov_name}」的 Base URL 不合法")
+                        return
+        except Exception as e:
+            QMessageBox.warning(self, "校验警告", f"导入后校验配置时出错：{e}")
         self.mgr = core.load_manager_config()
         self.refresh_all()
         self.settings_load()
@@ -816,7 +843,10 @@ class FeatureMixin:
 
     # ---- sessions extras ----
     def session_selected_path(self) -> str | None:
-        rows = self.sessions_table.selectionModel().selectedRows()
+        sm = self.sessions_table.selectionModel()
+        if not sm:
+            return None
+        rows = sm.selectedRows()
         if not rows:
             return None
         r = rows[0].row()

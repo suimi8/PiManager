@@ -2,6 +2,8 @@
 """Resolve bundled asset paths (dev + PyInstaller, all platforms)."""
 from __future__ import annotations
 
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -142,4 +144,16 @@ def self_check() -> list[str]:
             _ = app.applicationName()
         except Exception as exc:
             errors.append(f"Qt QApplication init failed: {exc}")
+    try:
+        from pi_manager import secrets as _secretstore
+        _vault_path = _secretstore._vault_path()
+        if _vault_path.exists():
+            _secretstore.load_vault()
+        _master_key_path = _secretstore._master_key_path()
+        if _master_key_path.exists() and os.name != "nt":
+            _master_mode = stat.S_IMODE(_master_key_path.stat().st_mode)
+            if _master_mode & 0o077:
+                errors.append(f"vault master key permissions too open: {oct(_master_mode)}")
+    except Exception as exc:
+        errors.append(f"vault security check failed: {exc}")
     return errors

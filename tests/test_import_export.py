@@ -5,6 +5,8 @@ import os
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from pi_manager import core
 from pi_manager import extras
 from pi_manager import secrets as secretstore
@@ -265,3 +267,26 @@ def test_failed_import_rolls_back_files_and_secrets(
     assert core.load_models_config() == {"providers": {}}
     assert secretstore.get_secret("provider:Existing:apiKey") == "keep-me"
     assert secretstore.get_secret("provider:Imported:apiKey") == ""
+
+
+def test_tampered_kdf_iterations_below_minimum_rejected(tmp_path, monkeypatch):
+    """A bundle with KDF iterations below 100,000 should be rejected."""
+    secrets_data = {"test": "value"}
+    bundle = extras._encrypt_bundle_secrets(secrets_data, "test_password_123")
+
+    # Tamper: set iterations to 99,999
+    bundle["iterations"] = 99999
+
+    # Attempt decryption should fail
+    with pytest.raises(ValueError):
+        extras._decrypt_bundle_secrets(bundle, "test_password_123")
+
+
+def test_tampered_kdf_iterations_above_maximum_rejected(tmp_path, monkeypatch):
+    """A bundle with KDF iterations above 2,000,000 should be rejected."""
+    secrets_data = {"test": "value"}
+    bundle = extras._encrypt_bundle_secrets(secrets_data, "test_password_123")
+    bundle["iterations"] = 2000001
+
+    with pytest.raises(ValueError):
+        extras._decrypt_bundle_secrets(bundle, "test_password_123")

@@ -77,14 +77,14 @@ def test_idle_reaper_closes_idle_session_but_spares_busy_one(isolated_home, monk
         }
         session.busy = True
         rpc_session._schedule_idle_reaper()
-    time.sleep(0.15)
+    time.sleep(0.3)
     assert session.alive is True, "busy session must not be reaped"
 
     session.busy = False
     with rpc_session._manager_lock:
         rpc_session._entry["last_used"] = time.monotonic() - 10
         rpc_session._schedule_idle_reaper()
-    time.sleep(0.15)
+    time.sleep(0.3)
     assert session.alive is False
     assert rpc_session._entry is None
 

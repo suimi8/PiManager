@@ -30,7 +30,8 @@ function findVsixAsset(release) {
     const match = name.match(VSIX_NAME_RE);
     const url = String((asset && asset.browser_download_url) || "");
     if (!match || !url) continue;
-    candidates.push({ name, version: match[1], url });
+    const digest = String((asset && asset.digest) || "");
+    candidates.push({ name, version: match[1], url, digest });
   }
   candidates.sort((left, right) => compareVersions(right.version, left.version));
   return candidates[0] || null;
@@ -51,6 +52,10 @@ function vsixUpdateInfo(localVersion, release) {
     };
   }
   const hasUpdate = compareVersions(asset.version, localVersion) > 0;
+  const digest = asset.digest || "";
+  const checksumLine = digest
+    ? `\n校验和：${digest}（下载后请用 sha256sum 校验）`
+    : "\n建议下载后使用 sha256sum 校验文件完整性。";
   return {
     ok: true,
     local: localVersion,
@@ -59,7 +64,7 @@ function vsixUpdateInfo(localVersion, release) {
     asset,
     releaseUrl,
     message: hasUpdate
-      ? `发现 Pi Cursor 扩展 v${asset.version}（当前 v${localVersion}）`
+      ? `发现 Pi Cursor 扩展 v${asset.version}（当前 v${localVersion}）${checksumLine}`
       : `Pi Cursor 扩展已是最新（本地 v${localVersion}，Release v${asset.version}）`,
   };
 }

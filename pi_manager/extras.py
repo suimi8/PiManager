@@ -933,7 +933,7 @@ def check_manager_update() -> dict[str, Any]:
         manifest_url = str(settings.get("update_manifest_url") or "").strip()
     try:
         parsed = urlsplit(manifest_url)
-        if parsed.scheme in ("http", "https") and parsed.hostname:
+        if parsed.scheme == "https" and parsed.hostname:
             url = manifest_url
     except ValueError:
         url = ""

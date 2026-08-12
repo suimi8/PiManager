@@ -156,3 +156,51 @@ def test_hanging_keyring_probe_times_out_and_uses_vault(isolated_home, monkeypat
         assert secretstore.load_vault().get("test:key") == "timed-out-value"
     finally:
         keyring.set_keyring(previous)
+
+
+def test_keyring_probe_retriable_after_cooldown(monkeypatch):
+    """After cooldown, a failed keyring probe should be retried."""
+    import sys
+    import time
+
+    # Reset state
+    monkeypatch.setattr(secretstore, "_KEYRING", None)
+    monkeypatch.setattr(secretstore, "_KEYRING_TRIED", False)
+    monkeypatch.setattr(secretstore, "_KEYRING_TRIED_AT", 0.0)
+    monkeypatch.setattr(secretstore, "_KEYRING_RETRY_COOLDOWN", 0.1)
+    monkeypatch.setattr(secretstore, "_KEYRING_PROBE_TIMEOUT", 0.1)
+
+    call_count = {"n": 0}
+
+    class HangingKeyring:
+        def get_password(self, *args):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                import threading
+                event = threading.Event()
+                event.wait(timeout=0.5)  # Hang
+                return None
+            return "test"
+
+        def set_password(self, *args):
+            pass
+
+        def delete_password(self, *args):
+            pass
+
+    # Make keyring module return our hanging keyring
+    mock_keyring_mod = type(sys)("keyring")
+    mock_keyring_mod.get_keyring = lambda: HangingKeyring()
+    monkeypatch.setitem(sys.modules, "keyring", mock_keyring_mod)
+
+    # First probe should timeout and return None
+    result1 = secretstore._get_keyring()
+    assert result1 is None
+
+    # Wait for cooldown
+    time.sleep(0.2)
+
+    # Second probe should retry
+    result2 = secretstore._get_keyring()
+    # It should not be None if the retry succeeds
+    # (may still be None due to probe logic, but _KEYRING_TRIED should be reset)

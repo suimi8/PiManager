@@ -278,9 +278,9 @@ def test_provider_env_helper_rotates_pool_across_processes(
     rows = core.list_provider_api_keys("Cross Process")
     repo_root = Path(core.__file__).resolve().parents[1]
     child_code = (
-        "import sys;"
+        "import sys, time;"
         "from pi_manager import secrets as s;"
-        "s._KEYRING=None;s._KEYRING_TRIED=True;"
+        "s._KEYRING=None;s._KEYRING_TRIED=True;s._KEYRING_TRIED_AT=time.monotonic();"
         "from pi_manager.provider_env import main;"
         "raise SystemExit(main(sys.argv[1:]))"
     )
@@ -653,6 +653,7 @@ def test_managed_model_http_test_rotates_to_second_key(
 
 def test_google_model_fetch_uses_real_key_but_redacts_result_endpoint(monkeypatch):
     requested: list[str] = []
+    sent_headers: list[dict[str, str]] = []
 
     class Response:
         status = 200
@@ -669,6 +670,7 @@ def test_google_model_fetch_uses_real_key_but_redacts_result_endpoint(monkeypatc
     class Opener:
         def open(self, request, timeout):
             requested.append(request.full_url)
+            sent_headers.append(dict(request.header_items()))
             return Response()
 
     monkeypatch.setattr("urllib.request.build_opener", lambda *_handlers: Opener())
@@ -680,9 +682,14 @@ def test_google_model_fetch_uses_real_key_but_redacts_result_endpoint(monkeypatc
 
     assert result["ok"] is True
     assert requested == [
-        "https://generativelanguage.googleapis.com/v1beta/models?key=google-real-secret"
+        "https://generativelanguage.googleapis.com/v1beta/models"
     ]
-    assert result["endpoint"].endswith("?key=***")
+    assert sent_headers
+    google_header = next(
+        (v for k, v in sent_headers[0].items() if k.lower() == "x-goog-api-key"), None
+    )
+    assert google_header == "google-real-secret"
+    assert "key=" not in result["endpoint"]
     assert "google-real-secret" not in json.dumps(result)
 
 
@@ -701,7 +708,7 @@ def test_google_model_fetch_redacts_endpoint_on_http_error(monkeypatch):
     )
 
     assert result["ok"] is False
-    assert result["endpoint"].endswith("?key=***")
+    assert "key=" not in result["endpoint"]
     assert "google-real-secret" not in json.dumps(result)
 
 
@@ -715,10 +722,10 @@ def test_google_model_test_uses_real_key_but_redacts_result_endpoint(
         api="google-generative-ai",
         models=[{"id": "gemini-test"}],
     )
-    requested: list[str] = []
+    requested: list[list] = []
 
-    def fake_request(url, **_kwargs):
-        requested.append(url)
+    def fake_request(url, *, method="GET", headers=None, **_kwargs):
+        requested.append([url, dict(headers or {})])
         return {
             "ok": True,
             "status": 200,
@@ -731,11 +738,12 @@ def test_google_model_test_uses_real_key_but_redacts_result_endpoint(
     monkeypatch.setattr(core, "_http_json_request", fake_request)
     result = core.test_model_http("Google Demo", "gemini-test")
 
-    assert requested == [
+    assert requested and requested[0][0] == (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-test:generateContent?key=google-real-secret"
-    ]
-    assert result["endpoint"].endswith("?key=***")
+        "gemini-test:generateContent"
+    )
+    assert requested[0][1].get("x-goog-api-key") == "google-real-secret"
+    assert "key=" not in result["endpoint"]
     assert "google-real-secret" not in json.dumps(result)
 
 

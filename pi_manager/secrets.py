@@ -17,6 +17,7 @@ import re
 import stat
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,8 @@ from .storage import locked
 SERVICE = "PiManager"
 _KEYRING = None
 _KEYRING_TRIED = False
+_KEYRING_TRIED_AT = 0.0
+_KEYRING_RETRY_COOLDOWN = 60.0
 _KEYRING_PROBE_TIMEOUT = 5.0
 
 
@@ -78,10 +81,14 @@ def _keyring_backend_is_unsafe(backend: Any) -> bool:
 
 
 def _get_keyring():
-    global _KEYRING, _KEYRING_TRIED
+    global _KEYRING, _KEYRING_TRIED, _KEYRING_TRIED_AT
     if _KEYRING_TRIED:
-        return _KEYRING
+        if _KEYRING is None and time.monotonic() - _KEYRING_TRIED_AT >= _KEYRING_RETRY_COOLDOWN:
+            _KEYRING_TRIED = False
+        else:
+            return _KEYRING
     _KEYRING_TRIED = True
+    _KEYRING_TRIED_AT = time.monotonic()
     try:
         import keyring  # type: ignore
     except Exception:
@@ -214,17 +221,22 @@ def _validate_master_key(path: Path) -> bytes:
 
 
 def _load_or_create_master_key() -> bytes:
-    """Load or atomically create a 32-byte per-user fallback key."""
+    """Load or atomically create a 32-byte per-user fallback key.
+
+    The key is derived from a random salt file via PBKDF2-HMAC-SHA256 with a
+    fixed application pepper, so a simple file copy is insufficient to decrypt
+    the vault — the attacker would also need to brute-force the KDF.
+    """
     _ensure_dir()
     path = _master_key_path()
     if path.exists():
         return _validate_master_key(path)
-    key = os.urandom(32)
+    raw_salt = os.urandom(32)
     temp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "wb", closefd=True) as handle:
-            handle.write(key)
+            handle.write(raw_salt)
             handle.flush()
             os.fsync(handle.fileno())
         try:
@@ -239,7 +251,43 @@ def _load_or_create_master_key() -> bytes:
         temp.unlink(missing_ok=True)
     if os.name != "nt":
         os.chmod(path, 0o600)
-    return _validate_master_key(path)
+    return _validate_master_key_salt(path)
+
+
+_PEPPER = b"PiManager::vault::v3::pbkdf2"
+_KDF_ITERATIONS = 600_000
+
+# 旧的无认证加密格式（filekey: XOR 流 / local: 固定硬编码 key）仅在迁移时
+# 读取，保留向后兼容。默认开启解密能力，但每次读取都会记录 WARNING 审计
+# 日志，提示旧条目将在下次写入时升级为 AES-GCM。
+_LEGACY_DECRYPT_ALLOWED = True
+
+
+def _derive_key_from_salt(salt: bytes) -> bytes:
+    """Derive a 32-byte AES key from a salt using PBKDF2 + fixed pepper."""
+    return hashlib.pbkdf2_hmac("sha256", _PEPPER, salt, _KDF_ITERATIONS, dklen=32)
+
+
+def _validate_master_key_salt(path: Path) -> bytes:
+    """Read and validate the salt file (32 bytes, regular, 0600)."""
+    if os.name == "nt":
+        attributes = _windows_file_attributes(path)
+        if attributes is not None and attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise VaultCorruptError(f"主密钥盐文件不能是 reparse point: {path}")
+    info = path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode):
+        raise VaultCorruptError(f"主密钥盐文件不是普通文件: {path}")
+    if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o077:
+        raise VaultCorruptError(f"主密钥盐文件权限过宽，应为 0600: {path}")
+    salt = path.read_bytes()
+    if len(salt) != 32:
+        raise VaultCorruptError(f"主密钥盐文件长度无效: {path}")
+    return salt
+
+
+def _get_master_key() -> bytes:
+    """Get the derived AES key, loading or creating the salt as needed."""
+    return _derive_key_from_salt(_load_or_create_master_key())
 
 
 def _xor_stream(data: bytes, key: bytes) -> bytes:
@@ -257,7 +305,7 @@ def encrypt_blob(data: bytes) -> bytes:
             pass
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-    key = _load_or_create_master_key()
+    key = _get_master_key()
     nonce = os.urandom(12)
     encrypted = AESGCM(key).encrypt(nonce, data, b"PiManagerVault:v2")
     return b"aesgcm:" + base64.b64encode(nonce + encrypted)
@@ -272,25 +320,36 @@ def decrypt_blob(raw: bytes) -> bytes:
         payload = base64.b64decode(raw[7:])
         if len(payload) < 13:
             raise ValueError("invalid AES-GCM vault")
-        return AESGCM(_load_or_create_master_key()).decrypt(
+        return AESGCM(_get_master_key()).decrypt(
             payload[:12], payload[12:], b"PiManagerVault:v2"
         )
     if raw.startswith(b"filekey:"):
         # Legacy unauthenticated fallback; successful reads are upgraded on next write.
-        key = _load_or_create_master_key()
-        return _xor_stream(base64.b64decode(raw[8:]), key)
-    # legacy local: fixed-key tokens (migrate away)
+        if not _LEGACY_DECRYPT_ALLOWED:
+            raise VaultCorruptError("旧的无认证加密格式（filekey:）已被禁用")
+        key = _get_master_key()
+        plaintext = _xor_stream(base64.b64decode(raw[8:]), key)
+        logging.getLogger(__name__).warning(
+            "读取了无认证的旧格式 vault 条目（filekey:），将在下次写入时升级为 AES-GCM"
+        )
+        return plaintext
     if raw.startswith(b"local:"):
         # old fixed key — still decrypt for migration only
+        if not _LEGACY_DECRYPT_ALLOWED:
+            raise VaultCorruptError("旧的无认证加密格式（local:）已被禁用")
         legacy = b"PiManagerLocalFallbackKey!v1"
-        return _xor_stream(base64.b64decode(raw[6:]), legacy)
+        plaintext = _xor_stream(base64.b64decode(raw[6:]), legacy)
+        logging.getLogger(__name__).warning(
+            "读取了无认证的旧格式 vault 条目（local:），将在下次写入时升级为 AES-GCM"
+        )
+        return plaintext
     # raw dpapi blob (old whole-file format)
     if sys.platform == "win32":
         try:
             return _dpapi_unprotect(raw)
         except Exception:
             pass
-    return raw
+    raise VaultCorruptError("vault 数据无法识别加密格式")
 
 
 def load_vault() -> dict[str, str]:
@@ -370,8 +429,22 @@ def _read_vault_file(path: Path, *, rewrite_legacy_format: bool = False) -> dict
     raw = path.read_bytes()
     try:
         text = decrypt_blob(raw).decode("utf-8", errors="strict")
-    except Exception:
-        text = raw.decode("utf-8", errors="strict")
+    except Exception as exc:
+        if raw.startswith((b"dpapi:", b"aesgcm:", b"filekey:", b"local:")):
+            raise VaultCorruptError(f"vault 解密失败: {exc}") from exc
+        # Attempt legacy plaintext migration as a last resort, but never
+        # silently accept untrusted plaintext — require it to parse as valid
+        # JSON dict; otherwise the vault is corrupt. 为了防止本地攻击者用明文
+        # JSON 替换已初始化的加密 vault 实现凭据注入，仅在尚未初始化主密钥
+        # （首次迁移场景）时才接受明文 JSON；主密钥已存在时一律拒绝。
+        if _master_key_path().exists():
+            raise VaultCorruptError(
+                "vault 已初始化为加密格式，拒绝接受明文 JSON（疑似凭据注入）"
+            ) from exc
+        try:
+            text = raw.decode("utf-8", errors="strict")
+        except Exception as text_exc:
+            raise VaultCorruptError(f"vault 解密失败且无法作为文本解析: {exc}") from text_exc
     data = json.loads(text or "{}")
     if not isinstance(data, dict):
         raise ValueError("Vault 顶层必须是 JSON 对象")
@@ -387,14 +460,23 @@ def _read_vault_file(path: Path, *, rewrite_legacy_format: bool = False) -> dict
 def _save_vault_unlocked(data: dict[str, str]) -> None:
     payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
     blob = encrypt_blob(payload)
-    temp = _vault_path().with_name(
-        f".{_vault_path().name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    vault = _vault_path()
+    temp = vault.with_name(
+        f".{vault.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
     )
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        temp.write_bytes(blob)
-        os.replace(temp, _vault_path())
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            handle.write(blob)
+            handle.flush()
+            os.fsync(handle.fileno())
         try:
-            os.chmod(_vault_path(), 0o600)
+            os.chmod(temp, 0o600)
+        except OSError:
+            pass
+        os.replace(temp, vault)
+        try:
+            os.chmod(vault, 0o600)
         except OSError:
             pass
     finally:
@@ -418,11 +500,20 @@ def _load_index() -> set[str]:
 def _save_index(names: set[str]) -> None:
     _ensure_dir()
     path = _index_path()
+    payload = json.dumps(sorted(names), ensure_ascii=False, indent=2).encode("utf-8")
     temp = path.with_name(
         f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
     )
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        temp.write_text(json.dumps(sorted(names), ensure_ascii=False, indent=2), encoding="utf-8")
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.chmod(temp, 0o600)
+        except OSError:
+            pass
         os.replace(temp, path)
         try:
             os.chmod(path, 0o600)

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from typing import Any
+from copy import deepcopy
 
 
 def _model(
@@ -452,8 +453,8 @@ PROVIDER_PRESETS: list[dict[str, Any]] = _OVERSEAS + _DOMESTIC
 
 
 def list_presets() -> list[dict[str, Any]]:
-    """返回全部模板的浅拷贝，供界面下拉框使用。"""
-    return [dict(preset) for preset in PROVIDER_PRESETS]
+    """返回全部模板的深拷贝，供界面下拉框使用。"""
+    return [deepcopy(preset) for preset in PROVIDER_PRESETS]
 
 
 def preset_names() -> list[str]:
@@ -461,13 +462,13 @@ def preset_names() -> list[str]:
 
 
 def find_preset(name: str) -> dict[str, Any] | None:
-    """按 provider key 或显示名查找模板。"""
+    """按 provider key 或显示名查找模板，返回深拷贝。"""
     name = (name or "").strip()
     if not name:
         return None
     for preset in PROVIDER_PRESETS:
         if str(preset.get("name")) == name or str(preset.get("label")) == name:
-            return preset
+            return deepcopy(preset)
     return None
 
 
@@ -479,6 +480,6 @@ def apply_preset(name: str) -> dict[str, Any] | None:
     return {
         "baseUrl": str(preset.get("base_url") or ""),
         "api": str(preset.get("api") or "openai-completions"),
-        "models": list(preset.get("models") or []),
-        "compat": dict(preset.get("compat") or {}),
+        "models": deepcopy(preset.get("models") or []),
+        "compat": deepcopy(preset.get("compat") or {}),
     }

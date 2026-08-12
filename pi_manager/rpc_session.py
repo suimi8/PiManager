@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 _COMMAND_TIMEOUT = 30.0
 _PROMPT_TIMEOUT = 180.0
 _RUNTIME_RETRY_COOLDOWN = 30.0
+_MAX_STDOUT_LINE = 10 * 1024 * 1024
 
 
 class RpcSessionError(RuntimeError):
@@ -100,6 +101,9 @@ class PiRpcSession:
                 line = raw.strip()
                 if not line.startswith("{"):
                     continue
+                if len(line) > _MAX_STDOUT_LINE:
+                    logger.warning("Pi RPC stdout 行过长 (%d 字符)，跳过", len(line))
+                    continue
                 try:
                     message = json.loads(line)
                 except ValueError:
@@ -134,12 +138,16 @@ class PiRpcSession:
         if message.get("type") == "message_end":
             inner = message.get("message")
             if isinstance(inner, dict) and inner.get("role") == "assistant":
-                turn["last_assistant"] = inner
+                with self._state_lock:
+                    if self._turn is turn:
+                        turn["last_assistant"] = inner
             return
         if message.get("type") == "agent_end" and not message.get("willRetry"):
             for inner in reversed(message.get("messages") or []):
                 if isinstance(inner, dict) and inner.get("role") == "assistant":
-                    turn["last_assistant"] = inner
+                    with self._state_lock:
+                        if self._turn is turn:
+                            turn["last_assistant"] = inner
                     break
             with self._state_lock:
                 if self._turn is turn:

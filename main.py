@@ -36,8 +36,9 @@ def _ensure_windows_cli_stdio() -> None:
                 sys.stdout = open(os.devnull, "w", encoding="utf-8")
             if sys.stderr is None:
                 sys.stderr = open(os.devnull, "w", encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        import logging
+        logging.getLogger("pi_manager").debug("stdio redirect failed: %s", exc, exc_info=True)
 
 
 def main():
@@ -56,9 +57,22 @@ def main():
         if not path:
             print(json.dumps({"ok": False, "error": "usage: --vision-describe <image-path> [prompt]"}))
             return 2
+        allowed_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff"}
+        p = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+        if os.path.splitext(p)[1].lower() not in allowed_exts:
+            print(json.dumps({"ok": False, "error": "仅支持图片文件（png/jpg/jpeg/gif/bmp/webp/tiff）"}))
+            return 2
+        max_image_size = 20 * 1024 * 1024
+        try:
+            if os.path.getsize(p) > max_image_size:
+                print(json.dumps({"ok": False, "error": "图片文件过大（上限 20MB）"}))
+                return 2
+        except OSError as exc:
+            print(json.dumps({"ok": False, "error": f"无法读取图片：{exc}"}))
+            return 2
         prompt = " ".join(sys.argv[3:]) or ""
         try:
-            with open(path, "rb") as fh:
+            with open(p, "rb") as fh:
                 data = fh.read()
         except OSError as exc:
             print(json.dumps({"ok": False, "error": f"无法读取图片：{exc}"}))
@@ -92,7 +106,8 @@ def main():
                 _emit(result, output_path)
             except (ValueError, OSError):
                 pass
-        print(encoded)
+        if not output_path:
+            print(encoded)
         return 0 if result.get("ok") else 2
     # Helper subcommands above are the extension's hot path and must not
     # rewrite the registry on every call; publish it when the app itself runs.

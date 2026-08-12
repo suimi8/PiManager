@@ -63,19 +63,28 @@ function failureCounts(manager) {
   return counts;
 }
 
+// NOTE: read-modify-write race – readManager() and writeManager() are not
+// guarded by the same lock as the Python-side Config Broker (storage.locked).
+// The retry loop below re-reads the latest counts before writing to narrow the
+// window, but it cannot eliminate a concurrent update that lands between the
+// final read and the write.
 async function updateFailureCount(readManager, writeManager, provider, model, succeeded) {
-  const manager = (await readManager()) || {};
-  const counts = failureCounts(manager);
-  const pair = normalizeModelPair(provider, model, { allowEmpty: false });
-  const key = `${pair[0]}/${pair[1]}`;
-  if (succeeded) {
-    if (!Object.prototype.hasOwnProperty.call(counts, key)) return 0;
-    counts[key] = 0;
-  } else {
-    counts[key] = Number(counts[key] || 0) + 1;
+  const maxAttempts = 3;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const manager = (await readManager()) || {};
+    const counts = failureCounts(manager);
+    const pair = normalizeModelPair(provider, model, { allowEmpty: false });
+    const key = `${pair[0]}/${pair[1]}`;
+    if (succeeded) {
+      if (!Object.prototype.hasOwnProperty.call(counts, key)) return 0;
+      counts[key] = 0;
+    } else {
+      counts[key] = Number(counts[key] || 0) + 1;
+    }
+    await writeManager({ ...manager, failover_fail_counts: counts });
+    return counts[key];
   }
-  await writeManager({ ...manager, failover_fail_counts: counts });
-  return counts[key];
+  return 0;
 }
 
 async function currentFailureCount(readManager, provider, model) {

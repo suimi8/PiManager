@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -247,9 +248,9 @@ def _check_request_scheme(url: str) -> str:
     if scheme not in {"http", "https"}:
         return f"Base URL 仅允许 http/https 协议，已拒绝 {scheme or '未知'}:// 请求。"
     if scheme == "http" and not _is_private_host(str(parts.hostname or "")):
-        logger.warning(
-            "请求目标 %s 使用明文 HTTP：密钥将以明文发送。建议改用 https://。",
-            str(parts.hostname or ""),
+        return (
+            "Base URL 使用公网 HTTP 明文协议，API Key 将以明文传输，已被阻止。"
+            "请改用 https://，或使用本地地址（如 127.0.0.1 / localhost）。"
         )
     return ""
 
@@ -290,9 +291,6 @@ def sanitize_proxy_env(env: dict[str, str]) -> dict[str, str]:
         if not proxy_reachable(value):
             result.pop(var, None)
     return result
-
-
-_sanitize_proxy_env = sanitize_proxy_env
 
 
 def run_pi(
@@ -463,8 +461,9 @@ def list_models(search: str | None = None) -> list[ModelInfo]:
     return uniq
 
 
-_CONFIG_CACHE: dict[str, tuple[int, int, Any]] = {}
+_CONFIG_CACHE: dict[str, tuple[int, int, Any, float]] = {}
 _CONFIG_CACHE_LOCK = threading.Lock()
+_CONFIG_CACHE_TTL = 5.0  # seconds
 
 
 def _invalidate_config_cache(path: Path | None = None) -> None:
@@ -483,6 +482,9 @@ def _load_json_cached(path: Path, default: Any) -> Any:
     far cheaper than the full file-lock + parse round trip. Writers (this
     process, the pi CLI, the extension's broker) all replace the file, so a
     changed signature naturally invalidates the entry.
+
+    A monotonic TTL guards against file systems whose mtime granularity is
+    too coarse to detect a rapid in-place rewrite by another process.
     """
     key = str(path)
     try:
@@ -493,7 +495,11 @@ def _load_json_cached(path: Path, default: Any) -> Any:
     if signature is not None:
         with _CONFIG_CACHE_LOCK:
             cached = _CONFIG_CACHE.get(key)
-        if cached is not None and (cached[0], cached[1]) == signature:
+        if (
+            cached is not None
+            and (cached[0], cached[1]) == signature
+            and (time.monotonic() - cached[3]) < _CONFIG_CACHE_TTL
+        ):
             return copy.deepcopy(cached[2])
     data = load_json(path, default)
     # Only cache when the file did not change while we were reading it.
@@ -504,7 +510,7 @@ def _load_json_cached(path: Path, default: Any) -> Any:
         after = None
     if after is not None and after == signature:
         with _CONFIG_CACHE_LOCK:
-            _CONFIG_CACHE[key] = (after[0], after[1], copy.deepcopy(data))
+            _CONFIG_CACHE[key] = (after[0], after[1], copy.deepcopy(data), time.monotonic())
     return data
 
 
@@ -847,9 +853,6 @@ def parse_favorite_key(key: str) -> tuple[str, str] | None:
     if not provider or not model:
         return None
     return provider, model
-
-
-_parse_favorite_key = parse_favorite_key
 
 
 def purge_favorites(
@@ -1218,9 +1221,6 @@ def project_name_from_path(path_str: str) -> str:
     # Windows 根目录 C:\
     s = str(path_str or "").rstrip("\\/")
     return s or "（未知项目）"
-
-
-_project_name_from_path = project_name_from_path
 
 
 def _parse_session_meta(path: Path) -> dict[str, str]:
@@ -2186,6 +2186,7 @@ def _ssl_context(insecure: bool = False):
     import ssl
 
     if insecure:
+        logger.warning("SSL 证书校验已被用户显式禁用（insecure_ssl=True），存在中间人攻击风险")
         ctx = ssl._create_unverified_context()
         return ctx
     cafile = None
@@ -2238,9 +2239,15 @@ def redact_endpoint_url(url: str) -> str:
 
 def redact_secret_values(text: str, secret_values: list[str]) -> str:
     result = str(text or "")
-    for secret in sorted({str(item) for item in secret_values if item}, key=len, reverse=True):
-        result = result.replace(secret, "***")
-    return result
+    # 过滤掉空值与长度小于 4 的短密钥，避免误伤无关文本
+    unique = {
+        str(item) for item in secret_values if item and len(str(item)) >= 4
+    }
+    if not unique:
+        return result
+    # 按长度降序构造正则，避免短密钥替换掉长密钥中的残片
+    pattern = "|".join(re.escape(secret) for secret in sorted(unique, key=len, reverse=True))
+    return re.sub(pattern, "***", result)
 
 
 def _friendly_fetch_error(exc: BaseException, endpoint: str = "") -> str:
@@ -2432,6 +2439,7 @@ def _zhipu_vision_request(
     else:
         # Explicitly disable proxies (including env vars) for the direct path.
         handlers.append(urllib.request.ProxyHandler({}))
+    handlers.append(urllib.request.HTTPSHandler(context=_ssl_context(False)))
     opener = urllib.request.build_opener(*handlers)
     t0 = _time.perf_counter()
     try:
@@ -2833,11 +2841,10 @@ def fetch_remote_models(
                 endpoint = root + "/models"
             else:
                 endpoint = root
-            if key:
-                sep = "&" if "?" in endpoint else "?"
-                from urllib.parse import quote
-                endpoint = f"{endpoint}{sep}key={quote(key, safe='')}"
         req_headers = {"Accept": "application/json", "User-Agent": DEFAULT_OPENAI_COMPAT_USER_AGENT}
+        # Google 支持以 x-goog-api-key 头部传递密钥，避免泄露到 URL/代理日志
+        if key and "key=" not in endpoint:
+            req_headers["x-goog-api-key"] = key
         if not key and "key=" not in endpoint:
             return {
                 "ok": False,
@@ -3551,11 +3558,10 @@ def test_model_http(
             endpoint = f"{root}/{model}:generateContent"
         else:
             endpoint = f"{root}/models/{model}:generateContent"
-        if key:
-            from urllib.parse import quote
-
-            sep = "&" if "?" in endpoint else "?"
-            endpoint = f"{endpoint}{sep}key={quote(key, safe='')}"
+        # 优先以 x-goog-api-key 头部传递密钥，避免泄露到 URL/代理日志；
+        # 若用户直接传入带 key= 的 URL 则保留原样
+        if key and "key=" not in endpoint:
+            headers["x-goog-api-key"] = key
         body_obj = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {"maxOutputTokens": 16, "temperature": 0},

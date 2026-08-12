@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -30,12 +31,19 @@ def _create_broker_token() -> str:
     path = broker_token_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    fd = os.open(path, flags, 0o600) if os.name != "nt" else os.open(path, flags)
+    fd = os.open(path, flags, 0o600)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(token.encode("ascii"))
             handle.flush()
             os.fsync(handle.fileno())
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        # On Windows, chmod 0o600 is insufficient; restrict ACL to current user.
+        if os.name == "nt":
+            _restrict_windows_acl(path)
         return token
     except Exception:
         try:
@@ -45,19 +53,49 @@ def _create_broker_token() -> str:
         raise
 
 
+def _restrict_windows_acl(path: Path) -> None:
+    """Restrict file ACL to current user only on Windows."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.windll.advapi32
+        kernel32 = ctypes.windll.kernel32
+
+        desired_access = 0x00100000 | 0x00010000  # WRITE_DAC | READ_CONTROL
+        handle = kernel32.CreateFileW(
+            str(path), desired_access, 0, None, 3, 0x80, None  # OPEN_EXISTING
+        )
+        if handle == ctypes.c_void_p(-1).value or handle == 0xFFFFFFFF:
+            return
+        try:
+            # Set ACL to NULL → only owner gets access (inheritance disabled)
+            advapi32.SetSecurityInfo(
+                handle, 1,  # SE_FILE_OBJECT
+                0x00000004 | 0x00000002,  # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+                None, None, None, None,
+            )
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+
+
 def _verify_broker_token(provided: str) -> bool:
     path = broker_token_path()
     if not path.exists():
         try:
-            _create_broker_token()
-            return True
+            token = _create_broker_token()
+            # Even on first creation, require the caller to present the token
+            # we just created. An empty provided value is never accepted.
+            return bool(provided) and hmac.compare_digest((provided or "").strip(), token)
         except FileExistsError:
             pass
     try:
         stored = path.read_text(encoding="utf-8", errors="strict").strip()
     except (OSError, UnicodeDecodeError):
         return False
-    return hmac.compare_digest((provided or "").strip(), stored)
+    return bool(provided) and hmac.compare_digest((provided or "").strip(), stored)
 
 
 def _revision_path() -> Path:
@@ -151,7 +189,10 @@ def mutate(request: dict[str, Any]) -> dict[str, Any]:
 
         return {"ok": False, "request_id": request_id, "error": "operation_not_allowed"}
     except Exception as exc:
-        return {"ok": False, "request_id": request_id, "error": str(exc)}
+        logging.getLogger(__name__).warning(
+            "config broker mutation failed: %s", exc, exc_info=True
+        )
+        return {"ok": False, "request_id": request_id, "error": "操作失败"}
 
 
 def mutate_file(path: str | Path) -> dict[str, Any]:
