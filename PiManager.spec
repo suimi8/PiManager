@@ -1,98 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""Cross-platform directory / .app build (recommended standalone layout).
+"""macOS / Linux 构建：目录版 / .app（Windows 改用 PiManagerOneFile.spec 单文件版）。
 
-Windows / Linux  -> dist/PiManager/
-macOS            -> dist/PiManager.app
+Linux -> dist/PiManager/（目录版）
+macOS -> dist/PiManager.app
+
+Windows 只发布 onefile 单文件版（dist/PiManager.exe），见 PiManagerOneFile.spec
+与 build.yml 的平台分支。
+
+共享构建配置（hiddenimports、datas、Qt 裁剪、图标与 APP_VERSION 提取）位于
+scripts/pyi_common.py；Windows EXE 版本资源由 scripts/pyi_version_info.py 生成。
 """
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
-
 project_root = Path(SPECPATH)
-extras_source = (project_root / "pi_manager" / "extras.py").read_text(encoding="utf-8")
-match = re.search(r"APP_VERSION\s*=\s*\"([^\"]+)\"", extras_source)
-if not match:
-    raise SystemExit("cannot extract APP_VERSION from pi_manager/extras.py")
-APP_VERSION = match.group(1)
-datas = [(str(project_root / "assets"), "assets")]
-datas += collect_data_files("certifi")
+sys.path.insert(0, str(project_root / "scripts"))
 
-# Bundle package data that may be imported dynamically.
-try:
-    datas += collect_data_files("keyring")
-except Exception:
-    pass
+import pyi_common
+import pyi_version_info
 
-hiddenimports = [
-    "keyring.backends",
-    "cryptography",
-    "pi_manager.platform_util",
-    "pi_manager.resources",
-    "pi_manager.extras",
-    "pi_manager.secrets",
-    "pi_manager.storage",
-    "pi_manager.provider_env",
-    "pi_manager.config_broker",
-    "pi_manager.helper_registry",
-    "pi_manager.rpc_session",
-    "pi_manager.ui_features",
-    "pi_manager.help_docs",
-    "pi_manager.builtin_themes",
-    "pi_manager.core",
-    "pi_manager.ui",
-    "pi_manager.presentation",
-    "pi_manager.presentation.main_window",
-    "pi_manager.presentation.design.stylesheet",
-    "pi_manager.presentation.components.navigation",
-    "pi_manager.presentation.pages.dashboard",
-    "pi_manager.presentation.pages.models",
-    "pi_manager.presentation.pages.providers",
-    "pi_manager.presentation.pages.chat",
-    "pi_manager.presentation.pages.sessions",
-    "pi_manager.presentation.pages.diagnostics",
-    "pi_manager.presentation.pages.settings",
-    "pi_manager.presentation.pages.help",
-]
-
-# Include every modular presentation page in frozen builds.
-hiddenimports += collect_submodules("pi_manager.presentation")
-
-# Pull all keyring backends so frozen apps do not miss platform providers.
-try:
-    hiddenimports += collect_submodules("keyring.backends")
-except Exception:
-    pass
-
-if sys.platform == "win32":
-    hiddenimports += [
-        "keyring.backends.Windows",
-        "win32timezone",
-        "pythoncom",
-        "pywintypes",
-    ]
-    icon = str(project_root / "assets" / "pi-manager.ico")
-elif sys.platform == "darwin":
-    hiddenimports += [
-        "keyring.backends.macOS",
-        "keyring.backends.chainer",
-        "keyring.backends.fail",
-    ]
-    icns = project_root / "assets" / "pi-manager.icns"
-    icon = str(icns if icns.exists() else project_root / "assets" / "icon.png")
-else:
-    hiddenimports += [
-        "keyring.backends.SecretService",
-        "keyring.backends.chainer",
-        "keyring.backends.fail",
-        "keyring.backends.libsecret",
-        "jeepney",
-        "secretstorage",
-    ]
-    icon = None
+APP_VERSION = pyi_common.read_app_version(project_root)
+datas = pyi_common.build_datas(project_root)
+hiddenimports = pyi_common.build_hiddenimports()
+icon = pyi_common.resolve_icon(project_root)
 
 # Keep binaries portable: never UPX-compress Qt/cryptography natives.
 a = Analysis(
@@ -104,20 +36,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[str(project_root / "scripts" / "pyi_rth_pimanager.py")],
-    excludes=[
-        "PySide6.QtQml",
-        "PySide6.QtQuick",
-        "PySide6.QtQuickWidgets",
-        "PySide6.QtQuick3D",
-        "PySide6.QtPdf",
-        "PySide6.QtPdfWidgets",
-        "PySide6.QtVirtualKeyboard",
-        "PySide6.QtWebEngineCore",
-        "PySide6.QtWebEngineWidgets",
-        "PySide6.QtCharts",
-        "PySide6.QtMultimedia",
-        "PySide6.QtMultimediaWidgets",
-    ],
+    excludes=pyi_common.EXCLUDES,
     noarchive=False,
     optimize=0,
 )
@@ -126,43 +45,12 @@ a = Analysis(
 # VirtualKeyboard runtimes the PySide6 hook still bundles, and keep only
 # Chinese/English Qt translations. opengl32sw.dll stays (software-GL
 # fallback for VMs/remote desktops).
-_QT_TRIM_TAGS = (
-    "Qt6Pdf",
-    "Qt6Qml",
-    "Qt6Quick",
-    "Qt6VirtualKeyboard",
-    "QtPdf",
-    "QtQml",
-    "QtQuick",
-    "QtVirtualKeyboard",
-    "qtvirtualkeyboard",
-)
-_QM_KEEP_SUFFIXES = ("_zh_CN.qm", "_zh_TW.qm", "_en.qm")
-
-
-def _trim_qt(toc):
-    kept = []
-    for entry in toc:
-        name = str(entry[0]).replace("\\", "/")
-        base = name.rsplit("/", 1)[-1]
-        if any(tag in base for tag in _QT_TRIM_TAGS):
-            continue
-        if "translations/" in name and base.endswith(".qm"):
-            if not base.endswith(_QM_KEEP_SUFFIXES):
-                continue
-        kept.append(entry)
-    return kept
-
-
-a.binaries = _trim_qt(a.binaries)
-a.datas = _trim_qt(a.datas)
+a.binaries = pyi_common.trim_qt(a.binaries)
+a.datas = pyi_common.trim_qt(a.datas)
 
 pyz = PYZ(a.pure)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
+exe_kwargs = dict(
     exclude_binaries=True,
     name="PiManager",
     debug=False,
@@ -176,6 +64,19 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=icon,
+)
+if sys.platform == "win32":
+    # Windows EXE version resource (FileVersion / ProductVersion ...) from
+    # the single source of truth pi_manager/extras.py -> APP_VERSION.
+    exe_kwargs["version"] = pyi_version_info.write_version_file(
+        APP_VERSION, project_root
+    )
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    **exe_kwargs,
 )
 
 coll = COLLECT(

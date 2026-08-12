@@ -29,6 +29,9 @@ from . import storage
 logger = logging.getLogger(__name__)
 
 
+# ==== 基础工具：路径定位 / JSON 读写 / 敏感数据脱敏 ====
+
+
 def user_home() -> Path:
     return Path(os.path.expanduser("~"))
 
@@ -101,6 +104,9 @@ def redact_sensitive_config(value: Any, field_name: str = "") -> Any:
     if isinstance(value, list):
         return [redact_sensitive_config(item, field_name) for item in value]
     return value
+
+
+# ==== 进程管理：Pi 命令定位 / 终端选项 / 进程树终止 / 代理环境 / 一次性运行 ====
 
 
 def find_pi_command() -> str | None:
@@ -301,15 +307,14 @@ def run_pi(
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run Pi with real-time 8 MiB limits for stdout and stderr."""
+    from . import proc
+
     base = pi_base_cmd()
     cmd = base + escape_cmd_shim_args(args, base)
-    full_env = os.environ.copy()
-    if env:
-        full_env.update(env)
-    full_env = sanitize_proxy_env(full_env)
+    full_env = proc.spawn_env(env, sanitize_after_merge=True)
     full_env.setdefault("PYTHONIOENCODING", "utf-8")
     output_limit = 8 * 1024 * 1024
-    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    creationflags = proc.create_no_window_flag()
     if sys.platform == "win32" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
         creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP
     process = subprocess.Popen(
@@ -360,6 +365,9 @@ def run_pi(
             cmd, -1, stdout, "process output limit exceeded\n" + stderr
         )
     return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+
+
+# ==== 模型列表与 Pi 版本 ====
 
 
 def get_pi_version() -> str:
@@ -463,6 +471,8 @@ def list_models(search: str | None = None) -> list[ModelInfo]:
 
 _CONFIG_CACHE: dict[str, tuple[int, int, Any, float]] = {}
 _CONFIG_CACHE_LOCK = threading.Lock()
+# ==== 配置读写：settings / models / auth / manager（带进程内缓存） ====
+
 _CONFIG_CACHE_TTL = 5.0  # seconds
 
 
@@ -616,6 +626,46 @@ def load_models_config() -> dict[str, Any]:
                 logger.warning(
                     "保存默认 User-Agent 头失败，models.json 与内存配置可能不一致: %s", exc
                 )
+
+    # Migrate reasoning models missing a thinkingLevelMap: without it, Pi
+    # silently clamps "max" down to "high" (and drops xhigh/max from the
+    # supported levels list). Fill in the default map for existing models
+    # that were saved before this migration existed.
+    providers = cfg.get("providers", {})
+    if isinstance(providers, dict):
+        thinking_changed = False
+        updated_providers = dict(providers)
+        for name, entry in providers.items():
+            if not isinstance(entry, dict):
+                continue
+            models = entry.get("models")
+            if not isinstance(models, list):
+                continue
+            new_models = []
+            any_changed = False
+            for m in models:
+                if not isinstance(m, dict):
+                    new_models.append(m)
+                    continue
+                migrated = ensure_thinking_level_map(m)
+                if migrated is not m:
+                    any_changed = True
+                new_models.append(migrated)
+            if any_changed:
+                updated_entry = dict(entry)
+                updated_entry["models"] = new_models
+                updated_providers[name] = updated_entry
+                thinking_changed = True
+        if thinking_changed:
+            cfg = dict(cfg)
+            cfg["providers"] = updated_providers
+            try:
+                save_models_config(cfg)
+            except Exception as exc:
+                logger.warning(
+                    "保存 thinkingLevelMap 迁移失败: %s", exc
+                )
+
     return cfg
 
 
@@ -744,6 +794,9 @@ def save_manager_config(data: dict[str, Any]) -> None:
     save_json(manager_config_path(), data, private=True)
 
 
+# ==== 默认模型 / 收藏 / 自定义 provider / 模型管理 ====
+
+
 def normalize_model_pair(
     provider: str | None,
     model: str | None,
@@ -814,11 +867,15 @@ def upsert_custom_provider(
         raw_key = str(existing.get("apiKey") or "")
     else:
         raw_key = secretstore.store_provider_api_key(name, str(api_key).strip())
+    saved_models = [
+        ensure_thinking_level_map(m)
+        for m in (models if models is not None else existing.get("models", []))
+    ]
     entry: dict[str, Any] = {
         "baseUrl": base_url,
         "api": api,
         "apiKey": raw_key,
-        "models": models if models is not None else existing.get("models", []),
+        "models": saved_models,
     }
     if compat is not None:
         entry["compat"] = compat
@@ -1047,6 +1104,37 @@ def delete_custom_provider(name: str) -> dict[str, Any]:
     return cfg
 
 
+# Default mapping from Pi thinking levels to OpenAI-style reasoning_effort
+# values. Pi treats xhigh/max as unsupported when a reasoning model has no
+# thinkingLevelMap, silently clamping max down to high — so fill it in.
+DEFAULT_THINKING_LEVEL_MAP: dict[str, str] = {
+    "off": "none",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max",
+}
+
+
+def ensure_thinking_level_map(model: dict[str, Any]) -> dict[str, Any]:
+    """Fill a default thinkingLevelMap for reasoning models missing one.
+
+    Without a thinkingLevelMap, Pi's getSupportedThinkingLevels() drops
+    xhigh/max, and clampThinkingLevel() demotes max to high. Only touch
+    models that support reasoning and have no explicit map, so user-provided
+    custom mappings are preserved.
+    """
+    if not isinstance(model, dict):
+        return model
+    if not model.get("reasoning") or model.get("thinkingLevelMap"):
+        return model
+    result = dict(model)
+    result["thinkingLevelMap"] = dict(DEFAULT_THINKING_LEVEL_MAP)
+    return result
+
+
 def add_model_to_provider(provider: str, model_id: str, **kwargs: Any) -> dict[str, Any]:
     cfg = load_models_config()
     providers = cfg.setdefault("providers", {})
@@ -1055,7 +1143,7 @@ def add_model_to_provider(provider: str, model_id: str, **kwargs: Any) -> dict[s
     models = providers[provider].setdefault("models", [])
     # replace if exists
     models = [m for m in models if m.get("id") != model_id]
-    item = {"id": model_id, **kwargs}
+    item = ensure_thinking_level_map({"id": model_id, **kwargs})
     if "cost" not in item:
         item["cost"] = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
     models.append(item)
@@ -1183,6 +1271,9 @@ def run_pi_print(
             or next_credential["key_id"] in attempted_key_ids
         ):
             return p.returncode, stdout, stderr
+
+
+# ==== 会话管理：会话目录解析 / 历史会话列表 / 打开路径 ====
 
 
 def _decode_session_folder_slug(slug: str) -> str:
@@ -1897,6 +1988,9 @@ def set_ui_theme(mode: str | None = None, accent: str | None = None) -> dict[str
     return {"mode": mode_name, "accent": accent_name}
 
 
+# ==== 凭据与 Provider 密钥：失效分类 / 环境变量解析 / 运行时凭据 ====
+
+
 class ProviderKeyError(RuntimeError):
     """Raised when a selected custom provider has no usable credential."""
 
@@ -2168,6 +2262,9 @@ def all_provider_runtime_env(*, strict: bool = False) -> dict[str, str]:
             if strict:
                 raise
     return result
+
+
+# ==== HTTP 工具：URL 规范化 / SSL 上下文 / 端点脱敏 / 友好错误 ====
 
 
 def normalize_openai_base_url(base_url: str) -> str:
@@ -2513,6 +2610,37 @@ def build_vision_prompt(user_prompt: str = "") -> str:
     )
 
 
+# ==== 视觉：智谱识图 / 图片校验 / 技能安装 ====
+
+
+_ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff"}
+_MAX_IMAGE_BYTES = 20 * 1024 * 1024
+
+
+def load_image_for_describe(path: str) -> dict[str, Any]:
+    """Validate + read an image file for ``--vision-describe`` (no GUI deps).
+
+    Returns ``{"ok": True, "data": bytes}`` on success, or
+    ``{"ok": False, "error": <中文错误>}`` otherwise. Error strings and
+    acceptance rules (extension whitelist, 20 MB cap) are the single source
+    of truth for the CLI hot path so behavior cannot drift.
+    """
+    p = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+    if os.path.splitext(p)[1].lower() not in _ALLOWED_IMAGE_EXTS:
+        return {"ok": False, "error": "仅支持图片文件（png/jpg/jpeg/gif/bmp/webp/tiff）"}
+    try:
+        if os.path.getsize(p) > _MAX_IMAGE_BYTES:
+            return {"ok": False, "error": "图片文件过大（上限 20MB）"}
+    except OSError as exc:
+        return {"ok": False, "error": f"无法读取图片：{exc}"}
+    try:
+        with open(p, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        return {"ok": False, "error": f"无法读取图片：{exc}"}
+    return {"ok": True, "data": data}
+
+
 def describe_image(
     image_bytes: bytes,
     mime: str = "image/png",
@@ -2717,6 +2845,9 @@ description: 自动降级识图管道。当用户要求查看、识别或分析�
 
 仅当你明确知道当前对话模型**原生支持图片**（例如模型列表中该 provider 的 images 列为 yes，且此前成功直接发图过）时，才可以直接把图片发给模型；否则一律走本技能识图管道。拿不准时，走识图管道是最安全的选择。
 """
+
+
+# ==== 远程模型获取与 provider 落库 ====
 
 
 def fetch_remote_models(
@@ -3073,6 +3204,9 @@ def upsert_provider_with_fetched_models(
 
 
 
+# ==== Provider 配置查询 / 密钥池管理 / 配置备份 ====
+
+
 def get_provider_config(provider: str) -> dict[str, Any] | None:
     """Return custom provider entry from models.json, if any."""
     if not provider:
@@ -3242,6 +3376,9 @@ def restore_all_provider_api_keys(provider: str) -> int:
     from . import secrets as secretstore
 
     return secretstore.restore_all_provider_keys(provider)
+
+
+# ==== HTTP 连通性测试与模型可用性测试 ====
 
 
 def _http_json_request(

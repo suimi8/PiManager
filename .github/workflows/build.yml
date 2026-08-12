@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version label (e.g. 1.8.0)"
+        description: "Release version label (e.g. 1.8.1)"
         required: true
-        default: "1.8.0"
+        default: "1.8.1"
       upload_to_release:
-        description: "Existing GitHub Release tag to upload into (e.g. v1.8.0). Leave empty for artifacts only."
+        description: "Existing GitHub Release tag to upload into (e.g. v1.8.1). Leave empty for artifacts only."
         required: false
         default: ""
   push:
@@ -105,15 +105,18 @@ jobs:
           elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=1.8.0" >> "$GITHUB_OUTPUT"
+            # Fallback: derive the version from pi_manager/extras.py (single source of truth)
+            # so that a bare "Run workflow" never drifts from the packaged APP_VERSION.
+            echo "version=$(python -c "import re,pathlib;m=re.search(r'APP_VERSION\s*=\s*\"([^\"]+)\"',pathlib.Path('pi_manager/extras.py').read_text(encoding='utf-8'));print(m.group(1) if m else '0.0.0')")" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: PyInstaller (directory / app)
-        run: python -m PyInstaller --noconfirm --clean PiManager.spec
-
-      - name: PyInstaller (onefile, Windows only)
+      - name: PyInstaller (onefile, Windows)
         if: matrix.platform == 'windows'
         run: python -m PyInstaller --noconfirm --clean PiManagerOneFile.spec
+
+      - name: PyInstaller (directory / app, macOS / Linux)
+        if: matrix.platform != 'windows'
+        run: python -m PyInstaller --noconfirm --clean PiManager.spec
 
       - name: Smoke test packaged binary
         shell: bash

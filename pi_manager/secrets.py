@@ -530,23 +530,33 @@ def set_secret(name: str, value: str) -> None:
     with locked(_mutation_lock_path()):
         kr = _get_keyring()
         keyring_saved = False
+        # 空值删除路径：仅当 keyring 删除已确认成功或 keyring 完全不可用
+        # 时才清理 vault 副本；keyring 删除抛异常时必须保留 vault 副本，
+        # 避免密钥在 keyring 与 vault 两端同时丢失。
+        keyring_delete_confirmed = False
         if kr is not None:
             try:
                 if value:
                     kr.set_password(SERVICE, name, value)
+                    keyring_saved = True
                 else:
                     try:
                         kr.delete_password(SERVICE, name)
                     except Exception:
-                        pass
-                keyring_saved = True
+                        keyring_delete_confirmed = False
+                    else:
+                        keyring_delete_confirmed = True
             except Exception:
                 kr = None
         vault = load_vault()
-        if value and not keyring_saved:
-            vault[name] = value
-        elif name in vault:
-            del vault[name]
+        if value:
+            if keyring_saved:
+                vault.pop(name, None)
+            else:
+                vault[name] = value
+        elif keyring_delete_confirmed or kr is None:
+            vault.pop(name, None)
+        # else: keyring 删除失败，保留 vault 副本作为最后防线
         save_vault(vault)
         names = _load_index()
         if value:
@@ -856,12 +866,21 @@ def mark_provider_key_failed(provider: str, key_id: str, reason: str = "") -> bo
     provider = (provider or "").strip()
     key_id = (key_id or "").strip()
     reason = _sanitize_reason(reason)
-    from .core import classify_provider_key_failure
+    from .core import classify_provider_key_failure, redact_secret_values
 
     classification = classify_provider_key_failure(1, "", reason)
     status = classification.get("status") or "restricted"
     with locked(_provider_key_pool_lock_path()):
         pool, _migrated = _read_provider_key_pool(provider)
+        # 脱敏：reason 可能混入密钥片段（如 "api key sk-xxx invalid"），
+        # 用池内全部密钥值做替换，避免密钥片段被写入 vault 并在界面展示。
+        # 与 classify_provider_key_failure 一样采用函数内延迟导入，避免顶层循环。
+        secret_values = [str(item.get("value") or "") for item in pool["keys"]]
+        safe_reason = _sanitize_reason(
+            redact_secret_values(
+                classification.get("reason") or reason.strip(), secret_values
+            )
+        )
         found = False
         for item in pool["keys"]:
             if item["id"] != key_id:
@@ -871,9 +890,7 @@ def mark_provider_key_failed(provider: str, key_id: str, reason: str = "") -> bo
             item["retry_at"] = classification.get("retry_at") or ""
             item["failure_kind"] = classification.get("failure_kind") or "unknown"
             item["failure_count"] = int(item.get("failure_count") or 0) + 1
-            item["failure_reason"] = _sanitize_reason(
-                classification.get("reason") or reason.strip()
-            )
+            item["failure_reason"] = safe_reason
             found = True
             break
         if not found:

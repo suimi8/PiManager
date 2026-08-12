@@ -11,6 +11,10 @@ from pi_manager import core, extras, rpc_session
 
 @pytest.fixture(autouse=True)
 def _reset_rpc_state():
+    # 说明（T8）：_runtime_disabled / _runtime_disabled_since 是 rpc_session 的
+    # 模块级运行时熔断状态，仅由内部在子进程失败时写入，没有公共重置接口；
+    # reset_chat_session() 只重置会话条目。测试必须直接重置私有状态才能
+    # 隔离用例，因此保留私有访问并在此注释说明。
     rpc_session.reset_chat_session()
     rpc_session._runtime_disabled = False
     rpc_session._runtime_disabled_since = 0.0
@@ -30,6 +34,9 @@ def test_rpc_chat_disabled_by_manager_config(isolated_home):
 def test_chat_attempt_falls_back_when_rpc_runtime_disabled(isolated_home, monkeypatch):
     import time
 
+    # 说明（T8）：_runtime_disabled 是运行时熔断标志，只能由 rpc_chat_once 在
+    # 真实子进程失败时置位；测试需要直接注入该状态以覆盖回退分支，
+    # 无公共入口，保留私有访问。
     rpc_session._runtime_disabled = True
     rpc_session._runtime_disabled_since = time.monotonic()
     calls: list[str] = []
@@ -114,9 +121,10 @@ def _sse_payload(text: str, model: str) -> bytes:
     ) + b"data: [DONE]\n\n"
 
 
+@pytest.mark.integration
 def test_rpc_chat_hot_switches_models_with_real_pi(isolated_home, monkeypatch, tmp_path):
     if not core.find_pi_command():
-        pytest.skip("official Pi CLI is not installed")
+        pytest.skip("integration: 未安装官方 Pi CLI，跳过真实子进程集成测试（CI 安装后运行 -m integration）")
 
     for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
         monkeypatch.delenv(name, raising=False)

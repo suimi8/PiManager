@@ -5,6 +5,8 @@ from __future__ import annotations
 import html
 import re
 
+from .extras import APP_VERSION
+
 _RE_CODE = re.compile(r"`([^`]+)`")
 _RE_BOLD = re.compile(r"\*\*([^*]+)\*\*")
 _RE_ITALIC = re.compile(r"\*([^*]+)\*")
@@ -13,9 +15,9 @@ _RE_SEP = re.compile(r":?-{3,}:?")
 _RE_UL = re.compile(r"^[-*] ")
 _RE_OL = re.compile(r"^\d+\. ")
 
-HELP_MARKDOWN = r'''# Pi Manager 使用教程与常见问题
+_HELP_MARKDOWN = r'''# Pi Manager 使用教程与常见问题
 
-> 版本 1.8.1 · 跨平台 GUI 管理官方 Pi Coding Agent（Windows / macOS / Linux）
+> 版本 __APP_VERSION__ · 跨平台 GUI 管理官方 Pi Coding Agent（Windows / macOS / Linux）
 > 完整 agent 能力始终由官方 `pi` 提供，本工具负责配置、切换、测试与启动。
 
 ---
@@ -252,6 +254,9 @@ A：写进 `models.json` 的 `compat` 字段，告诉官方 Pi 这个接口支�
 
 *完整编码/agent 能力请始终通过「启动 Pi」使用官方交互会话。*
 '''
+
+# 版本号单一来源：pi_manager/extras.py 的 APP_VERSION。
+HELP_MARKDOWN = _HELP_MARKDOWN.replace("__APP_VERSION__", APP_VERSION)
 
 
 def _help_theme_colors(mode: str = "night") -> dict[str, str]:

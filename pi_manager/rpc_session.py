@@ -10,15 +10,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import subprocess
-import sys
 import threading
 import time
 import uuid
 from typing import Any
 
 from . import core
+from . import proc
 from . import secrets as secretstore
 
 logger = logging.getLogger(__name__)
@@ -27,6 +26,9 @@ _COMMAND_TIMEOUT = 30.0
 _PROMPT_TIMEOUT = 180.0
 _RUNTIME_RETRY_COOLDOWN = 30.0
 _MAX_STDOUT_LINE = 10 * 1024 * 1024
+_STDIN_WRITE_TIMEOUT = 10.0
+_STDIN_WRITE_GRACE = 0.2
+_MAX_PROVIDER_ENV_CACHE = 8
 
 
 class RpcSessionError(RuntimeError):
@@ -52,9 +54,7 @@ def _extract_text(message: dict[str, Any] | None) -> str:
 
 class PiRpcSession:
     def __init__(self, argv: list[str], *, env: dict[str, str], cwd: str | None = None) -> None:
-        creationflags = (
-            getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-        )
+        creationflags = proc.create_no_window_flag()
         self._proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
@@ -177,6 +177,47 @@ class PiRpcSession:
             unavailable=not self._ever_responded,
         )
 
+    def _write_payload(self, payload: dict[str, Any]) -> None:
+        """Write one JSON line to the child stdin with a bounded flush.
+
+        A wedged child that stops reading stdin would otherwise block
+        write()/flush() forever and bypass the command timeout. The write
+        runs on a worker thread; on timeout the child is killed (a child
+        that cannot read stdin cannot serve further RPC anyway) and the
+        caller receives a normal RpcSessionError instead of hanging.
+        """
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        with self._stdin_lock:
+            if self._proc.stdin is None:
+                raise RpcSessionError("Pi RPC stdin 不可用")
+            outcome: dict[str, Any] = {}
+
+            def do_write() -> None:
+                try:
+                    assert self._proc.stdin is not None
+                    self._proc.stdin.write(line)
+                    self._proc.stdin.flush()
+                    outcome["ok"] = True
+                except Exception as exc:  # BrokenPipeError / OSError ...
+                    outcome["exc"] = exc
+
+            worker = threading.Thread(target=do_write, daemon=True)
+            worker.start()
+            worker.join(_STDIN_WRITE_TIMEOUT)
+            if worker.is_alive():
+                # Grace tick: the worker may have just finished its flush but
+                # not yet returned; only declare a timeout if still stuck.
+                worker.join(_STDIN_WRITE_GRACE)
+            if worker.is_alive():
+                self.close()
+                raise RpcSessionError(
+                    f"写入 Pi RPC stdin 超时（{_STDIN_WRITE_TIMEOUT:.0f}s），子进程已终止"
+                )
+            if "exc" in outcome:
+                raise RpcSessionError(
+                    f"发送 RPC 命令失败：{outcome['exc']}"
+                ) from outcome["exc"]
+
     def send(self, command: dict[str, Any], timeout: float = _COMMAND_TIMEOUT) -> dict[str, Any]:
         with self._state_lock:
             if not self._alive:
@@ -188,10 +229,7 @@ class PiRpcSession:
         payload = dict(command)
         payload["id"] = command_id
         try:
-            with self._stdin_lock:
-                assert self._proc.stdin is not None
-                self._proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-                self._proc.stdin.flush()
+            self._write_payload(payload)
         except Exception as exc:
             with self._state_lock:
                 self._pending.pop(command_id, None)
@@ -371,18 +409,24 @@ def _ensure(
     global _entry
     entry = _entry
     workdir_key = str(workdir or "")
+    env_snapshot = dict(provider_env)
+    # A1: keep one env snapshot per provider so the env comparison is precise.
+    # The child process is started with a fixed --provider, so a switch to a
+    # different provider must respawn regardless of the cached env (pi's RPC
+    # set_model cannot find models of another provider); within the same
+    # provider, respawn only when its env genuinely changed (e.g. key
+    # rotation), never because only the last provider's env was remembered.
+    env_changed = entry is not None and entry["env_by_provider"].get(provider) != env_snapshot
     respawn = (
         entry is None
         or not entry["session"].is_alive()
-        or entry["env_by_provider"].get(provider) != provider_env
+        or entry["current"][0] != provider
+        or env_changed
         or entry["workdir"] != workdir_key
         or entry["thinking"] != thinking
     )
     if respawn:
         session_id = entry["session_id"] if entry else str(uuid.uuid4())
-        env_by_provider = {provider: dict(provider_env)}
-        if entry is not None:
-            entry["session"].close()
         base = core.pi_base_cmd()
         argv = base + core.escape_cmd_shim_args(
             ["--mode", "rpc", "--provider", provider, "--model", model],
@@ -391,9 +435,24 @@ def _ensure(
         if thinking:
             argv += ["--thinking", thinking]
         argv += ["--session-id", session_id, "-n", "PiManager 快速提问"]
-        spawn_env = core.sanitize_proxy_env(os.environ.copy())
-        spawn_env.update(dict(provider_env))
+        spawn_env = proc.spawn_env(provider_env, sanitize_after_merge=False)
+        # A2: spawn the replacement first; only tear the old session down
+        # after the new process is up, so a spawn failure keeps the old
+        # conversation recoverable instead of losing it.
         session = PiRpcSession(argv, env=spawn_env, cwd=workdir or None)
+        if entry is not None:
+            entry["session"].close()
+        # A1: carry over the per-provider env cache and bound its size so the
+        # cache cannot grow without limit across provider switches.
+        env_by_provider = dict(entry["env_by_provider"]) if entry else {}
+        env_by_provider[provider] = env_snapshot
+        if len(env_by_provider) > _MAX_PROVIDER_ENV_CACHE:
+            for stale in list(env_by_provider):
+                if stale == provider:
+                    continue
+                del env_by_provider[stale]
+                if len(env_by_provider) <= _MAX_PROVIDER_ENV_CACHE:
+                    break
         _entry = {
             "session": session,
             "session_id": session_id,

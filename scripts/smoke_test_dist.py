@@ -127,12 +127,16 @@ def main() -> int:
 
     # Basic layout checks
     if plat == "windows":
-        assets = binary.parent / "_internal" / "assets"
-        if not assets.is_dir():
-            assets = binary.parent / "assets"
-        if not assets.is_dir():
-            print("FAIL: assets directory missing next to Windows binary", file=sys.stderr)
-            return 2
+        # Onefile embeds assets inside the exe (validated by --self-check);
+        # only the onedir layout keeps _internal/ (or assets/) next to the binary.
+        onedir = (binary.parent / "_internal").is_dir() or (binary.parent / "assets").is_dir()
+        if onedir:
+            assets = binary.parent / "_internal" / "assets"
+            if not assets.is_dir():
+                assets = binary.parent / "assets"
+            if not assets.is_dir():
+                print("FAIL: assets directory missing next to Windows binary", file=sys.stderr)
+                return 2
     elif plat == "macos":
         app = dist / "PiManager.app"
         if not app.is_dir():
@@ -148,7 +152,7 @@ def main() -> int:
             return 2
         # Shared libs commonly expected beside binary in onedir builds
         internal = binary.parent / "_internal"
-        if not internal.is_dir() and not (binary.parent / "libpython3.12.so.1.0").exists():
+        if not internal.is_dir() and not list(binary.parent.glob("libpython*.so*")):
             # Older layout may keep libs next to binary; warn only if completely empty tree
             if len(list(binary.parent.iterdir())) < 3:
                 print("FAIL: Linux onedir looks incomplete", file=sys.stderr)

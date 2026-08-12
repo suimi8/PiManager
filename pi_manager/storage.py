@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 import threading
@@ -152,6 +153,10 @@ def locked(path: Path) -> Iterator[None]:
             # Read-only or sandboxed directories cannot create a sidecar lock.
             # The in-process lock still protects threads; the actual read/write
             # will produce its own useful error when writes are not permitted.
+            logging.getLogger(__name__).warning(
+                "无法创建锁文件 %s（目录只读或受限），已降级为仅线程锁",
+                lock_path,
+            )
             yield
             return
         acquired = False

@@ -2,13 +2,16 @@
 """Package PyInstaller dist/ output into standalone release archives.
 
 Usage (after pyinstaller):
-  python scripts/package_release.py --platform windows|macos|linux --version 1.8.1
+  python scripts/package_release.py --platform windows|macos|linux [--version X.Y.Z]
+
+The version defaults to pi_manager/extras.py APP_VERSION when --version is omitted.
 """
 from __future__ import annotations
 
 import argparse
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -20,6 +23,22 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+_APP_VERSION_RE = re.compile(r'APP_VERSION\s*=\s*"([^"]+)"')
+
+
+def get_app_version(project_root: Path = REPO_ROOT) -> str:
+    """Read APP_VERSION from pi_manager/extras.py (single source of truth).
+
+    Text-based extraction keeps this standalone packaging entry point free of
+    pi_manager package imports (no GUI / heavy dependencies).
+    """
+    src = (project_root / "pi_manager" / "extras.py").read_text(encoding="utf-8")
+    match = _APP_VERSION_RE.search(src)
+    if not match:
+        raise SystemExit("cannot extract APP_VERSION from pi_manager/extras.py")
+    return match.group(1)
 
 
 def resolve_repo_path(value: str) -> Path:
@@ -138,7 +157,7 @@ def write_run_notes(out_dir: Path, plat: str, version: str) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--platform", default=detect_platform())
-    parser.add_argument("--version", default="1.8.1")
+    parser.add_argument("--version", default=get_app_version())
     parser.add_argument("--dist", default="dist")
     parser.add_argument("--out", default="release-assets")
     args = parser.parse_args()

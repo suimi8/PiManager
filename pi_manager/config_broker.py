@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,9 @@ _ALLOWED_MANAGER_FIELDS = frozenset(
         "failover_silent",
     }
 )
+
+# broker token 最长有效期：180 天。校验通过后按此期限轮换。
+_BROKER_TOKEN_MAX_AGE_SECONDS = 180 * 24 * 3600
 
 
 def broker_token_path() -> Path:
@@ -81,6 +85,49 @@ def _restrict_windows_acl(path: Path) -> None:
         pass
 
 
+def _rotate_broker_token_if_expired() -> None:
+    """校验通过后按有效期轮换 broker token（默认 180 天，基于文件 mtime）。
+
+    轮换发生在 token 校验成功之后，不影响当前请求；写入使用 os.replace
+    保证原子性。扩展每次调用前重新读取 token 文件，因此下一次调用自然
+    拿到新 token。轮换失败（目录只读等）时非致命：沿用旧 token，仅记日志。
+    """
+    path = broker_token_path()
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return
+    if age < _BROKER_TOKEN_MAX_AGE_SECONDS:
+        return
+    new_token = os.urandom(32).hex()
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(new_token.encode("ascii"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.chmod(temp, 0o600)
+        except OSError:
+            pass
+        if os.name == "nt":
+            _restrict_windows_acl(temp)
+        os.replace(temp, path)
+        if os.name == "nt":
+            _restrict_windows_acl(path)
+    except OSError:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        logging.getLogger(__name__).warning(
+            "broker token 已过期但轮换失败，沿用旧 token：%s", path
+        )
+        return
+    logging.getLogger(__name__).info("broker token 已按有效期轮换")
+
+
 def _verify_broker_token(provided: str) -> bool:
     path = broker_token_path()
     if not path.exists():
@@ -132,6 +179,8 @@ def mutate(request: dict[str, Any]) -> dict[str, Any]:
             "request_id": request_id,
             "error": "broker token 校验失败，请求已被拒绝",
         }
+    # 校验通过后按有效期轮换 token；轮换失败不影响当前请求。
+    _rotate_broker_token_if_expired()
     if int(request.get("schema_version") or 0) != 1:
         return {"ok": False, "request_id": request_id, "error": "unsupported_schema"}
     operation = str(request.get("operation") or "")

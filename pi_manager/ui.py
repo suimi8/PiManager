@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
-    QFrame,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -961,54 +960,6 @@ class MainWindow(FeatureMixin, QMainWindow):
             "MainWindow 仅作为行为基类使用；请实例化 presentation.ModernMainWindow"
         )
 
-    def _on_nav_changed(self, row: int):
-        if row < 0 or row >= len(self._page_keys):
-            return
-        key = self._page_keys[row]
-        self.pages.setCurrentIndex(self._page_index[key])
-        title, desc = next(((t, d) for k, t, d in NAV_PAGES if k == key), ("", ""))
-        if hasattr(self, "page_heading"):
-            self.page_heading.setText(title)
-            self.page_subheading.setText(desc)
-        # 切换到对应页时自动加载本地数据
-        if key == "health":
-            try:
-                self.health_refresh_table()
-            except Exception:
-                pass
-        elif key == "history":
-            try:
-                self.history_refresh()
-            except Exception:
-                pass
-
-    def _goto_page(self, key: str):
-        if key in getattr(self, "_page_index", {}) and hasattr(self, "nav"):
-            self.nav.setCurrentRow(self._page_keys.index(key))
-        elif key in getattr(self, "_page_index", {}):
-            self.pages.setCurrentIndex(self._page_index[key])
-
-    def _card(self, *, elevated: bool = False) -> QFrame:
-        f = QFrame()
-        f.setObjectName("card")
-        if elevated:
-            f.setProperty("elevated", True)
-        return f
-
-    def _btn(self, text: str, slot, *, secondary=False, danger=False, success=False, ghost=False) -> QPushButton:
-        b = QPushButton(text)
-        b.setCursor(Qt.PointingHandCursor)
-        if secondary:
-            b.setProperty("secondary", True)
-        if danger:
-            b.setProperty("danger", True)
-        if success:
-            b.setProperty("success", True)
-        if ghost:
-            b.setProperty("ghost", True)
-        b.clicked.connect(slot)
-        return b
-
     def _polish_table(self, table: QTableWidget) -> None:
         """统一表格观感（跨平台）。"""
         table.setShowGrid(False)
@@ -1188,16 +1139,6 @@ class MainWindow(FeatureMixin, QMainWindow):
             model = str(data[1] or "").strip()
             if provider and model:
                 return provider, model
-        return None
-
-    def _model_row_key(self, row: int) -> tuple[str, str] | None:
-        """兼容旧表格行号调用：树模式下取第 row 个组节点的第一个模型子项。"""
-        tree = self.models_table
-        if not hasattr(tree, "topLevelItem"):
-            return None
-        group = tree.topLevelItem(row)
-        if group is not None and group.childCount():
-            return self._model_item_key(group.child(0))
         return None
 
     def _track(self, worker: Worker):
@@ -1942,13 +1883,6 @@ class MainWindow(FeatureMixin, QMainWindow):
         provider, model, thinking = core.get_default_model()
         self._launch(provider or None, model or None, thinking or None)
 
-    def launch_selected(self):
-        m = self.selected_model_row()
-        if m:
-            self._launch(m.provider, m.model, self.thinking_combo.currentText())
-        else:
-            self.launch_default()
-
     def _launch(self, provider, model, thinking):
         self.persist_mgr()
         try:
@@ -1973,24 +1907,6 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.settings_load()
         self.fill_models_table()
         self.status.showMessage(f"默认模型已切换为 {m.key}")
-
-    def model_add_favorite(self):
-        # multi-select aware
-        rows = self.selected_model_rows()
-        if rows:
-            self.model_add_favorite_batch()
-            return
-        m = self.selected_model_row()
-        if not m:
-            return
-        favs = list(self.mgr.get("favorites") or [])
-        if m.key not in favs:
-            favs.append(m.key)
-            self.mgr["favorites"] = favs
-            self.persist_mgr()
-            self.fill_favorites()
-            self.fill_models_table()
-        self.status.showMessage(f"已收藏 {m.key}")
 
     def model_launch(self):
         m = self.selected_model_row()

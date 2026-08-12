@@ -41,6 +41,14 @@ def _ensure_windows_cli_stdio() -> None:
         logging.getLogger("pi_manager").debug("stdio redirect failed: %s", exc, exc_info=True)
 
 
+def _cli_json_error(error: str) -> int:
+    """Print a JSON error payload (extension contract) and return exit code 2."""
+    import json
+
+    print(json.dumps({"ok": False, "error": error}))
+    return 2
+
+
 def main():
     _ensure_windows_cli_stdio()
     if len(sys.argv) >= 2 and sys.argv[1] in {"--print-provider-env", "--provider-env"}:
@@ -49,71 +57,84 @@ def main():
         return provider_env_main(sys.argv[2:])
     if len(sys.argv) >= 2 and sys.argv[1] == "--vision-describe":
         # Lightweight image understanding entry for Pi skills: no GUI import.
+        import argparse as _argparse
         import json
 
-        from pi_manager.core import describe_image
+        from pi_manager.core import describe_image, load_image_for_describe
 
-        path = sys.argv[2] if len(sys.argv) > 2 else ""
+        parser = _argparse.ArgumentParser(
+            prog="PiManager --vision-describe",
+            add_help=False,
+            allow_abbrev=False,
+        )
+        parser.add_argument("path", nargs="?", default="")
+        # prompt is everything after the path, joined with spaces — the
+        # calling convention used by the Cursor extension / vision skill
+        # (<path> [prompt...]) must stay stable.
+        parser.add_argument("prompt", nargs=_argparse.REMAINDER)
+        try:
+            args, _extra = parser.parse_known_args(sys.argv[2:])
+        except SystemExit:
+            return _cli_json_error("usage: --vision-describe <image-path> [prompt]")
+        path = args.path or ""
         if not path:
-            print(json.dumps({"ok": False, "error": "usage: --vision-describe <image-path> [prompt]"}))
-            return 2
-        allowed_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff"}
-        p = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
-        if os.path.splitext(p)[1].lower() not in allowed_exts:
-            print(json.dumps({"ok": False, "error": "仅支持图片文件（png/jpg/jpeg/gif/bmp/webp/tiff）"}))
-            return 2
-        max_image_size = 20 * 1024 * 1024
-        try:
-            if os.path.getsize(p) > max_image_size:
-                print(json.dumps({"ok": False, "error": "图片文件过大（上限 20MB）"}))
-                return 2
-        except OSError as exc:
-            print(json.dumps({"ok": False, "error": f"无法读取图片：{exc}"}))
-            return 2
-        prompt = " ".join(sys.argv[3:]) or ""
-        try:
-            with open(p, "rb") as fh:
-                data = fh.read()
-        except OSError as exc:
-            print(json.dumps({"ok": False, "error": f"无法读取图片：{exc}"}))
-            return 2
-        result = describe_image(data, prompt=prompt or None)
+            return _cli_json_error("usage: --vision-describe <image-path> [prompt]")
+        loaded = load_image_for_describe(path)
+        if not loaded.get("ok"):
+            return _cli_json_error(str(loaded.get("error") or "无法读取图片"))
+        prompt = " ".join(args.prompt) or ""
+        result = describe_image(loaded["data"], prompt=prompt or None)
         if result.get("ok"):
-            print(result.get("description") or "")
+            desc = result.get("description") or ""
+            try:
+                print(desc)
+            except UnicodeEncodeError:
+                sys.stdout.buffer.write(desc.encode("utf-8", errors="replace"))
+                sys.stdout.buffer.write(b"\n")
+                sys.stdout.buffer.flush()
             return 0
         print(json.dumps({"ok": False, "error": result.get("error") or "识图失败"}))
         return 1
     if len(sys.argv) >= 2 and sys.argv[1] == "--config-mutate":
+        import argparse as _argparse
         import json
 
         from pi_manager.config_broker import mutate_file
         from pi_manager.provider_env import _emit
 
-        output_path = ""
-        if len(sys.argv) == 5 and sys.argv[3] == "--output":
-            output_path = sys.argv[4]
-        elif len(sys.argv) != 3:
-            result = {"ok": False, "error": "request file is required"}
-            print(json.dumps(result))
-            return 2
-        result = mutate_file(sys.argv[2])
+        parser = _argparse.ArgumentParser(
+            prog="PiManager --config-mutate",
+            add_help=False,
+            allow_abbrev=False,
+        )
+        parser.add_argument("request_file")
+        parser.add_argument("--output", default="")
+        rest = sys.argv[2:]
+        # Pre-checks keep the JSON-only error contract (no argparse usage
+        # noise on stderr for the common bad invocations).
+        if not rest or rest[0].startswith("-"):
+            return _cli_json_error("request file is required")
+        try:
+            args, extra = parser.parse_known_args(rest)
+        except SystemExit:
+            return _cli_json_error("request file is required")
+        if extra:
+            return _cli_json_error("request file is required")
+        result = mutate_file(args.request_file)
         encoded = json.dumps(result, ensure_ascii=False)
-        if output_path:
+        if args.output:
             try:
                 # Same hardened write as provider-env responses (pre-created
                 # file only, no symlink following); stdout below remains the
                 # fallback channel the extension already reads.
-                _emit(result, output_path)
+                _emit(result, args.output)
             except (ValueError, OSError):
                 pass
-        if not output_path:
+        if not args.output:
             print(encoded)
         return 0 if result.get("ok") else 2
     # Helper subcommands above are the extension's hot path and must not
-    # rewrite the registry on every call; publish it when the app itself runs.
-    from pi_manager.helper_registry import register_current_helper_best_effort
-
-    register_current_helper_best_effort()
+    # rewrite the registry on every call; publish it only when the GUI runs.
     if len(sys.argv) >= 2 and sys.argv[1] in {"--self-check", "--smoke-test"}:
         from pi_manager.extras import APP_VERSION
         from pi_manager.resources import self_check
@@ -131,7 +152,9 @@ def main():
         print(f"platform={sys.platform}")
         return 0
     from pi_manager.ui import run_app
+    from pi_manager.helper_registry import register_current_helper_best_effort
 
+    register_current_helper_best_effort()
     return run_app()
 
 

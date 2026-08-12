@@ -779,9 +779,10 @@ def test_all_failed_keys_require_manual_restore_and_helper_can_mark(
     }
 
 
+@pytest.mark.integration
 def test_official_pi_sends_real_key_to_provider(isolated_home, monkeypatch, tmp_path):
     if not core.find_pi_command():
-        pytest.skip("official Pi CLI is not installed")
+        pytest.skip("integration: 未安装官方 Pi CLI，跳过真实子进程集成测试（CI 安装后运行 -m integration）")
 
     for name in (
         "HTTP_PROXY",

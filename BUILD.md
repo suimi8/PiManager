@@ -18,19 +18,21 @@ python main.py --self-check
 
 ## 本地打包（当前 OS）
 
+发布前依次执行（与 AGENTS.md 维护约束一致）：
+
 ```bash
+python -m pip install -r requirements.txt
+python -m pytest tests -q
+python main.py --self-check
+# 本地打包（当前 OS）
 python -m pip install -r requirements.txt pyinstaller
 # macOS 额外：
 # bash scripts/make_icns.sh
-python -m PyInstaller --noconfirm --clean PiManager.spec
+# Windows 产物为单文件版（dist/PiManager.exe）；macOS / Linux 用目录版 / .app：
+#   Windows:    python -m PyInstaller --noconfirm --clean PiManagerOneFile.spec
+#   macOS/Linux: python -m PyInstaller --noconfirm --clean PiManager.spec
 python scripts/smoke_test_dist.py
 python scripts/package_release.py --version 1.8.1
-```
-
-Windows 还可打单文件：
-
-```bat
-python -m PyInstaller --noconfirm --clean PiManagerOneFile.spec
 ```
 
 Cursor 扩展统一从项目根目录打包：
@@ -45,15 +47,14 @@ python scripts/package_extension.py
 
 ## 各平台独立运行要求
 
-| 平台 | 推荐产物 | 用户操作 | 保持完整的目录 |
+| 平台 | 推荐产物 | 用户操作 | 保持完整的部分 |
 |------|----------|----------|----------------|
-| Windows x64 | `...-windows-x64-dir.zip` | 解压后运行 `PiManager\PiManager.exe` | `PiManager.exe` + `_internal\` |
+| Windows x64 | `...-windows-x64-onefile.zip` | 解压后直接运行 `PiManager.exe` | 单文件自包含 |
 | macOS arm64 | `...-macos-arm64.zip` | 解压后打开 `PiManager.app` | 整个 `.app` bundle |
 | Linux x64 | `...-linux-x64.tar.gz` | `./PiManager/PiManager` | 整个 `PiManager/` 目录 |
 
 ### Windows
-- 目录版启动更快、更稳；单文件首次解压较慢
-- 不要只拷贝 `PiManager.exe` 而丢掉 `_internal`
+- 产物为单文件版（`dist/PiManager.exe`），自包含，可单独拷贝分发；首次启动需解压到临时目录，稍慢
 - 自检：`PiManager.exe --self-check`
 
 ### macOS
@@ -101,7 +102,8 @@ git push origin v1.8.1
 
 ## 打包实现要点
 
-- `PiManager.spec`：按平台收集 keyring 后端、certifi、assets；禁用 UPX
+- `PiManagerOneFile.spec`：Windows 主产物（单文件版，`dist/PiManager.exe`）
+- `PiManager.spec`：macOS / Linux 产物（目录版 / `.app`）；按平台收集 keyring 后端、certifi、assets；禁用 UPX
 - `scripts/pyi_rth_pimanager.py`：冻结环境下设置 `QT_PLUGIN_PATH`
 - `pi_manager/resources.py`：兼容 onedir / onefile / macOS `.app` 资源路径
 - `main.py --self-check`：验证 PySide6 / cryptography / keyring / assets / 离屏 Qt

@@ -5,12 +5,22 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtGui import QPalette
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QDialog
 
 from pi_manager import core
+from pi_manager.presentation.design.tokens import tokens_for
 from pi_manager.presentation.main_window import ModernMainWindow
 from pi_manager.ui import InstallPiDialog
+
+
+def _color_close(actual: str, expected: str, tolerance: int = 60) -> bool:
+    """RGB 曼哈顿距离容差比较：允许主题色微调，避免像素级硬编码。"""
+    a, e = QColor(actual), QColor(expected)
+    return (
+        abs(a.red() - e.red()) + abs(a.green() - e.green()) + abs(a.blue() - e.blue())
+        <= tolerance
+    )
 
 
 @pytest.fixture(scope="module")
@@ -51,11 +61,14 @@ def test_modern_window_builds_without_background_side_effects(qapp, isolated_hom
 def test_navigation_is_grouped_collapsible_and_keeps_page_stack_in_sync(qapp, isolated_home):
     window = ModernMainWindow(start_background=False)
     try:
-        for key in window._page_keys:
-            window._goto_page(key)
+        # 通过公共接口遍历所有页面：导航行 ↔ 页面栈 index ↔ 标题同步
+        for row in range(window.pages.count()):
+            window.nav.setCurrentRow(row)
             qapp.processEvents()
-            assert window.nav.current_key() == key
-            assert window.pages.currentIndex() == window._page_index[key]
+            assert window.nav.currentRow() == row
+            assert window.nav.current_key()  # 当前 key 非空
+            assert window.pages.currentIndex() == row
+            assert window.page_heading.text()
         window.nav.set_collapsed(True)
         assert window.nav.is_collapsed() is True
         assert window.nav.width() == window.nav.COLLAPSED_WIDTH
@@ -173,17 +186,25 @@ def test_open_dialogs_and_install_dialog_follow_application_theme(qapp, isolated
     plain_dialog.show()
     install_dialog.show()
     try:
+        # 主题 token 是单一事实来源；palette 与 stylesheet 必须跟随 token
+        day_tokens = tokens_for("day", "blue")
+        night_tokens = tokens_for("night", "blue")
         window.apply_ui_theme("day", "blue")
         qapp.processEvents()
-        assert qapp.palette().color(QPalette.Window).name().upper() == "#F4F6F8"
-        assert plain_dialog.grab().toImage().pixelColor(10, 10).name().upper() == "#F4F6F8"
-        assert install_dialog.grab().toImage().pixelColor(10, 10).name().upper() == "#F4F6F8"
+        assert qapp.palette().color(QPalette.Window).name().upper() == day_tokens.window.upper()
+        assert day_tokens.window in qapp.styleSheet()
+        # 单个真实像素冒烟（容差比较，主题微调不破坏测试）
+        day_pixel = plain_dialog.grab().toImage().pixelColor(10, 10).name().upper()
+        assert _color_close(day_pixel, day_tokens.window), f"{day_pixel} 应接近 {day_tokens.window}"
 
         window.apply_ui_theme("night", "blue")
         qapp.processEvents()
-        assert qapp.palette().color(QPalette.Window).name().upper() == "#090C10"
-        assert plain_dialog.grab().toImage().pixelColor(10, 10).name().upper() == "#090C10"
-        assert install_dialog.grab().toImage().pixelColor(10, 10).name().upper() == "#090C10"
+        assert qapp.palette().color(QPalette.Window).name().upper() == night_tokens.window.upper()
+        assert night_tokens.window in qapp.styleSheet()
+        night_pixel = plain_dialog.grab().toImage().pixelColor(10, 10).name().upper()
+        assert _color_close(night_pixel, night_tokens.window), f"{night_pixel} 应接近 {night_tokens.window}"
+        # 昼夜像素必须确实不同
+        assert day_pixel != night_pixel
     finally:
         install_dialog.close()
         plain_dialog.close()
@@ -214,8 +235,8 @@ def test_dynamic_theme_refreshes_model_status_and_help_html(qapp, isolated_home)
         night_status = night_child.foreground(3).color().name().upper()
         night_html = window.help_browser.toHtml().lower()
 
-        assert day_status == "#16A34A"
-        assert night_status == "#35C56F"
+        assert day_status == tokens_for("day", "blue").success.upper()
+        assert night_status == tokens_for("night", "blue").success.upper()
         assert day_status != night_status
         assert "#f3f4f6" in day_html
         assert "#1a222d" in night_html

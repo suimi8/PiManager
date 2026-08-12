@@ -113,6 +113,9 @@ pi.providerEnvCommand = python /path/to/PiManager/main.py --print-provider-env
 
 ```bash
 python -m pip install -r requirements.txt pyinstaller
+# Windows（单文件版）:
+python -m PyInstaller --noconfirm --clean PiManagerOneFile.spec
+# macOS / Linux（目录版 / .app）:
 python -m PyInstaller --noconfirm --clean PiManager.spec
 python scripts/smoke_test_dist.py
 python scripts/package_release.py --version 1.8.1
@@ -155,6 +158,7 @@ PiManager 启动官方 Pi 时从安全存储读取并注入子进程环境。
 ## 安全说明
 
 - 请勿将含真实 API Key 的配置、`secrets.vault`、导出 ZIP 提交到 Git
+- 回退文件库 `secrets.vault`（OS keyring 不可用时使用）的机密性依赖文件权限（仅当前用户可读/写）与随机盐（PBKDF2-HMAC-SHA256 派生 AES 密钥）；Windows 上另有 DPAPI 保护，密钥绑定当前 Windows 用户
 - 导出含密钥的配置包时务必设置强密码
 - 发现安全问题请优先私下联系维护者，避免在公开 Issue 中粘贴密钥
 

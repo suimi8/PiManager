@@ -358,6 +358,41 @@ def _export_safe_models() -> dict[str, Any]:
     return models
 
 
+def _strip_plaintext_api_keys(models: dict[str, Any]) -> list[str]:
+    """把 providers 中仍为明文的 apiKey 引用化（存入安全存储）。
+
+    迁移失败（vault/keyring 不可用）时置空该字段并返回警告，保证未加密
+    导出包永远不携带明文 apiKey。已是环境变量引用或命令引用（`!` 前缀）
+    的值原样保留，不触发任何存储写入。返回值为 export-meta.json 的
+    warnings 列表内容。
+    """
+    warnings: list[str] = []
+    providers = models.get("providers")
+    if not isinstance(providers, dict):
+        return warnings
+    for name, entry in providers.items():
+        if not isinstance(entry, dict):
+            continue
+        raw = entry.get("apiKey")
+        key = str(raw or "").strip() if raw is not None else ""
+        if not key or key.startswith("!"):
+            continue
+        env_name = secretstore.referenced_env_name(key)
+        if env_name:
+            entry["apiKey"] = f"${{{env_name}}}"
+            continue
+        try:
+            entry["apiKey"] = secretstore.store_provider_api_key(str(name), key)
+        except Exception:
+            # 密钥存储不可用：置空并警告，绝不把明文写进导出包。
+            entry["apiKey"] = ""
+            warnings.append(
+                f"provider {name} 的 apiKey 无法安全引用化（密钥存储不可用），"
+                "已从导出中移除"
+            )
+    return warnings
+
+
 def _export_safe_manager() -> dict[str, Any]:
     manager = json.loads(json.dumps(core.load_manager_config()))
     proxy = str(manager.get("proxy_url") or "")
@@ -386,9 +421,11 @@ def export_config_bundle(
     if dest.suffix.lower() != ".zip":
         dest = dest.with_suffix(".zip")
     core.ensure_agent_dir()
+    safe_models = _export_safe_models()
+    export_warnings = _strip_plaintext_api_keys(safe_models)
     entries: dict[str, bytes] = {
         "settings.json": _json_bytes(core.load_settings()),
-        "models.json": _json_bytes(_export_safe_models()),
+        "models.json": _json_bytes(safe_models),
         "pi-manager.json": _json_bytes(_export_safe_manager()),
     }
     agents = core.agents_md_path()
@@ -407,6 +444,10 @@ def export_config_bundle(
         "include_secrets": include_secrets,
         "secrets_encrypted": include_secrets,
     }
+    if export_warnings:
+        # 新增可选字段：明文 apiKey 被移除时的警告列表（导入侧不读取，
+        # 向后兼容）。
+        meta["warnings"] = export_warnings
     entries["export-meta.json"] = _json_bytes(meta)
     if include_secrets:
         values = {}
@@ -427,6 +468,11 @@ def export_config_bundle(
         os.replace(temp, dest)
     finally:
         temp.unlink(missing_ok=True)
+    # 导出包可能含配置快照，POSIX 下收紧为仅当前用户可读写。
+    try:
+        os.chmod(dest, 0o600)
+    except OSError:
+        pass
     return str(dest)
 
 
@@ -505,11 +551,10 @@ def _atomic_replace_bytes(path: Path, content: bytes, *, private: bool = False) 
             previous_mode = None
     temp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     try:
-        if private:
-            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            handle = os.fdopen(fd, "wb")
-        else:
-            handle = temp.open("wb")
+        # 与 storage.py 的语义一致：新文件一律 0600 初值；已有文件保留
+        # previous_mode，绝不因一次重写而放宽权限。
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        handle = os.fdopen(fd, "wb")
         with handle:
             handle.write(content)
             handle.flush()
