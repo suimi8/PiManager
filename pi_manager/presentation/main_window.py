@@ -70,7 +70,6 @@ class ModernMainWindow(LegacyMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("Pi Manager")
-        self.apply_ui_theme()
         central = QWidget()
         central.setObjectName("appRoot")
         self.setCentralWidget(central)
@@ -138,6 +137,9 @@ class ModernMainWindow(LegacyMainWindow):
         self.setStatusBar(self.status)
         self.status.showMessage("就绪 · 配置、模型与会话彼此独立")
         self.nav.set_current_key("simple")
+        # 所有 widget 已创建，现在应用主题（此前各 widget 已用 _theme_pair 取色构建，
+        # 此处统一刷新图标/样式表/状态栏主题文案）。
+        self.apply_ui_theme()
         # Initialize quick-chat from the default pair once. Later dashboard/default
         # refreshes must not overwrite an explicit chat-page selection.
         self.chat_fill_default()
