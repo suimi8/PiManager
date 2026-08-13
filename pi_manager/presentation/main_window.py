@@ -292,35 +292,30 @@ class ModernMainWindow(LegacyMainWindow):
         app = QApplication.instance()
         if app is not None:
             apply_application_theme(app, mode_name, accent_name)
-        if hasattr(self, "nav"):
-            self.nav.update_icons(mode_name, accent_name)
+        self.nav.update_icons(mode_name, accent_name)
         self._refresh_dynamic_button_icons(mode_name, accent_name)
         for section in self.findChildren(CollapsibleSection):
             section.refresh_theme(mode_name, accent_name)
-        if hasattr(self, "model_more_button"):
-            colors = tokens_for(mode_name, accent_name)
-            self.model_more_button.setIcon(icon("ellipsis", colors.text_muted, 17))
-        if hasattr(self, "models_table"):
-            self._apply_model_table_colors()
-            self._refresh_model_status_colors()
-        if hasattr(self, "set_ui_mode"):
-            for index in range(self.set_ui_mode.count()):
-                if self.set_ui_mode.itemData(index) == mode_name:
-                    self.set_ui_mode.setCurrentIndex(index)
-                    break
-            for index in range(self.set_ui_accent.count()):
-                if self.set_ui_accent.itemData(index) == accent_name:
-                    self.set_ui_accent.setCurrentIndex(index)
-                    break
+        colors = tokens_for(mode_name, accent_name)
+        self.model_more_button.setIcon(icon("ellipsis", colors.text_muted, 17))
+        self._apply_model_table_colors()
+        self._refresh_model_status_colors()
+        for index in range(self.set_ui_mode.count()):
+            if self.set_ui_mode.itemData(index) == mode_name:
+                self.set_ui_mode.setCurrentIndex(index)
+                break
+        for index in range(self.set_ui_accent.count()):
+            if self.set_ui_accent.itemData(index) == accent_name:
+                self.set_ui_accent.setCurrentIndex(index)
+                break
         try:
             self.refresh_help_theme(mode_name)
         except Exception:
             pass
-        if hasattr(self, "status") and self.status is not None:
-            cli_theme = core.cli_theme_for_ui_mode(mode_name)
-            self.status.showMessage(
-                f"\u5168\u5c40\u4e3b\u9898\uff1a{MODE_LABELS.get(mode_name, mode_name)} / "
-                f"{ACCENT_LABELS.get(accent_name, accent_name)}\uff1bPi CLI {cli_theme}"
+        cli_theme = core.cli_theme_for_ui_mode(mode_name)
+        self.status.showMessage(
+            f"\u5168\u5c40\u4e3b\u9898\uff1a{MODE_LABELS.get(mode_name, mode_name)} / "
+            f"{ACCENT_LABELS.get(accent_name, accent_name)}\uff1bPi CLI {cli_theme}"
             )
 
     def _refresh_dynamic_button_icons(self, mode: str, accent: str) -> None:
