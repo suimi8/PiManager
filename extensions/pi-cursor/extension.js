@@ -265,7 +265,8 @@ function invokeConfigBroker(operation, args) {
         fs.writeFileSync(requestPath, JSON.stringify(request), { encoding: "utf8", mode: 0o600, flag: "wx" });
         ownedTempFiles.add(requestPath);
       } catch (error) {
-        return Promise.reject(new Error(`无法创建 Config Broker 请求：${error.message}`));
+        reject(new Error(`无法创建 Config Broker 请求：${error.message}`));
+        return;
       }
       const responsePath = path.join(
         os.tmpdir(),
@@ -277,7 +278,8 @@ function invokeConfigBroker(operation, args) {
         ownedTempFiles.add(responsePath);
       } catch (error) {
         ownedTempFiles.delete(requestPath); try { fs.unlinkSync(requestPath); } catch {}
-        return Promise.reject(new Error(`无法创建 Config Broker 响应文件：${error.message}`));
+        reject(new Error(`无法创建 Config Broker 响应文件：${error.message}`));
+        return;
       }
       execFile(
         bin,

@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import platform_util
 from .storage import locked
 
 SERVICE = "PiManager"
@@ -183,32 +184,9 @@ def _dpapi_unprotect(data: bytes) -> bytes:
         kernel32.LocalFree(blob_out.pbData)
 
 
-_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-
-
-def _windows_file_attributes(path: Path) -> int | None:
-    try:
-        import ctypes
-
-        func = ctypes.windll.kernel32.GetFileAttributesW
-        func.argtypes = [ctypes.c_wchar_p]
-        func.restype = ctypes.c_uint32
-    except Exception:
-        return None
-    try:
-        value = func(str(path))
-    except Exception:
-        return None
-    if value == 0xFFFFFFFF:
-        return None
-    return int(value)
-
-
 def _validate_master_key(path: Path) -> bytes:
-    if os.name == "nt":
-        attributes = _windows_file_attributes(path)
-        if attributes is not None and attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
-            raise VaultCorruptError(f"主密钥不能是 reparse point: {path}")
+    if platform_util.is_reparse_point(path):
+        raise VaultCorruptError(f"主密钥不能是 reparse point: {path}")
     info = path.stat(follow_symlinks=False)
     if not stat.S_ISREG(info.st_mode):
         raise VaultCorruptError(f"主密钥不是普通文件: {path}")
@@ -223,17 +201,13 @@ def _validate_master_key(path: Path) -> bytes:
 def _ensure_regular_file(path: Path, *, what: str) -> None:
     """校验路径是普通文件而非 reparse point / 符号链接，防止符号链接劫持。"""
     try:
-        st = path.stat(follow_symlinks=False)
+        path.stat(follow_symlinks=False)
     except FileNotFoundError:
         return  # 不存在无妨
     except OSError as exc:
         raise VaultCorruptError(f"{what} 状态检查失败: {exc}") from exc
-    if not stat.S_ISREG(st.st_mode):
-        raise VaultCorruptError(f"{what} 不是普通文件（疑似符号链接/重解析点）")
-    # Windows: 额外检查 reparse point 属性
-    attrs = _windows_file_attributes(path)
-    if attrs is not None and (attrs & _FILE_ATTRIBUTE_REPARSE_POINT):
-        raise VaultCorruptError(f"{what} 是重解析点，拒绝读取/写入")
+    if platform_util.is_reparse_point(path):
+        raise VaultCorruptError(f"{what} 是重解析点/符号链接，拒绝读取/写入")
 
 
 def _load_or_create_master_key() -> bytes:
@@ -271,7 +245,10 @@ def _load_or_create_master_key() -> bytes:
 
 
 _PEPPER = b"PiManager::vault::v3::pbkdf2"
-_KDF_ITERATIONS = 600_000
+# PBKDF2-HMAC-SHA256 迭代次数：vault 主密钥派生与配置包加密共用同一强度。
+KDF_ITERATIONS = 600_000
+# 向后兼容：本模块内部历史名称。
+_KDF_ITERATIONS = KDF_ITERATIONS
 
 # 旧的无认证加密格式（filekey: XOR 流 / local: 固定硬编码 key）仅在迁移时
 # 读取，保留向后兼容。默认开启解密能力，但每次读取都会记录 WARNING 审计
@@ -286,10 +263,8 @@ def _derive_key_from_salt(salt: bytes) -> bytes:
 
 def _validate_master_key_salt(path: Path) -> bytes:
     """Read and validate the salt file (32 bytes, regular, 0600)."""
-    if os.name == "nt":
-        attributes = _windows_file_attributes(path)
-        if attributes is not None and attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
-            raise VaultCorruptError(f"主密钥盐文件不能是 reparse point: {path}")
+    if platform_util.is_reparse_point(path):
+        raise VaultCorruptError(f"主密钥盐文件不能是 reparse point: {path}")
     info = path.stat(follow_symlinks=False)
     if not stat.S_ISREG(info.st_mode):
         raise VaultCorruptError(f"主密钥盐文件不是普通文件: {path}")

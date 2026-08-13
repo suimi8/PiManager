@@ -275,7 +275,8 @@ def resolve_api_key_for_provider(provider: str, api_key_field: str = "") -> str:
 
 
 _BUNDLE_AAD = b"PiManagerConfigSecrets:v1"
-_BUNDLE_KDF_ITERATIONS = 600_000
+# 复用 secrets 的 KDF 迭代次数，保证 vault 与配置包加密强度一致。
+_BUNDLE_KDF_ITERATIONS = secretstore.KDF_ITERATIONS
 _MAX_ZIP_MEMBERS = 128
 _MAX_ZIP_MEMBER_BYTES = 5 * 1024 * 1024
 _MAX_ZIP_TOTAL_BYTES = 20 * 1024 * 1024
@@ -543,6 +544,17 @@ def _parse_bundle_json(files: dict[str, bytes], name: str) -> dict[str, Any] | N
 
 
 def _atomic_replace_bytes(path: Path, content: bytes, *, private: bool = False) -> None:
+    """以任意 bytes 内容原子替换文件。
+
+    刻意独立于 ``storage._write_unlocked``：storage 面向 JSON——写前会读取
+    校验、拒绝覆盖损坏 JSON、并做 ``.bak.1``/``.bak.2`` 备份轮转。本函数写任意
+    bytes（导入/恢复配置包时可能是 JSON、也可能是 ``AGENTS.md`` 等纯文本），
+    且调用方（``import_config_bundle`` 及回滚路径）已自行管理备份快照，因此不
+    做 JSON 解析与备份轮转，以免引入多余耦合或改变现有行为。原子写机制与
+    ``storage._write_unlocked`` 的原子写部分一致：``O_EXCL`` 创建临时文件、
+    ``0o600`` 初值、保留已有文件的 ``previous_mode``、``flush`` + ``fsync`` +
+    ``os.replace``。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     previous_mode: int | None = None
     if not private:
@@ -589,14 +601,9 @@ def _is_private_or_link_local_host(host: str) -> bool:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return bool(
-        ip.is_private
-        or ip.is_link_local
-        or ip.is_loopback
-        or ip.is_multicast
-        or ip.is_unspecified
-        or ip.is_reserved
-    )
+    # 复用 core 的 IP 分类（private/loopback/link_local/reserved/multicast），
+    # 额外补充 core 未覆盖的 is_unspecified（0.0.0.0 / ::）。
+    return core._is_private_host(host) or ip.is_unspecified
 
 
 def _validate_model_base_url(url: str) -> str:

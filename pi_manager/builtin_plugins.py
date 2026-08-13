@@ -311,15 +311,6 @@ def self_check() -> list[str]:
 # ---- extension 的 npm 依赖安装与状态查询 ----
 
 
-def _npm_command(*args: str) -> list[str]:
-    """复用 core._npm_command 的 npm 定位逻辑。"""
-    names = ("npm.cmd", "npm") if sys.platform == "win32" else ("npm",)
-    import shutil as _shutil
-
-    executable = next((p for n in names if (p := _shutil.which(n))), names[0])
-    return [executable, *args]
-
-
 def npm_install(plugin_name: str) -> dict[str, Any]:
     """在插件目录执行 ``npm install --omit=dev``。
 
@@ -345,7 +336,7 @@ def npm_install(plugin_name: str) -> dict[str, Any]:
             "command": f"cd \"{target}\" && npm install --omit=dev",
             "path": str(target),
         }
-    cmd = _npm_command("install", "--omit=dev")
+    cmd = core._npm_command("install", "--omit=dev")
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
     try:
         proc = subprocess.run(

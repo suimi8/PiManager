@@ -13,29 +13,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal
 
+from . import platform_util
 
 _LOCKS_GUARD = threading.Lock()
 _LOCKS: dict[str, threading.RLock] = {}
 
-_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-
-
-def _windows_file_attributes(path: Path) -> int | None:
-    try:
-        import ctypes
-
-        func = ctypes.windll.kernel32.GetFileAttributesW
-        func.argtypes = [ctypes.c_wchar_p]
-        func.restype = ctypes.c_uint32
-    except Exception:
-        return None
-    try:
-        value = func(str(path))
-    except Exception:
-        return None
-    if value == 0xFFFFFFFF:
-        return None
-    return int(value)
+# 复用 platform_util 的重解析点常量（CreateFile 路径仍需直接位运算）。
+_FILE_ATTRIBUTE_REPARSE_POINT = platform_util.FILE_ATTRIBUTE_REPARSE_POINT
 
 
 class CorruptJsonError(ValueError):
@@ -131,7 +115,7 @@ def _open_lock_file_win32(path: Path):
             kernel32.CloseHandle(handle)
             raise
     except (AttributeError, ImportError):
-        attributes = _windows_file_attributes(path)
+        attributes = platform_util.windows_file_attributes(path)
         if attributes is not None and attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
             raise OSError("lock file must not be a reparse point")
         return path.open("a+b")

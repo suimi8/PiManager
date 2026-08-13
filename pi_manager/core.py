@@ -1255,6 +1255,10 @@ def launch_pi_interactive(
     pi_args = append_language_args(pi_args)
     pi_args = append_vision_args(pi_args)
     base = pi_base_cmd()
+    # Mirror run_pi: when the pi launcher is a cmd.exe batch shim, cmd.exe
+    # re-expands %VAR% in the command line (e.g. %TEMP% in the vision rule)
+    # before the script runs. Escape percents so args stay literal.
+    pi_args = escape_cmd_shim_args(pi_args, base)
     full_cmd_list = base + pi_args
     workdir = workdir or str(user_home())
     if provider:
@@ -1579,7 +1583,12 @@ def apply_language_preference(lang: str | None = None) -> Path:
     lang = lang or get_language()
     ensure_agent_dir()
     path = agents_md_path()
-    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    # Tolerate non-UTF-8 bytes (e.g. a user edited AGENTS.md as GBK/ANSI on
+    # Windows): replacing bad bytes lets the save proceed and rewrites the
+    # file as clean UTF-8, instead of crashing the language preference action.
+    existing = (
+        path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+    )
     existing = _LANG_BLOCK_RE.sub("", existing).rstrip() + "\n"
     body = language_prompt_text(lang).strip()
     if body:
@@ -2271,7 +2280,11 @@ def provider_runtime_credential(provider: str | None) -> dict[str, Any]:
         credential = secretstore.get_active_provider_credential(provider)
         if credential:
             return {
-                "env": {**header_env, env_name: credential["value"]},
+                # API-key entry first so callers that take the first env value
+                # (historically next(iter(env.values()))) resolve the API key,
+                # not a sensitive header secret. header_env may be empty.
+                "env": {env_name: credential["value"], **header_env},
+                "key": credential["value"],
                 "key_id": credential["key_id"],
             }
         if secretstore.list_provider_keys(provider):
@@ -2287,7 +2300,7 @@ def provider_runtime_credential(provider: str | None) -> dict[str, Any]:
             f"Provider「{provider}」引用的环境变量 {env_name} 未设置或安全密钥已丢失。"
             "请在 Provider 编辑页重新填写 API Key 后保存。"
         )
-    return {"env": {**header_env, env_name: value}, "key_id": ""}
+    return {"env": {env_name: value, **header_env}, "key": value, "key_id": ""}
 
 
 def provider_runtime_env(provider: str | None) -> dict[str, str]:
@@ -2880,7 +2893,10 @@ def fetch_remote_models(
             try:
                 credential = provider_runtime_credential(provider)
                 key_id = str(credential.get("key_id") or "")
-                key = next(iter(credential["env"].values()), "")
+                # Read the resolved API key explicitly rather than the first env
+                # value: provider_runtime_credential may also carry sensitive
+                # header secrets, whose value must never be used as the API key.
+                key = str(credential.get("key") or "")
             except ProviderKeyError as exc:
                 return {
                     "ok": False,
@@ -3076,6 +3092,34 @@ def fetch_remote_models(
 
     models: list[dict[str, Any]] = []
 
+    def _to_int(value: Any) -> int | None:
+        """Coerce provider-supplied numeric fields without crashing.
+
+        Providers occasionally return non-numeric strings such as "128K",
+        "unknown", or "unlimited" for context_window / max_tokens. A bare
+        int() would raise ValueError and abort the whole model fetch.
+        """
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        if value is None:
+            return None
+        s = str(value).strip()
+        if not s:
+            return None
+        mult = 1
+        upper = s.upper()
+        for suffix, factor in (("K", 1024), ("M", 1024 * 1024), ("G", 1024 ** 3)):
+            if upper.endswith(suffix):
+                mult = factor
+                s = s[:-1]
+                break
+        try:
+            return int(float(s) * mult)
+        except (TypeError, ValueError):
+            return None
+
     def add_model(mid: str, name: str | None = None, extra: dict | None = None):
         if not mid:
             return
@@ -3089,15 +3133,18 @@ def fetch_remote_models(
             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
         }
         if extra:
-            # common optional fields
-            if "context_window" in extra:
-                item["contextWindow"] = int(extra["context_window"])
-            if "contextWindow" in extra:
-                item["contextWindow"] = int(extra["contextWindow"])
-            if "max_tokens" in extra:
-                item["maxTokens"] = int(extra["max_tokens"])
-            if "maxTokens" in extra:
-                item["maxTokens"] = int(extra["maxTokens"])
+            # common optional fields — providers may return non-numeric
+            # strings (e.g. "128K", "unknown"), so coerce defensively.
+            for src_key, dst_key in (
+                ("context_window", "contextWindow"),
+                ("contextWindow", "contextWindow"),
+                ("max_tokens", "maxTokens"),
+                ("maxTokens", "maxTokens"),
+            ):
+                if src_key in extra:
+                    coerced = _to_int(extra[src_key])
+                    if coerced is not None:
+                        item[dst_key] = coerced
         models.append(item)
 
     # OpenAI style: { data: [ {id} ] }
@@ -3533,7 +3580,10 @@ def test_model_http(
         try:
             credential = provider_runtime_credential(provider)
             key_id = str(credential.get("key_id") or "")
-            key = next(iter(credential["env"].values()), "")
+            # Read the resolved API key explicitly rather than the first env
+            # value: provider_runtime_credential may also carry sensitive
+            # header secrets, whose value must never be used as the API key.
+            key = str(credential.get("key") or "")
         except ProviderKeyError as exc:
             return {
                 "ok": False,

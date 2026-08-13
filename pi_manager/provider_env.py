@@ -6,6 +6,7 @@ import json
 import os
 import stat
 
+from . import platform_util
 from . import secrets as secretstore
 from .core import (
     ProviderKeyError,
@@ -74,25 +75,8 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-
-
-def _windows_file_attributes(path: str) -> int | None:
-    try:
-        import ctypes
-
-        func = ctypes.windll.kernel32.GetFileAttributesW
-        func.argtypes = [ctypes.c_wchar_p]
-        func.restype = ctypes.c_uint32
-    except Exception:
-        return None
-    try:
-        value = func(path)
-    except Exception:
-        return None
-    if value == 0xFFFFFFFF:
-        return None
-    return int(value)
+# 复用 platform_util 的重解析点常量与属性查询。
+_FILE_ATTRIBUTE_REPARSE_POINT = platform_util.FILE_ATTRIBUTE_REPARSE_POINT
 
 
 def _open_output_file_win32(path: str) -> int:
@@ -166,7 +150,7 @@ def _open_output_file_win32(path: str) -> int:
             kernel32.CloseHandle(handle)
             raise
     except (AttributeError, ImportError):
-        attributes = _windows_file_attributes(path)
+        attributes = platform_util.windows_file_attributes(path)
         if attributes is not None and attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
             raise ValueError("helper output file must not be a reparse point")
         return os.open(path, os.O_WRONLY | os.O_TRUNC)

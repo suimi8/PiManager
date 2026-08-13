@@ -71,6 +71,35 @@ class Worker(QThread):
             self.failed.emit(str(e)[:500])
 
 
+class WorkerTrackerMixin:
+    """管理后台 Worker 生命周期：登记、完成时 deleteLater + 移除。
+
+    子类需在 __init__ 中调用 ``_init_workers`` 初始化跟踪列表。
+    ``_adopt_worker`` 默认把 worker 的 parent 设为 self（随窗口清理）；
+    MainWindow 重写为 no-op（窗口关闭即应用退出）。
+    各子类应保留自己的 ``closeEvent``（超时/拒绝逻辑各不相同，不在此统一）。
+    """
+
+    def _init_workers(self) -> None:
+        self._workers: list[Worker] = []
+
+    def _adopt_worker(self, worker: Worker) -> None:
+        worker.setParent(self)
+
+    def _track(self, worker: Worker) -> Worker:
+        self._adopt_worker(worker)
+        self._workers.append(worker)
+        worker.finished.connect(lambda: self._untrack(worker))
+        worker.finished.connect(worker.deleteLater)
+        return worker
+
+    def _untrack(self, worker: Worker) -> None:
+        try:
+            self._workers.remove(worker)
+        except ValueError:
+            pass
+
+
 class BatchTestWorker(QThread):
     """Run concurrent model tests and emit each result as it completes."""
 
@@ -138,14 +167,14 @@ class BatchTestWorker(QThread):
 
 
 
-class ProviderEditorDialog(QDialog):
+class ProviderEditorDialog(WorkerTrackerMixin, QDialog):
     def __init__(self, parent=None, existing: dict[str, Any] | None = None, name: str = ""):
         super().__init__(parent)
         self.setWindowTitle("编辑自定义 Provider" if existing else "添加自定义 Provider")
         self.resize(680, 640)
         self.existing = existing or {}
         self._worker = None
-        self._workers: list[Worker] = []
+        self._init_workers()
         layout = QVBoxLayout(self)
         form = QFormLayout()
 
@@ -282,17 +311,6 @@ class ProviderEditorDialog(QDialog):
             text += f"\n获取 API Key：{key_url}"
         text += "\n填写 API Key 后可直接保存，或点击下方按钮拉取最新模型列表。"
         self.fetch_status.setText(text)
-
-    def _track(self, worker: Worker) -> Worker:
-        worker.setParent(self)
-        self._workers.append(worker)
-        worker.finished.connect(lambda: self._untrack(worker))
-        worker.finished.connect(worker.deleteLater)
-        return worker
-
-    def _untrack(self, worker: Worker) -> None:
-        if worker in self._workers:
-            self._workers.remove(worker)
 
     def closeEvent(self, event):
         running = [w for w in self._workers if w.isRunning()]
@@ -524,7 +542,7 @@ class ProviderKeysDialog(QDialog):
         QMessageBox.information(self, "恢复完成", f"已恢复 {restored} 把 Key")
 
 
-class FetchModelsDialog(QDialog):
+class FetchModelsDialog(WorkerTrackerMixin, QDialog):
     """Standalone: baseUrl + apiKey -> list models -> save provider."""
 
     def __init__(self, parent=None):
@@ -593,18 +611,7 @@ class FetchModelsDialog(QDialog):
         layout.addLayout(row)
         self._models: list[dict[str, Any]] = []
         self._worker = None
-        self._workers: list[Worker] = []
-
-    def _track(self, worker: Worker) -> Worker:
-        worker.setParent(self)
-        self._workers.append(worker)
-        worker.finished.connect(lambda: self._untrack(worker))
-        worker.finished.connect(worker.deleteLater)
-        return worker
-
-    def _untrack(self, worker: Worker) -> None:
-        if worker in self._workers:
-            self._workers.remove(worker)
+        self._init_workers()
 
     def closeEvent(self, event):
         running = [w for w in self._workers if w.isRunning()]
@@ -717,7 +724,7 @@ NAV_PAGES = [
 ]
 
 
-class InstallPiDialog(QDialog):
+class InstallPiDialog(WorkerTrackerMixin, QDialog):
     """Install or upgrade the Node-compatible official Pi npm channel."""
 
     def __init__(self, parent=None, status: dict | None = None):
@@ -725,7 +732,7 @@ class InstallPiDialog(QDialog):
         self.setWindowTitle("\u5b89\u88c5 / \u5347\u7ea7 Pi")
         self.resize(620, 460)
         self._worker = None
-        self._workers: list[Worker] = []
+        self._init_workers()
         self.install_succeeded = False
         self.status_info = dict(status or {})
         node_version = self.status_info.get("node_version") or core.get_node_version()
@@ -775,17 +782,6 @@ class InstallPiDialog(QDialog):
             self.btn_install.setToolTip(
                 str(self.status_info.get("error") or "\u8bf7\u5148\u4fee\u590d Node.js/npm \u73af\u5883\u3002")
             )
-
-    def _track(self, worker: Worker) -> Worker:
-        worker.setParent(self)
-        self._workers.append(worker)
-        worker.finished.connect(lambda: self._untrack(worker))
-        worker.finished.connect(worker.deleteLater)
-        return worker
-
-    def _untrack(self, worker: Worker) -> None:
-        if worker in self._workers:
-            self._workers.remove(worker)
 
     def closeEvent(self, event):
         if self._worker is not None and self._worker.isRunning():
@@ -922,7 +918,7 @@ class SetupWizardDialog(QDialog):
         self.accept()
 
 
-class MainWindow(FeatureMixin, QMainWindow):
+class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
     def __init__(self, *, start_background: bool = True):
         """Create the window.
 
@@ -940,7 +936,8 @@ class MainWindow(FeatureMixin, QMainWindow):
         self.resize(1320, 880)
         self.setMinimumSize(1080, 720)
         self.models: list[core.ModelInfo] = []
-        self.workers: list[Worker] = []
+        self._init_workers()
+        self.workers = self._workers  # 公共别名，兼容现有测试与外部引用
         self.test_results: dict[str, dict[str, Any]] = {}
         self.mgr = core.load_manager_config()
         self.setAcceptDrops(True)
@@ -1142,15 +1139,9 @@ class MainWindow(FeatureMixin, QMainWindow):
                 return provider, model
         return None
 
-    def _track(self, worker: Worker):
-        self.workers.append(worker)
-        worker.finished.connect(lambda: self._untrack(worker))
-        worker.finished.connect(worker.deleteLater)
-        return worker
-
-    def _untrack(self, worker: Worker):
-        if worker in self.workers:
-            self.workers.remove(worker)
+    def _adopt_worker(self, worker: Worker) -> None:
+        # MainWindow 是顶层窗口：不设 parent，关闭即应用退出。
+        pass
 
     def selected_model_row(self) -> core.ModelInfo | None:
         item = self.models_table.currentItem()
@@ -2661,8 +2652,16 @@ def run_app():
                 socket.write(b"wake")
                 socket.flush()
                 socket.waitForBytesWritten(500)
+                socket.close()
+                return 0
             socket.close()
-            return 0
+            # listen() 失败且无法连接到已有实例：上一个实例崩溃后遗留了
+            # 残旧的 Unix-domain socket 文件（Linux/macOS）。删除它后再重试，
+            # 否则用户必须手动删除该 socket 才能再次启动。removeServer 在
+            # Windows 的命名管道上是 no-op，故跨平台安全。
+            QLocalServer.removeServer(SINGLE_INSTANCE_SERVER_NAME)
+            if not server.listen(SINGLE_INSTANCE_SERVER_NAME):
+                return 0
     try:
         app.setStyle("Fusion")
     except Exception:

@@ -255,21 +255,28 @@ def test_lock_file_symlink_is_never_followed(isolated_home, tmp_path):
 
 
 def test_master_key_reparse_point_is_rejected(isolated_home, monkeypatch):
-    if os.name != "nt":
-        pytest.skip("reparse-point checks are Windows-only")
-    monkeypatch.setattr(
-        secrets,
-        "_windows_file_attributes",
-        lambda path: secrets._FILE_ATTRIBUTE_REPARSE_POINT
-        if str(path).endswith(".vault_master_key")
-        else None,
-    )
+    from pi_manager import platform_util
+
+    def _is_reparse(path) -> bool:
+        # Treat the master key / salt file as a reparse point so the
+        # hardening check rejects it, regardless of platform.
+        name = str(path)
+        return name.endswith(".vault_master_key") or name.endswith(
+            ".vault_master_key_salt"
+        )
+
+    monkeypatch.setattr(platform_util, "is_reparse_point", _is_reparse)
     with pytest.raises(secrets.VaultCorruptError):
         secrets._load_or_create_master_key()
 
 
 def test_master_key_check_skips_when_api_unavailable(isolated_home, monkeypatch):
-    monkeypatch.setattr(secrets, "_windows_file_attributes", lambda path: None)
+    from pi_manager import platform_util
+
+    # When the file-attribute probe is unavailable, is_reparse_point already
+    # returns False (no reparse point detected), so master-key creation must
+    # proceed normally and still reject only genuine non-regular files.
+    monkeypatch.setattr(platform_util, "is_reparse_point", lambda path: False)
     key = secrets._load_or_create_master_key()
     assert len(key) == 32
 

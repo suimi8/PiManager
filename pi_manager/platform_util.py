@@ -28,6 +28,49 @@ def is_linux() -> bool:
     return sys.platform.startswith("linux")
 
 
+# Windows FILE_ATTRIBUTE_REPARSE_POINT：文件是重解析点（含符号链接/junction）。
+# 非 Windows 平台该常量无意义，但保留以供 is_reparse_point 早返回。
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def windows_file_attributes(path: str | Path) -> int | None:
+    """返回 Windows 文件属性位；非 Windows 或查询失败返回 None。
+
+    用 GetFileAttributesW 不跟随符号链接地读取属性，供重解析点/符号链接检测。
+    """
+    if not is_windows():
+        return None
+    try:
+        import ctypes
+
+        func = ctypes.windll.kernel32.GetFileAttributesW
+        func.argtypes = [ctypes.c_wchar_p]
+        func.restype = ctypes.c_uint32
+        value = func(str(path))
+    except Exception:
+        return None
+    if value == 0xFFFFFFFF:  # INVALID_FILE_ATTRIBUTES
+        return None
+    return int(value)
+
+
+def is_reparse_point(path: str | Path) -> bool:
+    """判断 path 是否为重解析点/符号链接（跨平台）。
+
+    非返回 False。用 stat(follow_symlinks=False) + Windows 属性位双校验，
+    防止符号链接劫持（写入符号链接会覆盖其指向的目标）。
+    """
+    try:
+        st = os.stat(str(path), follow_symlinks=False)
+    except (FileNotFoundError, OSError):
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        # 非普通文件即视为需警惕（目录/字符设备/链接本身）
+        return True
+    attrs = windows_file_attributes(path)
+    return attrs is not None and bool(attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
 def platform_name() -> str:
     if is_windows():
         return "windows"
@@ -245,7 +288,10 @@ def list_terminal_options() -> list[tuple[str, str]]:
 def _linux_terminal_prefix(mode: str = "auto") -> tuple[str, list[str]] | None:
     ordered: list[tuple[str, list[str]]] = []
     if mode == "gnome":
-        ordered = [("gnome-terminal", ["--"])]
+        # gnome-terminal uses "--"; kgx (GNOME Console, its modern successor)
+        # also uses "--" — it does NOT support "-e", which would swallow the
+        # flag silently and never start the pi session.
+        ordered = [("gnome-terminal", ["--"]), ("kgx", ["--"])]
     elif mode == "konsole":
         ordered = [("konsole", ["-e"])]
     elif mode == "xterm":
@@ -254,7 +300,7 @@ def _linux_terminal_prefix(mode: str = "auto") -> tuple[str, list[str]] | None:
         ordered = [
             ("x-terminal-emulator", ["-e"]),
             ("gnome-terminal", ["--"]),
-            ("kgx", ["-e"]),
+            ("kgx", ["--"]),
             ("konsole", ["-e"]),
             ("xfce4-terminal", ["-e"]),
             ("mate-terminal", ["-e"]),
@@ -339,7 +385,10 @@ def _launch_windows(argv: list[str], workdir: str, mode: str, env: dict[str, str
     if mode == "cmd":
         # CREATE_NEW_CONSOLE provides the requested terminal without another
         # shell parsing pass. This also works when Windows delegates consoles
-        # to Windows Terminal.
+        # to Windows Terminal. We launch argv directly (no `cmd /c` wrapper) so
+        # quoted paths and multiline system prompts are never re-parsed by a
+        # nested shell. The console closes when pi exits; callers that need a
+        # persistent window should use PowerShell mode (which passes -NoExit).
         subprocess.Popen(
             argv,
             cwd=workdir,

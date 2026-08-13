@@ -320,6 +320,7 @@ def mutate(request: dict[str, Any]) -> dict[str, Any]:
 
             with storage.locked(_broker_lock_path()):
                 storage.update_json(core.settings_path(), {}, update_settings)
+                core._invalidate_config_cache(core.settings_path())
                 revision = _record_revision(core.settings_path())
             return {
                 "ok": True,
@@ -340,6 +341,7 @@ def mutate(request: dict[str, Any]) -> dict[str, Any]:
 
             with storage.locked(_broker_lock_path()):
                 storage.update_json(core.manager_config_path(), {}, update_manager)
+                core._invalidate_config_cache(core.manager_config_path())
                 revision = _record_revision(core.manager_config_path())
             return {"ok": True, "request_id": request_id, "revision": revision, "result": {}}
 
