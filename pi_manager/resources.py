@@ -156,4 +156,10 @@ def self_check() -> list[str]:
                 errors.append(f"vault master key permissions too open: {oct(_master_mode)}")
     except Exception as exc:
         errors.append(f"vault security check failed: {exc}")
+    # 内置插件（skills / extensions）资源完整性
+    try:
+        from pi_manager import builtin_plugins
+        errors.extend(builtin_plugins.self_check())
+    except Exception as exc:
+        errors.append(f"builtin plugins check failed: {exc}")
     return errors

@@ -42,7 +42,7 @@ def test_modern_window_builds_without_background_side_effects(qapp, isolated_hom
         assert window._background_enabled is False
         assert window.windowTitle() == "Pi Manager"
         assert window.workers == []
-        assert window.pages.count() == 10
+        assert window.pages.count() == 11
         assert window.nav.current_key() == "simple"
         assert window.page_heading.text() == "简化配置"
         for attribute in (

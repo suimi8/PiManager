@@ -59,6 +59,7 @@ _PAGE_META = {
     "health": ("health", "运行与诊断"),
     "history": ("history", "运行与诊断"),
     "tools": ("tools", "系统"),
+    "plugins": ("plugins", "系统"),
     "settings": ("settings", "系统"),
     "help": ("help", "系统"),
 }
@@ -120,6 +121,7 @@ class ModernMainWindow(LegacyMainWindow):
             "health": self._build_health_tab,
             "history": self._build_history_tab,
             "tools": self._build_tools_tab,
+            "plugins": self._build_plugins_tab,
             "settings": self._build_settings_tab,
             "help": self._build_help_tab,
         }
@@ -164,6 +166,11 @@ class ModernMainWindow(LegacyMainWindow):
 
     def _build_tools_tab(self) -> QWidget:
         return build_tools_page(self)
+
+    def _build_plugins_tab(self) -> QWidget:
+        from .pages.plugins import build_plugins_page
+
+        return build_plugins_page(self)
 
     def _build_settings_tab(self) -> QWidget:
         return build_settings_page(self)

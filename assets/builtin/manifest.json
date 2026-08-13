@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "plugins": [
+    {
+      "name": "pi-manager-vision",
+      "type": "skill",
+      "description": "Pi Manager 自动降级识图管道：把图片路由到智谱 GLM 视觉模型转文字，再交当前 provider 回答。",
+      "source": "skills/pi-manager-vision",
+      "target_dir": "skills/pi-manager-vision",
+      "templated": true,
+      "template_vars": ["vision_command"],
+      "min_version": "1.0.0"
+    },
+    {
+      "name": "pi-manager-mcp-bridge",
+      "type": "extension",
+      "description": "MCP 桥 extension 骨架：把外部 MCP server 的工具注册回 pi。落盘后需在扩展目录执行 npm install。",
+      "source": "extensions/pi-manager-mcp-bridge",
+      "target_dir": "extensions/pi-manager-mcp-bridge",
+      "templated": false,
+      "needs_npm_install": true,
+      "min_version": "1.8.1",
+      "enabled_by_default": false
+    }
+  ]
+}

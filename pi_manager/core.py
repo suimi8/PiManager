@@ -892,12 +892,13 @@ def upsert_custom_provider(
         entry["headers"] = existing["headers"]
     providers[name] = entry
     save_models_config(cfg)
-    # Saving a provider means the user is about to use Pi: make sure the
-    # vision skill is installed so image handling works out of the box.
+    # 保存 provider 后用户即将使用 Pi：确保所有内置插件（含 vision skill）
+    # 已落盘，让图片处理等开箱即用。委托给 builtin_plugins 统一机制。
     try:
-        install_vision_skill()
+        from . import builtin_plugins
+        builtin_plugins.install_all_builtins()
     except Exception as exc:
-        logger.warning("安装 vision skill 失败: %s", exc)
+        logger.warning("安装内置插件失败: %s", exc)
     return cfg
 
 
@@ -2408,7 +2409,8 @@ def set_zhipu_api_key(value: str) -> None:
     else:
         secretstore.delete_secret(ZHIPU_API_KEY_SECRET)
     try:
-        install_vision_skill()
+        from . import builtin_plugins
+        builtin_plugins.install_all_builtins()
     except Exception:
         pass
 
@@ -2771,80 +2773,17 @@ def ensure_zhipu_provider() -> dict[str, Any]:
 
 
 def install_vision_skill() -> dict[str, Any]:
-    """Install (or refresh) the Pi vision skill into ~/.pi/skills/.
+    """安装 / 刷新 Pi vision skill 到 ``~/.pi/agent/skills/pi-manager-vision/``。
 
-    The skill instructs Pi sessions to route every image through the free
-    Zhipu vision models before the text provider answers. The helper command
-    inside SKILL.md is generated from the current executable (frozen build or
-    source tree), so the skill works when this project is shared with others.
-
-    Idempotent: the file is only rewritten when its content changes.
+    现已委托给 ``builtin_plugins`` 统一机制：资源源文件位于
+    ``assets/builtin/skills/pi-manager-vision/SKILL.md.tmpl``，落盘时渲染
+    ``{{vision_command}}`` 占位。保留本函数仅为向后兼容（旧调用点与测试）。
     """
-    skill_dir = Path(os.path.expanduser("~")) / ".pi" / "skills" / "pi-manager-vision"
-    skill_file = skill_dir / "SKILL.md"
-    vision_command = _helper_command_text()
-    content = _VISION_SKILL_TEMPLATE.format(vision_command=vision_command)
     try:
-        skill_dir.mkdir(parents=True, exist_ok=True)
-        if skill_file.exists():
-            existing = skill_file.read_text(encoding="utf-8")
-            if existing == content:
-                return {"ok": True, "installed": True, "updated": False, "path": str(skill_file)}
-        temp = skill_file.with_name(f".{skill_file.name}.{os.getpid()}.tmp")
-        temp.write_text(content, encoding="utf-8")
-        os.replace(temp, skill_file)
-        return {"ok": True, "installed": True, "updated": True, "path": str(skill_file)}
-    except OSError as exc:
+        from . import builtin_plugins
+        return builtin_plugins.install_builtin("pi-manager-vision")
+    except Exception as exc:
         return {"ok": False, "error": str(exc)}
-
-
-_VISION_SKILL_TEMPLATE = """---
-name: pi-manager-vision
-description: 自动降级识图管道。当用户要求查看、识别或分析图片、截图、报错截图、界面截图，或对话中涉及图片（粘贴/拖入/提供图片路径）时使用。无论当前对话 provider 模型是否支持图片，一律先用智谱 GLM-4.6V-Flash / GLM-4.1V-Thinking-Flash 免费视觉模型把图片转为文字描述（含原样文字转录），再把识别结果作为上下文返回给当前对话模型进行回答。Trigger on 图片/截图/识图/看图/视觉/image/screenshot/clipboard 图片/粘贴图片等表述，以及任何包含图片文件路径的请求。
----
-
-# Pi Manager 自动降级识图管道
-
-## 核心规则（必须遵守）
-
-**只要对话中出现图片（用户粘贴、拖入、给出图片文件路径、或要求看最新截图），永远先执行识图转文本，绝不要尝试把图片直接发送给当前对话模型。**
-
-原因：当前对话 provider 模型（如 deepseek-v4-flash）可能不支持图片输入，直接发送图片会报 `image_url` 错误。智谱视觉模型免费、快速、可靠，识图后转成文本即可与任何 provider 模型对话。
-
-## 执行步骤
-
-1. **确定图片文件**：
-   - 用户给了路径 → 直接使用。
-   - 用户粘贴/拖入图片（未给路径）→ 从剪贴板临时目录查找最新的：
-     ```
-     Get-ChildItem $env:TEMP -Filter "pi-clipboard-*" -File | Sort-Object LastWriteTime -Descending | Select-Object -First 3 Name, Length
-     ```
-     取最新的一张（或让用户确认）。
-   - 用户说"看最新截图" → 同样从 Temp 目录取最新。
-
-2. **调用识图命令**（把图片转成文字描述）：
-
-   ```
-   {vision_command} --vision-describe "<图片完整路径>" "<用户的问题，可空>"
-   ```
-
-   多张图片时逐张调用，分别得到每张的描述。
-
-3. **基于识别结果回答**：命令输出即图片的文字描述（含原样转录的文字内容）。完全基于该描述回答用户的问题。如用户有具体问题，把问题与描述结合回答。
-
-4. **识别结果即"图片本身"**：向用户转述时说明"已通过识图模型读取图片内容"。
-
-## 失败处理
-
-- 输出包含 `未配置智谱 API Key` → 告知用户：请在 Pi Manager「设置 → 识图模型」填入智谱 API Key（免费申请 https://bigmodel.cn）。
-- 输出包含 `429` / `Too Many Requests` → 智谱免费额度限流，稍等片刻后自动重试一次；仍失败则告知用户稍后再试。
-- 输出包含 `无法读取图片` → 路径错误，帮助用户确认路径或从 Temp 目录查找最新的剪贴板图片。
-- 输出包含 `HTTP 4xx/5xx` → 把错误原样反馈给用户。
-
-## 例外（仅在确认可用时）
-
-仅当你明确知道当前对话模型**原生支持图片**（例如模型列表中该 provider 的 images 列为 yes，且此前成功直接发图过）时，才可以直接把图片发给模型；否则一律走本技能识图管道。拿不准时，走识图管道是最安全的选择。
-"""
 
 
 # ==== 远程模型获取与 provider 落库 ====
