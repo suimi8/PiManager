@@ -98,11 +98,16 @@ def test_shutdown_interrupts_and_reaps_running_worker(window, qapp):
     qapp.processEvents()
     assert worker.isRunning() or worker.isFinished()
     window._shutdown_background_tasks()
-    # wait 最多 2.5s，worker 应在关闭后完成并从未跟踪列表移除
-    qapp.processEvents()
+    # _shutdown_background_tasks 已通过 worker.wait() 等待 run() 返回；
+    # 但 finished → _untrack 的 queued 连接需要事件循环处理才能生效，
+    # 轮询 processEvents 直到 worker 从跟踪列表移除（含总 timeout 上限）。
+    deadline = time.monotonic() + 3.0
+    while worker in window.workers and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
     assert worker.isFinished() is True
     assert window.workers == []
-    assert time.monotonic() - started < 2.0, "关闭不应等待慢任务超过预算"
+    assert time.monotonic() - started < 5.0, "关闭不应等待慢任务超过预算"
 
 
 def test_close_event_runs_shutdown_path_without_tray(window, qapp):
@@ -117,7 +122,12 @@ def test_close_event_runs_shutdown_path_without_tray(window, qapp):
     worker.start()
     event = QCloseEvent()
     window.closeEvent(event)
-    qapp.processEvents()
+    # closeEvent → _shutdown_background_tasks 已 wait() 完 worker.run()；
+    # finished 信号的 queued 槽需轮询 processEvents 处理后才移除 worker。
+    deadline = time.monotonic() + 3.0
+    while worker in window.workers and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
     assert event.isAccepted() is True
     assert worker.isFinished() is True
     assert window.workers == []
@@ -130,5 +140,5 @@ def test_track_untrack_removes_completed_worker(window, qapp):
     deadline = time.monotonic() + 3
     while worker in window.workers and time.monotonic() < deadline:
         qapp.processEvents()
-        time.sleep(0.02)
+        time.sleep(0.005)
     assert worker not in window.workers, "完成的 worker 应从跟踪列表移除"

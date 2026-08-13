@@ -87,7 +87,7 @@ def _wait_writes(fake: _FakePopen, n: int, timeout: float = 3.0) -> None:
     while len(fake.stdin.writes) < n:
         if time.monotonic() > deadline:
             raise AssertionError(f"等待第 {n} 次 stdin 写入超时，当前 {len(fake.stdin.writes)} 次")
-        time.sleep(0.005)
+        time.sleep(0.002)
 
 
 def _wait_until(predicate, timeout: float = 3.0) -> None:
@@ -95,7 +95,7 @@ def _wait_until(predicate, timeout: float = 3.0) -> None:
     while not predicate():
         if time.monotonic() > deadline:
             raise AssertionError("等待条件超时")
-        time.sleep(0.01)
+        time.sleep(0.002)
 
 
 def _teardown(session, fake: _FakePopen) -> None:

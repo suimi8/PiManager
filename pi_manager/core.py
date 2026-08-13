@@ -2846,6 +2846,45 @@ def install_vision_skill() -> dict[str, Any]:
 # ==== 远程模型获取与 provider 落库 ====
 
 
+def _resolve_provider_runtime_key(
+    provider: str, raw_key: str
+) -> tuple[str, str, str]:
+    """Resolve the API key (and managed-key id) for a provider request.
+
+    Shared by :func:`fetch_remote_models` and :func:`test_model_http` to keep the
+    managed-key detection, credential fetch, and plain-key fallback identical.
+
+    Returns ``(key_id, api_key, error_or_empty)``. ``key_id`` is non-empty only
+    when the key came from the managed credential pool, so callers can wire it
+    into failover. On a :class:`ProviderKeyError` the key is ``""`` and the
+    third element carries the message — the caller decides how to surface it,
+    since the two call sites return differently shaped error dicts.
+    """
+    key_id = ""
+    if provider:
+        from . import secrets as secretstore
+
+        managed_key = raw_key.startswith("__DPAPI__:") or (
+            secretstore.referenced_env_name(raw_key)
+            == secretstore.provider_env_name(provider)
+        )
+        if managed_key:
+            try:
+                credential = provider_runtime_credential(provider)
+                key_id = str(credential.get("key_id") or "")
+                # Read the resolved API key explicitly rather than the first env
+                # value: provider_runtime_credential may also carry sensitive
+                # header secrets, whose value must never be used as the API key.
+                key = str(credential.get("key") or "")
+            except ProviderKeyError as exc:
+                return "", "", str(exc)
+            return key_id, key, ""
+    # No provider, or a plain/literal key: resolve through the shared path.
+    # resolve_api_key_value normalizes the value itself, so the already-stripped
+    # raw_key is safe to pass.
+    return "", resolve_api_key_value(raw_key, provider=provider), ""
+
+
 def fetch_remote_models(
     base_url: str,
     api_key: str = "",
@@ -2881,34 +2920,15 @@ def fetch_remote_models(
         }
 
     raw_key = (api_key or "").strip()
-    key_id = ""
-    managed_key = False
-    if provider:
-        from . import secrets as secretstore
-
-        managed_key = raw_key.startswith("__DPAPI__:") or (
-            secretstore.referenced_env_name(raw_key) == secretstore.provider_env_name(provider)
-        )
-        if managed_key:
-            try:
-                credential = provider_runtime_credential(provider)
-                key_id = str(credential.get("key_id") or "")
-                # Read the resolved API key explicitly rather than the first env
-                # value: provider_runtime_credential may also carry sensitive
-                # header secrets, whose value must never be used as the API key.
-                key = str(credential.get("key") or "")
-            except ProviderKeyError as exc:
-                return {
-                    "ok": False,
-                    "models": [],
-                    "endpoint": "",
-                    "error": str(exc),
-                    "raw_count": 0,
-                }
-        else:
-            key = resolve_api_key_value(api_key, provider=provider)
-    else:
-        key = resolve_api_key_value(api_key, provider=provider)
+    key_id, key, key_error = _resolve_provider_runtime_key(provider, raw_key)
+    if key_error:
+        return {
+            "ok": False,
+            "models": [],
+            "endpoint": "",
+            "error": key_error,
+            "raw_count": 0,
+        }
     api = (api or "openai-completions").lower()
 
     # OpenAI / Anthropic always need a key for /models
@@ -3570,35 +3590,22 @@ def test_model_http(
     base = normalize_openai_base_url(str(entry.get("baseUrl") or ""))
     api = str(entry.get("api") or "openai-completions").lower()
     raw_key = str(entry.get("apiKey") or "").strip()
-    key_id = ""
     from . import secrets as secretstore
 
-    managed_key = raw_key.startswith("__DPAPI__:") or (
-        secretstore.referenced_env_name(raw_key) == secretstore.provider_env_name(provider)
-    )
-    if managed_key:
-        try:
-            credential = provider_runtime_credential(provider)
-            key_id = str(credential.get("key_id") or "")
-            # Read the resolved API key explicitly rather than the first env
-            # value: provider_runtime_credential may also carry sensitive
-            # header secrets, whose value must never be used as the API key.
-            key = str(credential.get("key") or "")
-        except ProviderKeyError as exc:
-            return {
-                "ok": False,
-                "available": False,
-                "mode": "http",
-                "provider": provider,
-                "model": model,
-                "latency_ms": None,
-                "error": str(exc),
-                "preview": "",
-                "endpoint": base,
-                "http_status": 0,
-            }
-    else:
-        key = resolve_api_key_value(raw_key, provider=provider)
+    key_id, key, key_error = _resolve_provider_runtime_key(provider, raw_key)
+    if key_error:
+        return {
+            "ok": False,
+            "available": False,
+            "mode": "http",
+            "provider": provider,
+            "model": model,
+            "latency_ms": None,
+            "error": key_error,
+            "preview": "",
+            "endpoint": base,
+            "http_status": 0,
+        }
     extra_headers = entry.get("headers") if isinstance(entry.get("headers"), dict) else {}
 
     if not base:

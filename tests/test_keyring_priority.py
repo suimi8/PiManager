@@ -197,8 +197,13 @@ def test_keyring_probe_retriable_after_cooldown(monkeypatch):
     result1 = secretstore._get_keyring()
     assert result1 is None
 
-    # Wait for cooldown
-    time.sleep(0.2)
+    # Wait for cooldown to elapse (poll instead of fixed sleep so CI-slow
+    # machines don't race the cooldown boundary).
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() - secretstore._KEYRING_TRIED_AT < secretstore._KEYRING_RETRY_COOLDOWN:
+        if time.monotonic() > deadline:
+            raise AssertionError("等待 keyring cooldown 过期超时")
+        time.sleep(0.005)
 
     # Second probe should retry
     result2 = secretstore._get_keyring()
