@@ -327,6 +327,9 @@ _entry: dict[str, Any] | None = None
 _runtime_disabled = False
 _runtime_disabled_since = 0.0
 _idle_timer: threading.Timer | None = None
+# 专用于 _runtime_disabled / _runtime_disabled_since 的跨线程同步：
+# 这两个变量由 Worker 线程写、主线程读，必须成对一致读取，避免快照错位。
+_runtime_lock = threading.Lock()
 
 
 def _idle_ttl_seconds() -> float:
@@ -375,10 +378,11 @@ def _reap_idle_session() -> None:
 
 def rpc_chat_enabled() -> bool:
     global _runtime_disabled
-    if _runtime_disabled:
-        if time.monotonic() - _runtime_disabled_since < _RUNTIME_RETRY_COOLDOWN:
-            return False
-        _runtime_disabled = False
+    with _runtime_lock:
+        if _runtime_disabled:
+            if time.monotonic() - _runtime_disabled_since < _RUNTIME_RETRY_COOLDOWN:
+                return False
+            _runtime_disabled = False
     try:
         mgr = core.load_manager_config()
     except Exception:
@@ -501,7 +505,8 @@ def rpc_chat_once(
     if not provider or not model:
         return _failed(provider, model, "Provider 和 Model 必须成对指定")
     if _runtime_disabled and time.monotonic() - _runtime_disabled_since >= _RUNTIME_RETRY_COOLDOWN:
-        _runtime_disabled = False
+        with _runtime_lock:
+            _runtime_disabled = False
     attempted: set[str] = set()
     last: dict[str, Any] | None = None
     while True:
@@ -524,12 +529,14 @@ def rpc_chat_once(
                 if _entry is not None and not _entry["session"].is_alive():
                     _entry = None
             if exc.unavailable:
-                _runtime_disabled = True
-                _runtime_disabled_since = time.monotonic()
+                with _runtime_lock:
+                    _runtime_disabled = True
+                    _runtime_disabled_since = time.monotonic()
             result = _failed(provider, model, str(exc))
         except FileNotFoundError as exc:
-            _runtime_disabled = True
-            _runtime_disabled_since = time.monotonic()
+            with _runtime_lock:
+                _runtime_disabled = True
+                _runtime_disabled_since = time.monotonic()
             return _failed(provider, model, str(exc))
         with _manager_lock:
             if _entry is not None:
@@ -538,7 +545,8 @@ def rpc_chat_once(
         result["provider"], result["model"] = provider, model
         if result.get("ok") or not key_id:
             if result.get("ok"):
-                _runtime_disabled = False
+                with _runtime_lock:
+                    _runtime_disabled = False
             return result
         classification = core.classify_provider_key_failure(
             int(result.get("returncode") or -1),

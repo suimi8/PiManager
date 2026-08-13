@@ -7,6 +7,7 @@ import base64
 import json
 import os
 import stat
+import threading
 import time
 import zipfile
 from contextlib import ExitStack
@@ -1370,14 +1371,22 @@ def _save_fail_counts(counts: dict[str, int]) -> None:
     core.save_manager_config(mgr)
 
 
+# 串行化 fail_count 的读-改-写，避免跨线程并发丢失更新。
+# 注意：不能用 storage.locked(manager_config_path())，因为 _fail_counts/
+# _save_fail_counts 内部走 core.load/save_manager_config → storage.load/save_json
+# → storage.locked(path)，跨进程锁 msvcrt/fcntl 不可重入，会触发死锁。
+_fail_counts_lock = threading.Lock()
+
+
 def record_model_success(provider: str, model: str) -> None:
     key = _model_pair_key(provider, model)
     if not key:
         return
-    counts = _fail_counts()
-    if key in counts:
-        counts[key] = 0
-        _save_fail_counts(counts)
+    with _fail_counts_lock:
+        counts = _fail_counts()
+        if key in counts:
+            counts[key] = 0
+            _save_fail_counts(counts)
 
 
 def record_model_failure(provider: str, model: str) -> int:
@@ -1385,10 +1394,11 @@ def record_model_failure(provider: str, model: str) -> int:
     key = _model_pair_key(provider, model)
     if not key:
         return 0
-    counts = _fail_counts()
-    counts[key] = int(counts.get(key) or 0) + 1
-    _save_fail_counts(counts)
-    return counts[key]
+    with _fail_counts_lock:
+        counts = _fail_counts()
+        counts[key] = int(counts.get(key) or 0) + 1
+        _save_fail_counts(counts)
+        return counts[key]
 
 
 def should_failover(provider: str, model: str) -> bool:

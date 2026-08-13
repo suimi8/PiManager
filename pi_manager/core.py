@@ -74,12 +74,15 @@ def save_json(path: Path, data: Any, *, private: bool = False) -> None:
     _invalidate_config_cache(path)
 
 
+_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
+
+
 def mask_secret(value: str | None, keep: int = 4) -> str:
     if not value:
         return ""
     s = str(value)
     if s.startswith(("!", "$")) or (
-        s.isupper() and "_" in s and not s.startswith(("sk", "tp-"))
+        _ENV_NAME_RE.match(s) and not s.startswith(("sk", "tp-"))
     ):
         # env var name or shell command
         return s
@@ -556,8 +559,49 @@ def _openai_compat_headers(
     return result
 
 
+def _restore_latest_config_backup(target_path: Path) -> dict[str, Any] | None:
+    """Return the newest parseable ``<name>.bak.*`` backup for *target_path*.
+
+    Used as a last resort when the live config file is corrupt. Backups are
+    tried newest-first; the first one that parses to a dict wins. Returns
+    ``None`` if no usable backup exists.
+    """
+    name = target_path.name
+    root = target_path.parent
+    try:
+        candidates = [
+            p
+            for p in root.glob(f"{name}.bak.*")
+            if p.is_file()
+        ]
+    except OSError:
+        return None
+    # Newest by mtime first.
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for bak in candidates:
+        try:
+            data = load_json(bak, None)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
 def load_models_config() -> dict[str, Any]:
-    cfg = _load_json_cached(models_path(), {"providers": {}})
+    try:
+        cfg = _load_json_cached(models_path(), {"providers": {}})
+    except storage.CorruptJsonError as exc:
+        # models.json is corrupt/unreadable. Try to restore the most recent
+        # backup before giving up; otherwise fall back to an empty config so
+        # the UI keeps working instead of bubbling the exception up.
+        logger.warning("models.json 损坏无法读取，尝试恢复备份: %s", exc)
+        restored = _restore_latest_config_backup(models_path())
+        if restored is not None:
+            cfg = restored
+        else:
+            logger.warning("无可用备份，使用空配置兜底")
+            cfg = {"providers": {}, "models": []}
     if not isinstance(cfg, dict):
         cfg = {"providers": {}}
     providers = cfg.get("providers")
@@ -1410,9 +1454,9 @@ def list_sessions(limit: int = 50) -> list[dict[str, str]]:
             except OSError:
                 continue
 
-    selected = heapq.nlargest(limit, candidates(True), key=lambda item: item[:2])
+    selected = heapq.nlargest(limit, candidates(True), key=lambda item: item[0])
     if not selected:
-        selected = heapq.nlargest(limit, candidates(False), key=lambda item: item[:2])
+        selected = heapq.nlargest(limit, candidates(False), key=lambda item: item[0])
     rows = []
     for _mtime, _path_key, p, st in selected:
         try:
@@ -1719,7 +1763,7 @@ def get_installed_pi_version() -> str | None:
 
 def parse_semver(v: str) -> tuple[int, ...]:
     parts = re.findall(r"\d+", str(v or ""))
-    values = tuple(int(x) for x in parts[:4]) if parts else (0,)
+    values = tuple(int(x) for x in parts[:3]) if parts else (0,)
     return values + (0,) * (3 - len(values))
 
 
@@ -3107,39 +3151,6 @@ def fetch_remote_models(
         "http_status": status,
     }
 
-
-def upsert_provider_with_fetched_models(
-    name: str,
-    *,
-    base_url: str,
-    api_key: str,
-    api: str = "openai-completions",
-    models: list[dict[str, Any]] | None = None,
-    fetch: bool = True,
-    compat: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Create/update provider; optionally fetch models first."""
-    fetched = None
-    if fetch and models is None:
-        fetched = fetch_remote_models(base_url, api_key, api=api)
-        if not fetched.get("ok"):
-            return {"ok": False, "error": fetched.get("error"), "fetched": fetched}
-        models = fetched["models"]
-    if models is None:
-        models = []
-    upsert_custom_provider(
-        name,
-        base_url=base_url,
-        api=api,
-        api_key=api_key,
-        models=models,
-        compat=compat
-        or {
-            "supportsDeveloperRole": False,
-            "supportsReasoningEffort": True,
-        },
-    )
-    return {"ok": True, "count": len(models), "fetched": fetched, "name": name}
 
 
 

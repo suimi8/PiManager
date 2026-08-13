@@ -58,7 +58,16 @@ def _create_broker_token() -> str:
 
 
 def _restrict_windows_acl(path: Path) -> None:
-    """Restrict file ACL to current user only on Windows."""
+    """Restrict file ACL to the current user only on Windows.
+
+    Builds an explicit DACL granting FILE_ALL_ACCESS to the file's owner
+    (the current user, since we created the file in-process) and applies it
+    together with PROTECTED_DACL_SECURITY_INFORMATION so inherited ACEs are
+    removed. A NULL DACL must NEVER be passed here: Microsoft documents
+    that a NULL DACL grants *every* local user full access, which would
+    invert the intended protection and expose the broker token to all
+    accounts on the machine.
+    """
     try:
         import ctypes
         from ctypes import wintypes
@@ -66,20 +75,118 @@ def _restrict_windows_acl(path: Path) -> None:
         advapi32 = ctypes.windll.advapi32
         kernel32 = ctypes.windll.kernel32
 
-        desired_access = 0x00100000 | 0x00010000  # WRITE_DAC | READ_CONTROL
+        # --- function prototypes (define argtypes for safety/correctness) ---
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        advapi32.GetSecurityInfo.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+            ctypes.POINTER(wintypes.PVOID), ctypes.POINTER(wintypes.PVOID),
+            ctypes.POINTER(wintypes.PVOID), ctypes.POINTER(wintypes.PVOID),
+            ctypes.POINTER(wintypes.PVOID),
+        ]
+        advapi32.GetSecurityInfo.restype = wintypes.DWORD
+
+        advapi32.SetEntriesInAclW.argtypes = [
+            wintypes.ULONG, ctypes.c_void_p, wintypes.PVOID,
+            ctypes.POINTER(wintypes.PVOID),
+        ]
+        advapi32.SetEntriesInAclW.restype = wintypes.DWORD
+
+        advapi32.SetSecurityInfo.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+            wintypes.PVOID, wintypes.PVOID, wintypes.PVOID, wintypes.PVOID,
+        ]
+        advapi32.SetSecurityInfo.restype = wintypes.DWORD
+
+        advapi32.LocalFree.argtypes = [wintypes.HLOCAL]
+        advapi32.LocalFree.restype = wintypes.HLOCAL
+
+        # --- constants ---
+        SE_FILE_OBJECT = 1
+        OWNER_SECURITY_INFORMATION = 0x00000001
+        DACL_SECURITY_INFORMATION = 0x00000004
+        PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+        WRITE_DAC = 0x00040000
+        READ_CONTROL = 0x00020000
+        OPEN_EXISTING = 3
+        FILE_ALL_ACCESS = 0x001F01FF
+        GRANT_ACCESS = 1
+        NO_INHERITANCE = 0
+        TRUSTEE_IS_SID = 0
+        TRUSTEE_IS_USER = 1
+
+        class TRUSTEE_W(ctypes.Structure):
+            _fields_ = [
+                ("pMultipleTrustee", ctypes.c_void_p),
+                ("MultipleTrusteeOperation", wintypes.DWORD),
+                ("TrusteeForm", wintypes.DWORD),
+                ("TrusteeType", wintypes.DWORD),
+                ("ptstrName", wintypes.LPWSTR),
+            ]
+
+        class EXPLICIT_ACCESS_W(ctypes.Structure):
+            _fields_ = [
+                ("grfAccessPermissions", wintypes.DWORD),
+                ("grfAccessMode", wintypes.DWORD),
+                ("grfInheritance", wintypes.DWORD),
+                ("Trustee", TRUSTEE_W),
+            ]
+
+        desired_access = WRITE_DAC | READ_CONTROL
         handle = kernel32.CreateFileW(
-            str(path), desired_access, 0, None, 3, 0x80, None  # OPEN_EXISTING
+            str(path), desired_access, 0, None, OPEN_EXISTING, 0, None
         )
-        if handle == ctypes.c_void_p(-1).value or handle == 0xFFFFFFFF:
+        invalid = ctypes.cast(-1, wintypes.HANDLE).value
+        if not handle or handle == invalid:
             return
+        sd = wintypes.PVOID()
+        owner = wintypes.PVOID()
         try:
-            # Set ACL to NULL → only owner gets access (inheritance disabled)
-            advapi32.SetSecurityInfo(
-                handle, 1,  # SE_FILE_OBJECT
-                0x00000004 | 0x00000002,  # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
-                None, None, None, None,
+            # Fetch the file's owner SID (the current user, who created it).
+            rc = advapi32.GetSecurityInfo(
+                handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                ctypes.byref(owner), None, None, None, ctypes.byref(sd),
             )
+            if rc != 0 or not owner:
+                return
+            ea = EXPLICIT_ACCESS_W()
+            ea.grfAccessPermissions = FILE_ALL_ACCESS
+            ea.grfAccessMode = GRANT_ACCESS
+            ea.grfInheritance = NO_INHERITANCE
+            ea.Trustee.pMultipleTrustee = None
+            ea.Trustee.MultipleTrusteeOperation = 0
+            ea.Trustee.TrusteeForm = TRUSTEE_IS_SID
+            ea.Trustee.TrusteeType = TRUSTEE_IS_USER
+            # TrusteeForm=IS_SID: ptstrName is a PSID, not a string. The
+            # LPWSTR field holds the pointer value as-is.
+            ea.Trustee.ptstrName = ctypes.cast(owner, wintypes.LPWSTR)
+            new_dacl = wintypes.PVOID()
+            rc = advapi32.SetEntriesInAclW(
+                1, ctypes.byref(ea), None, ctypes.byref(new_dacl)
+            )
+            if rc != 0 or not new_dacl:
+                return
+            try:
+                info = (
+                    OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION
+                )
+                advapi32.SetSecurityInfo(
+                    handle, SE_FILE_OBJECT, info,
+                    owner, None, new_dacl, None,
+                )
+            finally:
+                advapi32.LocalFree(new_dacl)
         finally:
+            if sd:
+                advapi32.LocalFree(sd)
             kernel32.CloseHandle(handle)
     except Exception:
         pass

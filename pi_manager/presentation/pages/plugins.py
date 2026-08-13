@@ -89,24 +89,30 @@ def _clear_list(window) -> None:
 
 def _refresh(window) -> None:
     """刷新插件列表状态（UI 线程内同步，数据量小）。"""
-    try:
-        statuses = builtin_plugins.all_statuses()
-    except Exception as exc:
-        window.plugins_global_status.setText(f"读取清单失败：{exc}")
+    if getattr(window, "_refreshing", False):
         return
-    _clear_list(window)
-    window._plugin_cards = {}
-    installed = 0
-    total = len(statuses)
-    for status in statuses:
-        card = _build_plugin_card(window, status)
-        window.plugins_list_container.addWidget(card)
-        window._plugin_cards[status.get("name", "")] = card
-        if status.get("ready"):
-            installed += 1
-    window.plugins_global_status.setText(
-        f"共 {total} 个内置插件，{installed} 个已就绪 · 安装目标：~/.pi/agent/"
-    )
+    window._refreshing = True
+    try:
+        try:
+            statuses = builtin_plugins.all_statuses()
+        except Exception as exc:
+            window.plugins_global_status.setText(f"读取清单失败：{exc}")
+            return
+        _clear_list(window)
+        window._plugin_cards = {}
+        installed = 0
+        total = len(statuses)
+        for status in statuses:
+            card = _build_plugin_card(window, status)
+            window.plugins_list_container.addWidget(card)
+            window._plugin_cards[status.get("name", "")] = card
+            if status.get("ready"):
+                installed += 1
+        window.plugins_global_status.setText(
+            f"共 {total} 个内置插件，{installed} 个已就绪 · 安装目标：~/.pi/agent/"
+        )
+    finally:
+        window._refreshing = False
 
 
 def _build_plugin_card(window, status: dict) -> QWidget:
@@ -184,6 +190,22 @@ def _set_card_result(window, name: str, text: str, *, ok: bool) -> None:
     lbl.style().polish(lbl)
 
 
+def _track_worker(window, worker) -> None:
+    """登记 Worker 并在完成时自动清理，避免 QThread 运行中被 GC 回收。"""
+    window._active_workers = getattr(window, "_active_workers", [])
+    window._active_workers.append(worker)
+    worker.finished.connect(worker.deleteLater)
+    worker.finished.connect(lambda w=worker: _untrack_worker(window, w))
+
+
+def _untrack_worker(window, worker) -> None:
+    workers = getattr(window, "_active_workers", [])
+    try:
+        workers.remove(worker)
+    except ValueError:
+        pass
+
+
 def _install_one(window, name: str, *, force: bool = False) -> None:
     """后台一键安装单个插件。"""
     card = getattr(window, "_plugin_cards", {}).get(name)
@@ -197,8 +219,7 @@ def _install_one(window, name: str, *, force: bool = False) -> None:
         return builtin_plugins.install_one_click(name)
 
     worker = Worker(task)
-    window._active_workers = getattr(window, "_active_workers", [])
-    window._active_workers.append(worker)
+    _track_worker(window, worker)
 
     def on_done(result):
         _refresh(window)
@@ -240,8 +261,7 @@ def _install_all(window) -> None:
         return results
 
     worker = Worker(task)
-    window._active_workers = getattr(window, "_active_workers", [])
-    window._active_workers.append(worker)
+    _track_worker(window, worker)
 
     def on_done(results):
         _refresh(window)

@@ -52,7 +52,11 @@ class LoadResult:
 
 
 def _thread_lock(path: Path) -> threading.RLock:
-    key = str(path.resolve())
+    # 规范化 key：realpath 解析符号链接并返回绝对路径，normcase 在 Windows 上
+    # 统一大小写和分隔符，确保不同写法的同一文件得到同一锁 key，维持互斥语义。
+    # _LOCKS 不做激进清理：实际使用中路径数量有限（固定几个配置文件），
+    # 规范化 key 后重复路径不再产生新条目，泄漏风险已大幅缓解。
+    key = os.path.normcase(os.path.realpath(str(path)))
     with _LOCKS_GUARD:
         return _LOCKS.setdefault(key, threading.RLock())
 

@@ -220,6 +220,22 @@ def _validate_master_key(path: Path) -> bytes:
     return key
 
 
+def _ensure_regular_file(path: Path, *, what: str) -> None:
+    """校验路径是普通文件而非 reparse point / 符号链接，防止符号链接劫持。"""
+    try:
+        st = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return  # 不存在无妨
+    except OSError as exc:
+        raise VaultCorruptError(f"{what} 状态检查失败: {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise VaultCorruptError(f"{what} 不是普通文件（疑似符号链接/重解析点）")
+    # Windows: 额外检查 reparse point 属性
+    attrs = _windows_file_attributes(path)
+    if attrs is not None and (attrs & _FILE_ATTRIBUTE_REPARSE_POINT):
+        raise VaultCorruptError(f"{what} 是重解析点，拒绝读取/写入")
+
+
 def _load_or_create_master_key() -> bytes:
     """Load or atomically create a 32-byte per-user fallback key.
 
@@ -490,8 +506,10 @@ def save_vault(data: dict[str, str]) -> None:
 
 
 def _load_index() -> set[str]:
+    path = _index_path()
+    _ensure_regular_file(path, what="secrets index")
     try:
-        data = json.loads(_index_path().read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
         return {str(item) for item in data if isinstance(item, str)} if isinstance(data, list) else set()
     except (OSError, json.JSONDecodeError):
         return set()
@@ -500,6 +518,7 @@ def _load_index() -> set[str]:
 def _save_index(names: set[str]) -> None:
     _ensure_dir()
     path = _index_path()
+    _ensure_regular_file(path, what="secrets index")
     payload = json.dumps(sorted(names), ensure_ascii=False, indent=2).encode("utf-8")
     temp = path.with_name(
         f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"

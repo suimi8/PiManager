@@ -1,6 +1,7 @@
 """Built-in Pi CLI themes shipped by Pi Manager."""
 from __future__ import annotations
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,17 @@ THEME_LABELS = {
 }
 
 def themes_dir() -> Path:
-    return Path.home() / ".pi" / "agent" / "themes"
+    from . import core
+    return core.pi_agent_dir() / "themes"
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 def ensure_builtin_themes() -> list[str]:
     d = themes_dir()
@@ -28,7 +39,7 @@ def ensure_builtin_themes() -> list[str]:
         path = d / f"{name}.json"
         if path.exists():
             continue
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
         written.append(name)
     return written
 
