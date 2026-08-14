@@ -127,6 +127,15 @@ _HELP_MARKDOWN = r'''# Pi Manager 使用教程与常见问题
 ### 工具/自检
 - 自检清单、配置导入导出、密钥加密、版本检查。
 
+### 内置插件（随包分发，落盘到 ~/.pi/agent/）
+- **识图 skill**（默认）：图片自动转文字再交对话模型回答，详见「快速提问 → 识图」。
+- **提交规范 skill**（默认）：按项目规范（@fix:/@feat:/@refactor: 前缀 + 中文要点）生成 commit message。
+- **文档处理 skill**（默认）：提取 PDF / Word / Excel / PowerPoint 文字与表格（PDF 需 `pip install pdfplumber` 一次）。
+- **敏感凭据防泄漏 extension**（默认）：拦截对 ~/.pi/agent 密钥/配置文件与项目 .env/*.pem 的读取与修改，输出侧抹除 sk-/ghp_ 等密钥模式。
+- **Git 自动检查点 extension**（默认）：每轮自动 `git stash create`，`/git-checkpoints` 查看、`/git-checkpoint-restore N` 回滚。
+- **状态注入 extension**（默认）：每轮把默认模型、收藏模型、健康巡检结果注入 pi 系统提示。
+- **MCP 桥 extension**（默认关闭）：连接 ~/.pi/agent/mcp-servers.json 声明的 MCP server（需 npm install），提供 /mcp-status、/mcp-reload。
+
 ### 设置
 - 默认模型、语言（中文优先）、CLI/界面主题。  
 - 全局代理、批量测试并发、托盘行为、密钥加密。

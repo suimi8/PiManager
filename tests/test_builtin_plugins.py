@@ -31,10 +31,34 @@ def test_list_builtins_returns_manifest_entries(isolated_home):
     names = {p.name for p in plugins}
     assert "pi-manager-vision" in names
     assert "pi-manager-mcp-bridge" in names
+    # v1.8.2 新增内置插件
+    for expected in (
+        "commit-message",
+        "document-processing",
+        "pi-sensitive-guard",
+        "pi-git-checkpoint",
+        "pi-manager-state",
+    ):
+        assert expected in names, f"缺少内置插件 {expected}"
     for p in plugins:
         assert p.type in {"skill", "extension"}
         assert p.source
         assert p.target_dir
+
+
+def test_new_extensions_do_not_need_npm(isolated_home):
+    """3 个新 extension 仅依赖 node 内置模块，落盘即用，无需 npm install。"""
+    for name in ("pi-sensitive-guard", "pi-git-checkpoint", "pi-manager-state"):
+        plugin = next(p for p in bp.list_builtins() if p.name == name)
+        assert plugin.needs_npm_install is False
+        assert plugin.enabled_by_default is True
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "assets"
+            / "builtin"
+            / plugin.source
+        )
+        assert (src / "index.ts").exists(), f"{name} 缺少 index.ts"
 
 
 def test_builtin_plugin_target_path_under_agent_dir(isolated_home):
@@ -137,6 +161,76 @@ def test_install_all_builtins_includes_disabled_when_requested(isolated_home):
     result = bp.install_all_builtins(include_disabled=True)
     names_installed = {r["name"] for r in result["installed"]}
     assert "pi-manager-mcp-bridge" in names_installed
+
+
+def test_install_all_builtins_lands_new_plugins(isolated_home):
+    """默认安装应落盘全部新插件（含脚本与 SKILL.md）。"""
+    result = bp.install_all_builtins()
+    names_installed = {r["name"] for r in result["installed"]}
+    for name in (
+        "commit-message",
+        "document-processing",
+        "pi-sensitive-guard",
+        "pi-git-checkpoint",
+        "pi-manager-state",
+    ):
+        assert name in names_installed
+    agent = core.pi_agent_dir()
+    assert (agent / "skills" / "commit-message" / "SKILL.md").exists()
+    doc_dir = agent / "skills" / "document-processing"
+    for script in (
+        "extract_docx.py",
+        "extract_xlsx.py",
+        "extract_pptx.py",
+        "extract_pdf.py",
+    ):
+        assert (doc_dir / "scripts" / script).exists()
+    for ext in ("pi-sensitive-guard", "pi-git-checkpoint", "pi-manager-state"):
+        assert (agent / "extensions" / ext / "index.ts").exists()
+
+
+def test_sensitive_guard_contains_guard_logic(isolated_home):
+    """敏感防泄漏扩展必须包含拦截与抹除逻辑的关键结构。"""
+    plugin = next(p for p in bp.list_builtins() if p.name == "pi-sensitive-guard")
+    src_root = Path(__file__).resolve().parent.parent / "assets" / "builtin" / plugin.source
+    content = (src_root / "index.ts").read_text(encoding="utf-8")
+    assert 'pi.on("tool_call"' in content
+    assert 'pi.on("tool_result"' in content
+    assert "secrets.vault" in content
+    assert "auth.json" in content
+    assert "REDACTED" in content
+
+
+def test_git_checkpoint_registers_commands(isolated_home):
+    plugin = next(p for p in bp.list_builtins() if p.name == "pi-git-checkpoint")
+    src_root = Path(__file__).resolve().parent.parent / "assets" / "builtin" / plugin.source
+    content = (src_root / "index.ts").read_text(encoding="utf-8")
+    assert "git-checkpoints" in content
+    assert "git-checkpoint-restore" in content
+    assert "stash" in content
+
+
+def test_manager_state_injection_is_readonly(isolated_home):
+    plugin = next(p for p in bp.list_builtins() if p.name == "pi-manager-state")
+    src_root = Path(__file__).resolve().parent.parent / "assets" / "builtin" / plugin.source
+    content = (src_root / "index.ts").read_text(encoding="utf-8")
+    assert "before_agent_start" in content
+    assert "pi-manager-health.json" in content
+    assert "readFileSync" in content
+    # 只读：不得出现写文件 API
+    assert "writeFileSync" not in content
+    assert "appendFileSync" not in content
+
+
+def test_skill_frontmatter_is_valid(isolated_home):
+    """新增 skill 必须有合法 frontmatter（name + description）。"""
+    for name in ("commit-message", "document-processing"):
+        plugin = next(p for p in bp.list_builtins() if p.name == name)
+        src_root = Path(__file__).resolve().parent.parent / "assets" / "builtin" / plugin.source
+        text = (src_root / "SKILL.md").read_text(encoding="utf-8")
+        assert text.startswith("---")
+        assert "name:" in text.split("---")[1]
+        assert "description:" in text.split("---")[1]
 
 
 def test_install_all_builtins_force_rewrites(isolated_home):

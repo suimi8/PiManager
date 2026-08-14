@@ -127,18 +127,38 @@ export default async function mcpBridge(pi: ExtensionAPI) {
   const config = loadServerConfig();
   const serverNames = Object.keys(config.servers);
   if (serverNames.length === 0) {
-    return; // 未配置任何 MCP server 时安静退出
+    // 未配置任何 MCP server：给一次性提示，避免每次启动打扰。
+    pi.registerCommand("mcp-status", {
+      description: "查看 MCP 桥状态与配置提示",
+      handler: async (_args, ctx) => {
+        ctx.ui.notify(
+          "MCP 桥已加载但未配置 server。\n请在 ~/.pi/agent/mcp-servers.json 中声明 servers，然后 /mcp-reload 生效。",
+          "warning",
+        );
+      },
+    });
+    pi.registerCommand("mcp-reload", {
+      description: "重新加载 MCP server 连接（读取 mcp-servers.json）",
+      handler: async (_args, ctx) => {
+        ctx.ui.notify("mcp-servers.json 中尚无 server，请先配置。", "warning");
+      },
+    });
+    return;
   }
 
   const connections: Map<string, { client: Client; tools: ToolDef[] }> =
     new Map();
   const toolIndex: Map<string, { server: string; tool: string }> = new Map();
+  const serverErrors: Map<string, string> = new Map();
 
-  // 启动时连接所有声明的 MCP server 并注册其工具。
-  pi.on("session_start", async () => {
+  async function connectAll() {
+    serverErrors.clear();
     for (const name of serverNames) {
       const conn = await connectServer(name, config.servers[name]);
-      if (!conn) continue;
+      if (!conn) {
+        serverErrors.set(name, `连接失败（命令: ${config.servers[name].command}）`);
+        continue;
+      }
       connections.set(name, conn);
       for (const tool of conn.tools) {
         const fullName = toolName(name, tool.name);
@@ -191,11 +211,60 @@ export default async function mcpBridge(pi: ExtensionAPI) {
         });
       }
     }
+  }
+
+  // 启动时连接所有声明的 MCP server 并注册其工具。
+  pi.on("session_start", async () => {
+    await connectAll();
+  });
+
+  // 状态命令：查看连接与已注册工具
+  pi.registerCommand("mcp-status", {
+    description: "查看 MCP server 连接状态与已注册工具",
+    handler: async (_args, ctx) => {
+      const lines: string[] = [];
+      for (const name of serverNames) {
+        const conn = connections.get(name);
+        if (conn) {
+          const tools = conn.tools.map((t) => t.name).join(", ");
+          lines.push(`✓ ${name}（工具: ${tools || "无"}）`);
+        } else {
+          lines.push(`✗ ${name}（${serverErrors.get(name) ?? "未连接"}）`);
+        }
+      }
+      ctx.ui.notify(
+        lines.length ? `MCP 桥状态:\n${lines.join("\n")}` : "MCP 桥无 server 配置",
+        serverErrors.size ? "warning" : "info",
+      );
+    },
+  });
+
+  // 重载命令：关闭现有连接后重新读取配置并连接
+  pi.registerCommand("mcp-reload", {
+    description: "重新读取 mcp-servers.json 并重连所有 MCP server",
+    handler: async (_args, ctx) => {
+      for (const conn of connections.values()) {
+        try {
+          await conn.client.close();
+        } catch {
+          // 忽略关闭失败
+        }
+      }
+      connections.clear();
+      toolIndex.clear();
+      await connectAll();
+      ctx.ui.notify(
+        serverErrors.size
+          ? `MCP 重载完成：${connections.size}/${serverNames.length} 个 server 已连接`
+          : `MCP 重载完成：${connections.size} 个 server 已连接`,
+        serverErrors.size ? "warning" : "info",
+      );
+    },
   });
 
   // 会话结束 / reload 时关闭所有 MCP server 连接，防止子进程泄漏。
   pi.on("session_shutdown", async () => {
-    for (const [name, conn] of connections) {
+    for (const conn of connections.values()) {
       try {
         await conn.client.close();
       } catch {

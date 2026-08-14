@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "plugins": [
     {
       "name": "pi-manager-vision",
@@ -12,14 +12,59 @@
       "min_version": "1.0.0"
     },
     {
+      "name": "commit-message",
+      "type": "skill",
+      "description": "根据 git diff 生成符合项目规范（@fix:/@feat:/@refactor: 前缀 + 中文标题 + 要点列表）的 commit message，并在用户确认后执行提交。",
+      "source": "skills/commit-message",
+      "target_dir": "skills/commit-message",
+      "templated": false,
+      "min_version": "1.8.2"
+    },
+    {
+      "name": "document-processing",
+      "type": "skill",
+      "description": "提取 PDF / Word(.docx) / Excel(.xlsx) / PowerPoint(.pptx) 文档的文字与表格内容，供模型阅读、总结、对比。",
+      "source": "skills/document-processing",
+      "target_dir": "skills/document-processing",
+      "templated": false,
+      "min_version": "1.8.2"
+    },
+    {
+      "name": "pi-sensitive-guard",
+      "type": "extension",
+      "description": "敏感凭据防泄漏：拦截对 ~/.pi/agent 密钥/配置文件（auth.json、secrets.vault、mcp-servers.json 等）与项目 .env/*.pem 的读取与修改，并在输出侧抹除 sk-/ghp_ 等密钥模式。",
+      "source": "extensions/pi-sensitive-guard",
+      "target_dir": "extensions/pi-sensitive-guard",
+      "templated": false,
+      "min_version": "1.8.2"
+    },
+    {
+      "name": "pi-git-checkpoint",
+      "type": "extension",
+      "description": "每轮 agent 前自动 git stash create 检查点（最多保留 10 个），提供 /git-checkpoints 与 /git-checkpoint-restore 命令，LLM 改坏代码可一键回滚。",
+      "source": "extensions/pi-git-checkpoint",
+      "target_dir": "extensions/pi-git-checkpoint",
+      "templated": false,
+      "min_version": "1.8.2"
+    },
+    {
+      "name": "pi-manager-state",
+      "type": "extension",
+      "description": "Pi Manager 状态注入：每轮把默认模型、收藏模型、最近健康巡检结果注入系统提示，模型报错时可参考可用列表建议切换。",
+      "source": "extensions/pi-manager-state",
+      "target_dir": "extensions/pi-manager-state",
+      "templated": false,
+      "min_version": "1.8.2"
+    },
+    {
       "name": "pi-manager-mcp-bridge",
       "type": "extension",
-      "description": "MCP 桥 extension 骨架：把外部 MCP server 的工具注册回 pi。落盘后需在扩展目录执行 npm install。",
+      "description": "MCP 桥：把外部 MCP server 的工具注册回 pi（/mcp-status、/mcp-reload）。落盘后需在扩展目录执行 npm install。",
       "source": "extensions/pi-manager-mcp-bridge",
       "target_dir": "extensions/pi-manager-mcp-bridge",
       "templated": false,
       "needs_npm_install": true,
-      "min_version": "1.8.1",
+      "min_version": "1.8.2",
       "enabled_by_default": false
     }
   ]
