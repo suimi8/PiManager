@@ -106,6 +106,9 @@ def test_windows_version_resource_parses(tmp_path) -> None:
     assert "VSVersionInfo(" in text and "FixedFileInfo(" in text
     assert f"FileVersion', '{version}'" in text
     pytest.importorskip("PyInstaller")
+    # PyInstaller.utils.win32 requires pefile, which is only installed on
+    # Windows; skip elsewhere so cross-platform CI stays green.
+    pytest.importorskip("pefile")
     from PyInstaller.utils.win32 import versioninfo
 
     info = versioninfo.load_version_info_from_text_file(str(path))

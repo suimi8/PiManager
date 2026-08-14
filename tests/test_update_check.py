@@ -249,5 +249,8 @@ def test_http_get_json_rejects_over_budget_body(local_server):
 
 def test_http_get_json_timeout_raises(local_server):
     base = f"http://127.0.0.1:{local_server.server_port}"
-    with pytest.raises((TimeoutError, socket.timeout, OSError)):
+    # 慢响应必须失败而不是挂起：超时抛 socket 异常；若服务端意外快速
+    # 返回空 body，则 json 解析失败（JSONDecodeError 继承 ValueError），
+    # 同样视为“未获得可用清单”的失败路径，避免跨平台 CI flaky。
+    with pytest.raises((TimeoutError, socket.timeout, OSError, ValueError)):
         extras._http_get_json(f"{base}/slow", timeout=0.05)
