@@ -798,6 +798,10 @@ class FeatureMixin:
 
     def _on_mgr_update(self, res: dict, silent: bool = False):
         self._last_manager_update = dict(res or {})
+        try:
+            self._refresh_update_indicators()
+        except Exception as e:
+            logger.warning("refresh update indicators failed: %s", e)
         msg = res.get("message") or ""
         if hasattr(self, "update_status"):
             self.update_status.setText(msg)
@@ -815,6 +819,12 @@ class FeatureMixin:
             if not silent:
                 QMessageBox.information(self, "更新检查", msg)
             return
+
+        remote = str(res.get("remote") or "")
+        prompted = remote in self._prompted_manager_versions or core.is_update_dismissed("mgr", remote)
+        if prompted and silent:
+            return
+        self._prompted_manager_versions.add(remote)
 
         notes = str(res.get("notes") or "").strip()
         notes_short = (notes[:500] + "…") if len(notes) > 500 else notes

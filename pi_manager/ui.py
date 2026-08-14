@@ -940,10 +940,14 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
         self.workers = self._workers  # 公共别名，兼容现有测试与外部引用
         self.test_results: dict[str, dict[str, Any]] = {}
         self.mgr = core.load_manager_config()
+        self._pi_update_status = core.load_pi_update_status()
+        self._last_manager_update: dict[str, Any] = {}
+        self._prompted_manager_versions: set[str] = set()
         self.setAcceptDrops(True)
         self.init_feature_state()
         self._build_ui()
         self._background_enabled = bool(start_background)
+        self._refresh_update_indicators()
         if self._background_enabled:
             self.refresh_all()
             self.setup_system_tray()
@@ -2444,7 +2448,7 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
         # update check：官方 Pi CLI + Pi Manager 自身
         cfg = core.load_manager_config()
         if cfg.get("auto_check_update", True):
-            w = self._track(Worker(core.needs_pi_install_or_update))
+            w = self._track(Worker(core.check_pi_status))
             w.done.connect(self._on_update_status)
             w.failed.connect(lambda e: self.status.showMessage(f"检查 Pi 更新失败: {e}"))
             w.start()
@@ -2455,11 +2459,18 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
                 pass
 
     def _on_update_status(self, st: dict):
+        self._pi_update_status = dict(st or {})
         self.status.showMessage(st.get("message") or "")
+        try:
+            self._refresh_update_indicators()
+        except Exception as e:
+            logger.warning("refresh update indicators failed: %s", e)
         if st.get("blocked") or st.get("check_failed"):
             return
         needs_action = st.get("missing") or st.get("outdated") or st.get("repair_required")
         if needs_action and st.get("installable"):
+            if core.is_update_dismissed("pi", str(st.get("latest") or "")):
+                return
             ret = QMessageBox.question(
                 self,
                 "Pi \u5b89\u88c5 / \u66f4\u65b0",
@@ -2491,7 +2502,7 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
 
     def check_pi_update(self):
         self.status.showMessage("正在检查 Pi 版本…")
-        w = self._track(Worker(core.needs_pi_install_or_update))
+        w = self._track(Worker(core.check_pi_status))
         w.done.connect(self._on_manual_update_status)
         w.failed.connect(lambda e: QMessageBox.warning(self, "检查失败", e))
         w.start()

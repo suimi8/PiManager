@@ -3,12 +3,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QToolButton,
     QVBoxLayout,
@@ -46,6 +47,7 @@ class NavigationRail(QFrame):
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self._pages = list(pages)
         self._buttons: dict[str, QToolButton] = {}
+        self._badges: dict[str, QLabel] = {}
         self._group_labels: list[QLabel] = []
         self._current_key = ""
         self._collapsed = False
@@ -88,6 +90,21 @@ class NavigationRail(QFrame):
         brand_row.addWidget(self.collapse_button)
         root.addWidget(brand)
 
+        # Navigation items live in a scroll area so the rail footer always stays
+        # visible: when the window is short, menu items scroll instead of the
+        # footer (launch button + tool row) being compressed or clipped.
+        self.nav_scroll = QScrollArea()
+        self.nav_scroll.setObjectName("navScroll")
+        self.nav_scroll.setWidgetResizable(True)
+        self.nav_scroll.setFrameShape(QFrame.NoFrame)
+        self.nav_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.nav_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        nav_host = QWidget()
+        nav_host.setObjectName("navHost")
+        nav_layout = QVBoxLayout(nav_host)
+        nav_layout.setContentsMargins(0, 0, 4, 0)
+        nav_layout.setSpacing(8)
+
         current_group = None
         for page in self._pages:
             if page.group != current_group:
@@ -95,7 +112,7 @@ class NavigationRail(QFrame):
                 label = QLabel(current_group.upper())
                 label.setObjectName("navSection")
                 self._group_labels.append(label)
-                root.addWidget(label)
+                nav_layout.addWidget(label)
             button = QToolButton()
             button.setObjectName("navButton")
             button.setCheckable(True)
@@ -108,10 +125,23 @@ class NavigationRail(QFrame):
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             button.clicked.connect(lambda checked=False, key=page.key: self.set_current_key(key))
             self._buttons[page.key] = button
+            # Badge floats on the button's top-right corner; it must never take
+            # layout space, otherwise nav text would truncate and shifting the
+            # rail would look broken.
+            badge = QLabel("")
+            badge.setObjectName("navBadge")
+            badge.setFixedSize(8, 8)
+            badge.setVisible(False)
+            badge.setParent(button)
+            button.setProperty("navBadge", badge)
+            button.installEventFilter(self)
+            self._badges[page.key] = badge
             # Horizontal: Expanding policy fills the rail width uniformly;
             # vertical centering keeps every tab aligned to the same midline.
-            root.addWidget(button, 0, Qt.AlignVCenter)
-        root.addStretch(1)
+            nav_layout.addWidget(button, 0, Qt.AlignVCenter)
+        nav_layout.addStretch(1)
+        self.nav_scroll.setWidget(nav_host)
+        root.addWidget(self.nav_scroll, 1)
 
         self.footer = QFrame()
         self.footer.setObjectName("sidebarFooter")
@@ -266,6 +296,21 @@ class NavigationRail(QFrame):
             layout.addLayout(utility)
         layout.activate()
         self.footer.updateGeometry()
+        # Footer items are built while the rail may still be hidden and before
+        # the application stylesheet is applied; Qt layouts treat invisible
+        # widgets as taking no space and unpolished buttons report tiny size
+        # hints, so the footer height computed from sizeHint() would be too
+        # small and the utility button row would overflow the footer boundary
+        # and overlap the launch button. Fix the height from stable constants.
+        #   launch: 38 min-height + 2 border = 40
+        #   tool button: 32 min-height + 14 padding + 2 border = 48
+        if self._collapsed:
+            hint = 9 + 40 + 6 + 48 * 3 + 6 * 2 + 9 + 2
+        else:
+            hint = 9 + 40 + 7 + 48 + 9 + 2
+        self.footer.setFixedHeight(hint)
+        self.footer.setMinimumHeight(hint)
+        self.footer.updateGeometry()
 
     def is_collapsed(self) -> bool:
         return self._collapsed
@@ -275,3 +320,32 @@ class NavigationRail(QFrame):
         self.launch_button.setToolTip(
             f"启动完整 Pi" + (f"\n{text}" if text else "")
         )
+
+    def set_badge(self, key: str, text: str | None = None) -> None:
+        """Show a small attention dot on a navigation item."""
+        label = self._badges.get(key)
+        if label is None:
+            return
+        if text is not None:
+            label.setText(str(text or ""))
+        label.setVisible(True)
+        self._position_badge(label)
+
+    def clear_badge(self, key: str) -> None:
+        label = self._badges.get(key)
+        if label is not None:
+            label.setVisible(False)
+
+    @staticmethod
+    def _position_badge(label: QLabel) -> None:
+        parent = label.parentWidget()
+        if parent is not None:
+            label.move(parent.width() - label.width() - 4, 3)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        """Keep the floating badge glued to its button's top-right corner."""
+        if event.type() == QEvent.Resize:
+            label = obj.property("navBadge")
+            if isinstance(label, QLabel):
+                self._position_badge(label)
+        return super().eventFilter(obj, event)

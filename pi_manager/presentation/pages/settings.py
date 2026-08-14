@@ -190,6 +190,7 @@ def build_settings_page(window) -> QWidget:
     maintenance.setSpacing(8)
     maintenance.addWidget(window._btn("检查 Pi 更新", window.check_pi_update, secondary=True))
     maintenance.addWidget(window._btn("安装 / 升级 Pi", window.open_install_dialog, secondary=True))
+    maintenance.addWidget(window._btn("检查 Manager 更新", window.check_manager_update, secondary=True))
     maintenance.addWidget(window._btn("打开配置向导", window.open_setup_wizard, ghost=True))
     maintenance.addStretch(1)
     system.body_layout.addLayout(maintenance)

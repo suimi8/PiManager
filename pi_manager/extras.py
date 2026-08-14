@@ -20,7 +20,7 @@ from . import core
 from . import secrets as secretstore
 from . import storage
 
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.8.2"
 APP_NAME = "Pi Manager"
 # Optional remote version manifest (JSON: {"version":"x.y.z","notes":"...","url":"..."})
 # 未配置时自动回退 GitHub Releases API
@@ -1050,6 +1050,18 @@ def check_manager_update() -> dict[str, Any]:
     except Exception as e:
         result["ok"] = False
         result["message"] = f"检查失败：{e}"
+    cfg = core.load_manager_config()
+    cfg["manager_update_status"] = {
+        "state": "ok" if result.get("ok") else "failed",
+        "local": result.get("local"),
+        "remote": result.get("remote"),
+        "has_update": bool(result.get("has_update")),
+        "notes": str(result.get("notes") or "")[:2000],
+        "url": str(result.get("url") or ""),
+        "message": str(result.get("message") or ""),
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    core.save_manager_config(cfg)
     return result
 
 

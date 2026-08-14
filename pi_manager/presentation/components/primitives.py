@@ -127,15 +127,15 @@ class MetricCard(QFrame):
         super().__init__(parent)
         self.setObjectName("metricCard")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(4)
+        self.content = QVBoxLayout(self)
+        self.content.setContentsMargins(14, 12, 14, 12)
+        self.content.setSpacing(4)
         self.value_label = QLabel(value)
         self.value_label.setObjectName("metricValue")
         self.label_label = QLabel(label)
         self.label_label.setObjectName("metricLabel")
-        layout.addWidget(self.value_label)
-        layout.addWidget(self.label_label)
+        self.content.addWidget(self.value_label)
+        self.content.addWidget(self.label_label)
 
 
 class PageHeader(QFrame):

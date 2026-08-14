@@ -604,6 +604,9 @@ def load_manager_config() -> dict[str, Any]:
             "health_interval_min": 0,
             "update_manifest_url": "",
             "last_manager_update_check": "",
+            "pi_update_status": {},
+            "manager_update_status": {},
+            "dismissed_updates": [],
             # 快速提问：模型连续失败后自动切换下一个收藏模型
             "failover_enabled": True,
             "failover_fail_threshold": 3,
@@ -625,6 +628,9 @@ def load_manager_config() -> dict[str, Any]:
         "health_interval_min": 0,
         "update_manifest_url": "",
         "last_manager_update_check": "",
+        "pi_update_status": {},
+        "manager_update_status": {},
+        "dismissed_updates": [],
         "drop_auto_launch": True,
         "language": "zh-CN",
         "ui_mode": "night",
@@ -1536,6 +1542,68 @@ def needs_pi_install_or_update() -> dict[str, Any]:
         f"Node.js {node_version}\uff0cnpm {npm_version}\uff09"
     )
     return result
+
+
+def pi_update_state(status: dict[str, Any]) -> str:
+    """Classify a needs_pi_install_or_update() result into a UI state."""
+    if status.get("check_failed"):
+        return "check_failed"
+    if status.get("blocked"):
+        return "blocked"
+    if status.get("missing"):
+        return "missing"
+    if status.get("runtime_broken") or status.get("repair_required"):
+        return "repair_required"
+    if status.get("outdated"):
+        return "outdated"
+    if status.get("ok"):
+        return "ok"
+    return "unknown"
+
+
+def check_pi_status() -> dict[str, Any]:
+    """Run the Pi update check and persist a compact snapshot for the UI."""
+    status = needs_pi_install_or_update()
+    from datetime import datetime
+
+    snapshot = {
+        "state": pi_update_state(status),
+        "installed": status.get("installed"),
+        "latest": status.get("latest"),
+        "channel": status.get("channel"),
+        "message": str(status.get("message") or ""),
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    cfg = load_manager_config()
+    cfg["pi_update_status"] = snapshot
+    cfg["last_update_check"] = snapshot["checked_at"]
+    save_manager_config(cfg)
+    return status
+
+
+def load_pi_update_status() -> dict[str, Any]:
+    return dict(load_manager_config().get("pi_update_status") or {})
+
+
+def is_update_dismissed(kind: str, version: str) -> bool:
+    """True when the user dismissed this update before (same version)."""
+    if not version:
+        return False
+    key = f"{kind}@{str(version).strip()}"
+    return key in {str(x) for x in (load_manager_config().get("dismissed_updates") or [])}
+
+
+def dismiss_update(kind: str, version: str) -> None:
+    """Remember the user dismissed this kind@version so it stops nagging."""
+    if not version:
+        return
+    cfg = load_manager_config()
+    key = f"{kind}@{str(version).strip()}"
+    entries = [str(x) for x in (cfg.get("dismissed_updates") or [])]
+    if key not in entries:
+        entries.append(key)
+        cfg["dismissed_updates"] = entries
+        save_manager_config(cfg)
 
 
 def install_or_update_pi(timeout: float = 300) -> tuple[int, str, str]:

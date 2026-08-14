@@ -77,7 +77,7 @@ QToolButton#navButton {{
     border: none;
     border-radius: 8px;
     padding: 8px 10px;
-    text-align: center;
+    text-align: left;
     font-size: 13px;
     font-weight: 500;
 }}
@@ -90,17 +90,22 @@ QToolButton#navButton:checked {{
     color: {c.accent_text};
     font-weight: 650;
 }}
-QToolButton#navToggle, QToolButton#iconButton {{
+QToolButton#navToggle, QToolButton#iconButton, QToolButton#updateIndicator {{
     background: transparent;
     color: {c.text_secondary};
     border: 1px solid transparent;
     border-radius: 8px;
     padding: 7px;
 }}
-QToolButton#navToggle:hover, QToolButton#iconButton:hover {{
+QToolButton#navToggle:hover, QToolButton#iconButton:hover, QToolButton#updateIndicator:hover {{
     background: {c.surface_hover};
     border-color: {c.border};
     color: {c.text};
+}}
+QLabel#navBadge {{
+    background: {c.warning};
+    border: 1px solid {c.sidebar};
+    border-radius: 4px;
 }}
 QFrame#sidebarFooter {{
     background: {c.surface};
@@ -157,6 +162,19 @@ QFrame#metricCard {{
     border: 1px solid {c.border};
     border-radius: 10px;
 }}
+QFrame#updateBanner {{
+    background: {c.warning_soft};
+    border: 1px solid {c.warning};
+    border-radius: 10px;
+}}
+QLabel#bannerText {{
+    color: {c.text};
+    font-size: 13px;
+    font-weight: 600;
+}}
+QLabel#bannerText[state="danger"] {{
+    color: {c.danger};
+}}
 QLabel#sectionTitle {{
     color: {c.text};
     font-size: 14px;
@@ -185,6 +203,11 @@ QLabel#metricValue {{
 QLabel#metricLabel {{
     color: {c.text_muted};
     font-size: 11px;
+}}
+QLabel#versionUpdateLabel {{
+    color: {c.warning};
+    font-size: 11px;
+    font-weight: 650;
 }}
 QFrame#divider {{
     background: {c.border};
