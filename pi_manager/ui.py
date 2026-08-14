@@ -749,9 +749,9 @@ class InstallPiDialog(WorkerTrackerMixin, QDialog):
         layout = QVBoxLayout(self)
         tip = QLabel(
             f"\u5b89\u88c5\u547d\u4ee4\uff1a\n{command_text}\n\n"
-            f"Node.js\uff1a{node_version or '\u672a\u68c0\u6d4b\u5230'}    "
-            f"npm\uff1a{npm_version or '\u672a\u68c0\u6d4b\u5230'}\n"
-            f"\u517c\u5bb9\u901a\u9053\uff1a{channel or '\u4e0d\u53ef\u7528'}    "
+            f"Node.js\uff1a{node_version or '未检测到'}    "
+            f"npm\uff1a{npm_version or '未检测到'}\n"
+            f"\u517c\u5bb9\u901a\u9053\uff1a{channel or '不可用'}    "
             f"\u76ee\u6807\u7248\u672c\uff1a{target}"
         )
         tip.setObjectName("subtitle")
