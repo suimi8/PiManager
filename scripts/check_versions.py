@@ -26,7 +26,16 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
+
+# CI Windows runner 的 stdout 默认 cp1252，中文输出会触发 UnicodeEncodeError；
+# 统一强制 UTF-8（errors=replace 兜底），保证跨平台一致。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    pass
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

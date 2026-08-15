@@ -34,6 +34,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+# CI Windows runner 的 stdout 默认 cp1252，中文输出会触发 UnicodeEncodeError；
+# 统一强制 UTF-8（errors=replace 兜底），保证跨平台一致。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    pass
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # 文件名黑名单（大小写不敏感；匹配 basename）
@@ -73,7 +81,7 @@ _INNOCENT_TOKEN_PARTS = (
     "sk-test", "sk-first", "sk-second", "sk-bad", "sk-demo", "sk-sanitize",
     "sk-process", "sk-zhipu", "dummy", "example", "placeholder", "redacted",
     "custom-secret", "custom-header-secret", "test-secret", "fake", "sample",
-    "secret-value",
+    "secret-value", "sk-1234567890",
 )
 
 # 跳过内容检查的文件（构建产物、文档截图占位等）
