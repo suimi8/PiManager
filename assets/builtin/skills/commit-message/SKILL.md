@@ -1,6 +1,6 @@
 ---
 name: commit-message
-description: 根据 git diff 生成符合项目提交规范（@fix:/@feat:/@refactor:/@docs:/@chore: 前缀 + 中文标题 + 要点列表）的 commit message，并在用户确认后执行提交。当用户要求提交代码、写 commit、生成提交信息、整理提交说明时使用。
+description: "根据 git diff 生成符合项目提交规范（@fix:/@feat:/@refactor:/@docs:/@chore: 前缀 + 中文标题 + 要点列表）的 commit message，并在用户确认后执行提交。当用户要求提交代码、写 commit、生成提交信息、整理提交说明时使用。"
 ---
 
 # 规范提交信息

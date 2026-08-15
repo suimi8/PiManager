@@ -6,7 +6,6 @@ Pi Manager 里选择 max 实际却按 high 调用。这里保证所有保存入�
 """
 from __future__ import annotations
 
-import pytest
 
 
 def test_ensure_thinking_level_map_fills_reasoning_model(isolated_home):

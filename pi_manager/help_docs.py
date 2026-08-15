@@ -134,7 +134,7 @@ _HELP_MARKDOWN = r'''# Pi Manager 使用教程与常见问题
 - **敏感凭据防泄漏 extension**（默认）：拦截对 ~/.pi/agent 密钥/配置文件与项目 .env/*.pem 的读取与修改，输出侧抹除 sk-/ghp_ 等密钥模式。
 - **Git 自动检查点 extension**（默认）：每轮自动 `git stash create`，`/git-checkpoints` 查看、`/git-checkpoint-restore N` 回滚。
 - **状态注入 extension**（默认）：每轮把默认模型、收藏模型、健康巡检结果注入 pi 系统提示。
-- **MCP 桥 extension**（默认关闭）：连接 ~/.pi/agent/mcp-servers.json 声明的 MCP server（需 npm install），提供 /mcp-status、/mcp-reload。
+- **MCP 桥 extension**（默认关闭）：连接 ~/.pi/agent/mcp-servers.json 声明的 MCP server（需 npm install），提供 /mcp-status、/mcp-reload。MCP server 子进程只继承白名单基础环境（PATH/HOME 等）、不自动继承 provider API Key；如需给某个 server 传密钥，必须在 mcp-servers.json 该 server 的 env 中显式写出。
 
 ### 设置
 - 默认模型、语言（中文优先）、CLI/界面主题。  

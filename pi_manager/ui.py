@@ -2348,7 +2348,7 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
         try:
             code, out, err = result
         except (TypeError, ValueError):
-            self.chat_output.appendPlainText(f"[错误] 返回格式无法解析")
+            self.chat_output.appendPlainText("[错误] 返回格式无法解析")
             self.status.showMessage("快速提问失败")
             return
         if out.strip():

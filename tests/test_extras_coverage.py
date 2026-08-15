@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import urllib.request
 
-import pytest
 
 from pi_manager import core, extras
 

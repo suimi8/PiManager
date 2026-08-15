@@ -85,7 +85,6 @@ def extract(xlsx_path: str, sheet_index: int | None = None) -> str:
                 cells: list[str] = []
                 for c in row.iter(f"{S_NS}c"):
                     t = c.attrib.get("t", "")
-                    ref = c.attrib.get("r", "")
                     v = None
                     for node in c:
                         if node.tag == f"{S_NS}v":

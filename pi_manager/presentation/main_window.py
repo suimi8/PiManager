@@ -433,7 +433,7 @@ class ModernMainWindow(LegacyMainWindow):
 
     def _refresh_update_indicators(self) -> None:
         """Refresh nav badges, dashboard banner and status bar from last statuses."""
-        colors = self._update_colors()
+        self._update_colors()
         pi = getattr(self, "_pi_update_status", None) or {}
         pi_state = str(pi.get("state") or "")
         pi_needs_action = pi_state in {"outdated", "missing", "repair_required"}

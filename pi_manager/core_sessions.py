@@ -11,7 +11,6 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any
 
 
 def _decode_session_folder_slug(slug: str) -> str:

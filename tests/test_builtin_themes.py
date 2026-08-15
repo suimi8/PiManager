@@ -7,9 +7,7 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
-from pi_manager import builtin_themes
 from pi_manager.builtin_themes import (
     BUILTIN_THEMES,
     THEME_LABELS,

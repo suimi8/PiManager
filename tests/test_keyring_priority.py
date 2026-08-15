@@ -206,6 +206,6 @@ def test_keyring_probe_retriable_after_cooldown(monkeypatch):
         time.sleep(0.005)
 
     # Second probe should retry
-    result2 = secretstore._get_keyring()
+    secretstore._get_keyring()
     # It should not be None if the retry succeeds
     # (may still be None due to probe logic, but _KEYRING_TRIED should be reset)

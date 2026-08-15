@@ -533,7 +533,7 @@ class FeatureMixin:
             )
             return
         try:
-            info = core.ensure_zhipu_provider()
+            core.ensure_zhipu_provider()
         except Exception as exc:
             QMessageBox.warning(self, "配置未就绪", str(exc))
             return

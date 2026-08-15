@@ -6,7 +6,6 @@
 """
 from __future__ import annotations
 
-import pytest
 
 from pi_manager import help_docs
 

@@ -105,11 +105,14 @@ def build_hiddenimports() -> list:
     hiddenimports = [
         "keyring.backends",
         "cryptography",
+        "yaml",
+        "yaml._yaml",
         "pi_manager.platform_util",
         "pi_manager.resources",
         "pi_manager.extras",
         "pi_manager.secrets",
         "pi_manager.storage",
+        "pi_manager.plugin_manager",
         "pi_manager.provider_env",
         "pi_manager.config_broker",
         "pi_manager.helper_registry",
@@ -131,6 +134,7 @@ def build_hiddenimports() -> list:
         "pi_manager.presentation.pages.diagnostics",
         "pi_manager.presentation.pages.settings",
         "pi_manager.presentation.pages.help",
+        "pi_manager.presentation.pages.plugins",
     ]
 
     # Include every modular presentation page in frozen builds.

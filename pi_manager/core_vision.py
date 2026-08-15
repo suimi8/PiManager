@@ -163,9 +163,9 @@ def _zhipu_vision_request(
             status = int(getattr(resp, "status", 200))
             body_text = raw.decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
-        err_body = b""
         try:
-            err_body = http_client.read_limited(e, http_client.ERROR_MAX_BYTES)
+            # 读取错误响应体仅用于触发 read_limited 的大小/编码校验，内容不回传。
+            http_client.read_limited(e, http_client.ERROR_MAX_BYTES)
         except Exception:
             pass
         return {

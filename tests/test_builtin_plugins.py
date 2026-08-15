@@ -12,15 +12,50 @@
 from __future__ import annotations
 
 import json
-import os
-import sys
+import subprocess
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
 
 import pytest
 
 from pi_manager import builtin_plugins as bp
 from pi_manager import core
+
+
+# ---- 测试辅助 ----
+
+
+def _make_plugin(**overrides) -> bp.BuiltinPlugin:
+    """基于真实清单构造一个 BuiltinPlugin，可覆盖任意字段。"""
+    base = next(p for p in bp.list_builtins() if p.name == "pi-manager-vision")
+    fields = dict(
+        name=base.name,
+        type=base.type,
+        description=base.description,
+        source=base.source,
+        target_dir=base.target_dir,
+        templated=base.templated,
+        template_vars=base.template_vars,
+        min_version=base.min_version,
+        needs_npm_install=base.needs_npm_install,
+        enabled_by_default=base.enabled_by_default,
+    )
+    fields.update(overrides)
+    return bp.BuiltinPlugin(**fields)
+
+
+def _tamper_manifest_target_dir(monkeypatch, tmp_path, target_dir: str) -> None:
+    """把真实 manifest 的 target_dir 篡改后写入 tmp，并让 _load_manifest 读取它。"""
+    real = Path(__file__).resolve().parent.parent / "assets" / "builtin" / "manifest.json"
+    data = json.loads(real.read_text(encoding="utf-8"))
+    data["plugins"][0]["target_dir"] = target_dir
+    fake = tmp_path / "manifest.json"
+    fake.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setattr(
+        bp.resources,
+        "asset_path",
+        lambda *parts: fake if parts == bp._MANIFEST_REL else None,
+    )
 
 
 # ---- 清单与校验 ----
@@ -124,6 +159,88 @@ def test_self_check_rejects_target_outside_agent_dir(isolated_home, monkeypatch)
     monkeypatch.setattr(bp, "_load_manifest", fake_manifest)
     errors = bp.self_check()
     assert any("越界" in e for e in errors)
+
+
+def test_load_manifest_rejects_windows_absolute_target_dir(isolated_home, monkeypatch, tmp_path):
+    _tamper_manifest_target_dir(monkeypatch, tmp_path, "C:/Windows/evil")
+    with pytest.raises(bp.BuiltinPluginError, match="绝对路径"):
+        bp._load_manifest()
+
+
+def test_load_manifest_rejects_posix_absolute_target_dir(isolated_home, monkeypatch, tmp_path):
+    _tamper_manifest_target_dir(monkeypatch, tmp_path, "/etc/evil")
+    with pytest.raises(bp.BuiltinPluginError, match="绝对路径"):
+        bp._load_manifest()
+
+
+def test_load_manifest_rejects_drive_relative_target_dir(isolated_home, monkeypatch, tmp_path):
+    # C:foo 在 Windows 是「当前盘相对路径」，POSIX 上 Path.is_absolute() 不识别，必须显式拒绝
+    _tamper_manifest_target_dir(monkeypatch, tmp_path, "C:evil")
+    with pytest.raises(bp.BuiltinPluginError, match="绝对路径"):
+        bp._load_manifest()
+
+
+def test_load_manifest_rejects_dotdot_target_dir(isolated_home, monkeypatch, tmp_path):
+    _tamper_manifest_target_dir(monkeypatch, tmp_path, "skills/../../escaped")
+    with pytest.raises(bp.BuiltinPluginError, match=r"\.\."):
+        bp._load_manifest()
+
+
+def test_load_manifest_rejects_backslash_dotdot_target_dir(isolated_home, monkeypatch, tmp_path):
+    # 反斜杠形式的 .. 段（Windows 风格）也必须被拒绝
+    _tamper_manifest_target_dir(monkeypatch, tmp_path, "skills\\..\\..\\escaped")
+    with pytest.raises(bp.BuiltinPluginError, match=r"\.\."):
+        bp._load_manifest()
+
+
+def test_install_one_rejects_outside_target(isolated_home, monkeypatch, tmp_path):
+    """纵深防御：即使绕过 _load_manifest 的解析期校验，_install_one 落盘前也拒绝越界 target。"""
+    plugin = _make_plugin(target_dir="../../escaped")
+    src = tmp_path / "src"
+    src.mkdir()
+    monkeypatch.setattr(bp, "_load_manifest", lambda: [plugin])
+    monkeypatch.setattr(bp, "_builtin_assets_dir", lambda: tmp_path)
+    with pytest.raises(bp.BuiltinPluginError, match="目标路径"):
+        bp.install_builtin(plugin.name)
+
+
+def test_install_builtin_force_never_rmtrees_outside_agent_dir(isolated_home, monkeypatch):
+    """force 分支的 rmtree 前必须再次校验 target：越界时不删除任何目录。"""
+    victim = core.pi_agent_dir().parent.parent / "pwned"
+    victim.mkdir()
+    plugin = _make_plugin(target_dir="../../pwned")
+    monkeypatch.setattr(bp, "_load_manifest", lambda: [plugin])
+    with pytest.raises(bp.BuiltinPluginError, match="目标路径"):
+        bp.install_builtin(plugin.name, force=True)
+    assert victim.is_dir()
+
+
+def test_install_all_builtins_force_skips_outside_target(isolated_home, monkeypatch):
+    victim = core.pi_agent_dir().parent.parent / "pwned"
+    victim.mkdir()
+    plugin = _make_plugin(target_dir="../../pwned")
+    monkeypatch.setattr(bp, "_load_manifest", lambda: [plugin])
+    result = bp.install_all_builtins(force=True)
+    assert result["ok"] is False
+    entry = next(r for r in result["installed"] if r["name"] == plugin.name)
+    assert entry["ok"] is False
+    assert "目标路径" in entry["error"]
+    assert victim.is_dir()
+
+
+def test_force_rmtree_is_guarded_by_target_check(isolated_home, monkeypatch):
+    """force 安装时 _assert_safe_target_dir 至少在落盘入口与 rmtree 前各被调用一次。"""
+    bp.install_builtin("pi-manager-vision")
+    calls = []
+    real = bp._assert_safe_target_dir
+
+    def spy(plugin):
+        calls.append(plugin.name)
+        real(plugin)
+
+    monkeypatch.setattr(bp, "_assert_safe_target_dir", spy)
+    bp.install_builtin("pi-manager-vision", force=True)
+    assert calls.count("pi-manager-vision") >= 2
 
 
 # ---- 落盘与幂等 ----
@@ -245,6 +362,34 @@ def test_install_unknown_plugin_raises(isolated_home):
         bp.install_builtin("does-not-exist")
 
 
+def test_install_one_wraps_template_decode_error(isolated_home, monkeypatch, tmp_path):
+    """模板文件不是合法 UTF-8 时，应包装为 BuiltinPluginError（含文件路径）而非冒泡。"""
+    plugin = _make_plugin(
+        name="bad-skill",
+        type="skill",
+        source="skills/bad-skill",
+        target_dir="skills/bad-skill",
+        templated=True,
+    )
+    src = tmp_path / "skills" / "bad-skill"
+    src.mkdir(parents=True)
+    (src / "SKILL.md").write_bytes(b"\xff\xfe not valid utf8")
+    monkeypatch.setattr(bp, "_load_manifest", lambda: [plugin])
+    monkeypatch.setattr(bp, "_builtin_assets_dir", lambda: tmp_path)
+    with pytest.raises(bp.BuiltinPluginError) as excinfo:
+        bp.install_builtin("bad-skill")
+    assert "SKILL.md" in str(excinfo.value)
+
+
+def test_install_all_builtins_hint_uses_ignore_scripts(isolated_home):
+    """需 npm 的插件落盘后，提示命令必须带 --ignore-scripts（不执行依赖包脚本）。"""
+    result = bp.install_all_builtins(include_disabled=True)
+    mcp = next(r for r in result["installed"] if r["name"] == "pi-manager-mcp-bridge")
+    assert mcp.get("npm_install_required") is True
+    assert "--ignore-scripts" in mcp["npm_install_hint"]
+    assert mcp["npm_install_args"]
+
+
 # ---- 状态查询 ----
 
 
@@ -292,7 +437,7 @@ def test_install_one_click_unknown_returns_error(isolated_home):
 
 def test_install_one_click_extension_without_npm_simulated(isolated_home, monkeypatch):
     """MCP 桥需要 npm install；用假 npm 让 install_one_click 走失败路径，
-    验证返回的 command 字段供用户手动执行。"""
+    验证返回的 command 字段供用户手动执行，且带 --ignore-scripts 提示。"""
     bp.install_builtin("pi-manager-mcp-bridge")  # 先落盘
 
     def fake_npm_install(name):
@@ -301,15 +446,21 @@ def test_install_one_click_extension_without_npm_simulated(isolated_home, monkey
             "returncode": 127,
             "stdout": "",
             "stderr": "npm not found",
-            "command": 'cd "FAKE" && npm install --omit=dev',
+            "command": 'cd "FAKE" && npm install --omit=dev --ignore-scripts --no-audit --no-fund',
+            "cwd": "FAKE",
+            "args": ["install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"],
             "path": "FAKE",
         }
 
     monkeypatch.setattr(bp, "npm_install", fake_npm_install)
     result = bp.install_one_click("pi-manager-mcp-bridge")
     assert result["ok"] is False
-    assert result["command"] == 'cd "FAKE" && npm install --omit=dev'
+    assert result["command"] == (
+        'cd "FAKE" && npm install --omit=dev --ignore-scripts --no-audit --no-fund'
+    )
     assert "npm not found" in result["error"]
+    # 明确告知用户：npm 使用 --ignore-scripts（不执行依赖包脚本）
+    assert "--ignore-scripts" in result["hint"]
 
 
 # ---- npm_install ----
@@ -332,3 +483,116 @@ def test_npm_install_when_not_on_disk_returns_command(isolated_home):
     assert result["ok"] is False
     assert "尚未落盘" in result["stderr"]
     assert "npm install --omit=dev" in result["command"]
+    assert "--ignore-scripts" in result["command"]
+    # 结构化字段：cwd 与 args
+    assert result["cwd"]
+    assert "install" in result["args"]
+
+
+def _capture_npm_run(monkeypatch, calls: dict):
+    """把 npm 执行替换为假命令并捕获参数。"""
+
+    def fake_run(cmd, **kwargs):
+        calls["cmd"] = list(cmd)
+        calls["cwd"] = kwargs.get("cwd")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(bp.core, "_npm_command", lambda *args: ["fake-npm", *args])
+    monkeypatch.setattr(bp.subprocess, "run", fake_run)
+
+
+def test_npm_install_uses_ignore_scripts_without_lockfile(isolated_home, monkeypatch):
+    """无 package-lock.json 时退回 npm install，且必须带 --ignore-scripts。"""
+    bp.install_builtin("pi-manager-mcp-bridge")
+    target = core.pi_agent_dir() / "extensions" / "pi-manager-mcp-bridge"
+    lockfile = target / "package-lock.json"
+    if lockfile.exists():
+        lockfile.unlink()  # 模拟旧版本无 lockfile 的场景
+    calls: dict = {}
+    _capture_npm_run(monkeypatch, calls)
+    result = bp.npm_install("pi-manager-mcp-bridge")
+    assert result["ok"] is True
+    assert calls["cmd"] == [
+        "fake-npm",
+        "install",
+        "--omit=dev",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+    ]
+    assert calls["cwd"] == str(target)
+    assert result["args"] == calls["cmd"][1:]
+    assert result["cwd"] == str(target)
+    assert "npm install --omit=dev --ignore-scripts" in result["command"]
+
+
+def test_npm_install_uses_npm_ci_with_lockfile(isolated_home, monkeypatch):
+    """存在 package-lock.json 时优先 npm ci 固定版本。"""
+    bp.install_builtin("pi-manager-mcp-bridge")
+    target = core.pi_agent_dir() / "extensions" / "pi-manager-mcp-bridge"
+    assert (target / "package-lock.json").is_file()  # 内置资产自带 lockfile，落盘后应存在
+    calls: dict = {}
+    _capture_npm_run(monkeypatch, calls)
+    result = bp.npm_install("pi-manager-mcp-bridge")
+    assert result["ok"] is True
+    assert calls["cmd"][0] == "fake-npm"
+    assert calls["cmd"][1] == "ci"
+    assert "--ignore-scripts" in calls["cmd"]
+    assert "npm ci --omit=dev" in result["command"]
+
+
+def test_npm_install_registry_env_restriction(isolated_home, monkeypatch):
+    """设置 PI_MANAGER_NPM_REGISTRY 时，参数与提示命令都应带 --registry。"""
+    monkeypatch.setenv("PI_MANAGER_NPM_REGISTRY", "https://registry.example.test")
+    bp.install_builtin("pi-manager-mcp-bridge")
+    calls: dict = {}
+    _capture_npm_run(monkeypatch, calls)
+    result = bp.npm_install("pi-manager-mcp-bridge")
+    assert result["ok"] is True
+    assert calls["cmd"][-2:] == ["--registry", "https://registry.example.test"]
+    assert "--registry" in result["command"]
+
+
+def test_npm_install_rejects_outside_target(isolated_home, monkeypatch):
+    """纵深防御：npm 在越界 target 上执行前必须拒绝。"""
+    plugin = _make_plugin(
+        name="evil-ext",
+        type="extension",
+        needs_npm_install=True,
+        target_dir="../../pwned",
+    )
+    monkeypatch.setattr(bp, "_load_manifest", lambda: [plugin])
+    with pytest.raises(bp.BuiltinPluginError, match="目标路径"):
+        bp.npm_install(plugin.name)
+
+
+def test_npm_install_handles_missing_npm(isolated_home, monkeypatch):
+    """npm 可执行文件不存在（FileNotFoundError）时返回结构化失败结果。"""
+    bp.install_builtin("pi-manager-mcp-bridge")
+
+    def boom(*args, **kwargs):
+        raise FileNotFoundError("npm not found")
+
+    monkeypatch.setattr(bp.core, "_npm_command", lambda *args: ["npm", *args])
+    monkeypatch.setattr(bp.subprocess, "run", boom)
+    result = bp.npm_install("pi-manager-mcp-bridge")
+    assert result["ok"] is False
+    assert "未找到 npm" in result["stderr"]
+    assert result["args"]
+    assert result["cwd"]
+
+
+def test_npm_install_handles_timeout(isolated_home, monkeypatch):
+    """npm install 超时（TimeoutExpired）时返回结构化失败结果。"""
+    bp.install_builtin("pi-manager-mcp-bridge")
+
+    def boom(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=["npm"], timeout=300)
+
+    monkeypatch.setattr(bp.core, "_npm_command", lambda *args: ["npm", *args])
+    monkeypatch.setattr(bp.subprocess, "run", boom)
+    result = bp.npm_install("pi-manager-mcp-bridge")
+    assert result["ok"] is False
+    assert "超时" in result["stderr"]
+    assert result["args"]
+    assert result["cwd"]

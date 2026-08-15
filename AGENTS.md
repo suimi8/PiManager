@@ -1,5 +1,8 @@
 # PiManager 桌面版本维护约束
 
+> 开发规范唯一权威正文：`docs/DEVELOPMENT_STANDARDS.md`（冲突时以它为准）。
+> 本文件是机器可读的「不可破坏边界 + 检测不变量」，AI 编码代理（pi 等）自动注入。
+
 本目录是完整、独立的跨平台桌面应用（Windows / macOS / Linux）源码单元。维护、构建或发布本版本时，只允许依赖本目录中的文件。
 
 ## 不可破坏的边界
@@ -14,14 +17,21 @@
 - JSON 存储写入必须走 `pi_manager/storage.py` 的原子写与并发锁（`locked`），防止多进程 / 多线程写坏配置。
 - 应用版本以 `pi_manager/extras.py` 的 `APP_VERSION` 为单一来源；Cursor 扩展版本以 `extensions/pi-cursor/package.json` 为准，两者独立维护、发布时同步更新。
 - 发布产物（`release-assets/`、dist 目录等）不得提交到仓库；二进制通过 GitHub Releases 分发。
+- 插件管理安全边界：用户插件只做静态校验、不执行插件代码；`trust` 不提供沙箱；
+  未信任插件不得启用；内置插件 `target_dir` 必须落在 `~/.pi/agent/` 内。
 
 ## 检测不变量
 
-- `python -m pytest tests -q` 必须全部通过。
+- `python -m pytest tests -q` 必须全部通过（integration 用例默认排除，`-m integration` 显式运行）。
+- `ruff check .` 必须通过（无硬语法错误与未使用导入；配置见 `pyproject.toml`）。
+- `python scripts/check_secrets.py --scan-tests` 必须通过（仓库无密钥/敏感文件）。
+- `python scripts/check_versions.py` 必须通过（桌面/扩展/文档版本一致）。
 - `python main.py --self-check` 必须输出 `self-check: OK`；发布包以对应平台产物（`PiManager.exe --self-check` / `PiManager.app/Contents/MacOS/PiManager --self-check` / `./PiManager/PiManager --self-check`）运行等价自检。
 - Linux 无头环境（CI）必须用 `xvfb` 运行 GUI 冒烟测试。
 - 打包后运行 `python scripts/smoke_test_dist.py` 验证产物可独立启动。
 - 密钥相关行为（keyring 优先、vault 回退、`models.json` 无明文）必须有测试覆盖，禁止出现安全回退退化。
+- 插件安全边界（ZIP 矩阵、frontmatter、self_check 错误分支等）必须有测试覆盖
+  （`tests/test_plugin_security_matrix.py`），禁止校验回归导致恶意包可导入。
 
 ## 修改和部署
 

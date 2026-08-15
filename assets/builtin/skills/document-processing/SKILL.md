@@ -1,6 +1,6 @@
 ---
 name: document-processing
-description: 提取 PDF、Word(.docx)、Excel(.xlsx)、PowerPoint(.pptx) 文档中的文字与表格内容，供模型阅读、总结、对比或转换为其他格式。当用户要求读取/解析/总结文档、提取表格或文本时使用。
+description: "提取 PDF、Word(.docx)、Excel(.xlsx)、PowerPoint(.pptx) 文档中的文字与表格内容，供模型阅读、总结、对比或转换为其他格式。当用户要求读取/解析/总结文档、提取表格或文本时使用。"
 ---
 
 # 文档处理

@@ -318,7 +318,7 @@ class NavigationRail(QFrame):
     def set_version(self, text: str) -> None:
         self.version_label.setText(text)
         self.launch_button.setToolTip(
-            f"启动完整 Pi" + (f"\n{text}" if text else "")
+            "启动完整 Pi" + (f"\n{text}" if text else "")
         )
 
     def set_badge(self, key: str, text: str | None = None) -> None:

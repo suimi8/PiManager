@@ -59,7 +59,7 @@
     {
       "name": "pi-manager-mcp-bridge",
       "type": "extension",
-      "description": "MCP 桥：把外部 MCP server 的工具注册回 pi（/mcp-status、/mcp-reload）。落盘后需在扩展目录执行 npm install。",
+      "description": "MCP 桥：把外部 MCP server 的工具注册回 pi（/mcp-status、/mcp-reload）。MCP server 子进程只继承白名单基础环境、不自动获得 provider 密钥；需传密钥时须在该 server 的 env 中显式声明。落盘后需在扩展目录执行 npm install。",
       "source": "extensions/pi-manager-mcp-bridge",
       "target_dir": "extensions/pi-manager-mcp-bridge",
       "templated": false,

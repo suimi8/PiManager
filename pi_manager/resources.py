@@ -2,7 +2,6 @@
 """Resolve bundled asset paths (dev + PyInstaller, all platforms)."""
 from __future__ import annotations
 
-import os
 import stat
 import sys
 from pathlib import Path
@@ -158,8 +157,9 @@ def self_check() -> list[str]:
         errors.append(f"vault security check failed: {exc}")
     # 内置插件（skills / extensions）资源完整性
     try:
-        from pi_manager import builtin_plugins
+        from pi_manager import builtin_plugins, plugin_manager
         errors.extend(builtin_plugins.self_check())
+        errors.extend(plugin_manager.self_check())
     except Exception as exc:
-        errors.append(f"builtin plugins check failed: {exc}")
+        errors.append(f"plugin resources check failed: {exc}")
     return errors

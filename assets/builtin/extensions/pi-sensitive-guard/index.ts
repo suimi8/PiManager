@@ -11,7 +11,8 @@
  *    - ~/.pi/agent/auth.json（OAuth / 登录态）
  *    - ~/.pi/agent/secrets.vault（AES-GCM 密钥库回退文件）
  *    - ~/.pi/agent/mcp-servers.json（可能含 GITHUB_TOKEN 等）
- *    - ~/.pi/agent/.master_key / keyring 相关文件
+ *    - ~/.pi/agent/.vault_master_key / .broker-token / secrets.index.json /
+ *      secrets.dpapi（vault 主密钥盐、broker 令牌、密钥索引、旧 vault）
  *    - 项目级 .env / .env.* / *.pem / id_rsa / id_ed25519 / .netrc / .npmrc
  * 2. 禁止写入/删除/覆盖：上述全部 + models.json / settings.json /
  *    pi-manager.json / pi-manager-health.json（配置只能由 PiManager 写入）。
@@ -31,13 +32,17 @@ import { join, resolve, sep } from "node:path";
 const AGENT_DIR = resolve(join(homedir(), ".pi", "agent"));
 
 // 绝对禁止读取/写入的敏感文件名（~/.pi/agent/ 下）
+// 文件名以 pi_manager/secrets.py 的实际落盘名称为准：
+//   .vault_master_key（PBKDF2 盐）、.broker-token（config broker 令牌）、
+//   secrets.index.json（密钥名索引）、secrets.dpapi（旧 vault）
 const AGENT_SENSITIVE_FILES = [
   "auth.json",
   "secrets.vault",
   "mcp-servers.json",
-  ".master_key",
-  "keyring",
-  "keyring.json",
+  ".vault_master_key",
+  ".broker-token",
+  "secrets.index.json",
+  "secrets.dpapi",
 ];
 
 // 禁止写入/删除/覆盖的配置类文件（可读，但不可被 pi 篡改）
@@ -68,6 +73,8 @@ const PROJECT_SENSITIVE_NAMES = [
 const SECRET_PATTERNS: RegExp[] = [
   /\bsk-[A-Za-z0-9_-]{16,}\b/g,
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,
+  /\bgithub_pat_[A-Za-z0-9_]{22,}\b/g,
+  /\bhf_[A-Za-z0-9]{20,}\b/g,
   /\bAIza[A-Za-z0-9_-]{30,}\b/g,
   /\bAKIA[A-Za-z0-9]{16}\b/g,
   /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
@@ -86,36 +93,41 @@ function redact(text: string): string {
 // 归一化路径：把 ~ 展开、相对路径基于 cwd 解析
 function normalizePath(p: string, cwd: string): string {
   let path = String(p || "").trim().replace(/^["']|["']$/g, "");
-  if (path.startsWith("~/") || path === "~") {
+  // 同时支持 POSIX 风格的 ~ 与 Windows 习惯的 ~\
+  if (path.startsWith("~/") || path.startsWith("~\\") || path === "~") {
     path = join(homedir(), path.slice(1));
   }
   return resolve(cwd, path);
 }
 
+// Windows 文件系统大小写不敏感；路径判断统一小写后比较，防止
+// AUTH.JSON / .PI\agent\auth.json 之类的大小写绕过。
+const AGENT_DIR_LOWER = AGENT_DIR.toLowerCase();
+
 function isAgentSensitive(path: string): boolean {
-  const resolved = resolve(path);
-  if (resolved !== AGENT_DIR && !resolved.startsWith(AGENT_DIR + sep)) return false;
+  const resolved = resolve(path).toLowerCase();
+  if (resolved !== AGENT_DIR_LOWER && !resolved.startsWith(AGENT_DIR_LOWER + sep)) return false;
   for (const name of AGENT_SENSITIVE_FILES) {
-    if (resolved === join(AGENT_DIR, name)) return true;
+    if (resolved === join(AGENT_DIR_LOWER, name.toLowerCase())) return true;
   }
   return false;
 }
 
 function isAgentConfig(path: string): boolean {
-  const resolved = resolve(path);
-  if (resolved !== AGENT_DIR && !resolved.startsWith(AGENT_DIR + sep)) return false;
+  const resolved = resolve(path).toLowerCase();
+  if (resolved !== AGENT_DIR_LOWER && !resolved.startsWith(AGENT_DIR_LOWER + sep)) return false;
   for (const name of AGENT_CONFIG_FILES) {
-    if (resolved === join(AGENT_DIR, name)) return true;
+    if (resolved === join(AGENT_DIR_LOWER, name.toLowerCase())) return true;
   }
   return false;
 }
 
 function isProjectSensitive(path: string): boolean {
-  const resolved = resolve(path);
+  const resolved = resolve(path).toLowerCase();
   const base = resolved.split(sep).pop() || "";
   for (const name of PROJECT_SENSITIVE_NAMES) {
-    if (base === name) return true;
-    if (name === ".env" && base.startsWith(".env.")) return true;
+    if (base === name.toLowerCase()) return true;
+    if (name === ".env" && base.startsWith(".env.".toLowerCase())) return true;
     if (base.endsWith(".pem") || base.endsWith(".key")) return true;
   }
   return false;

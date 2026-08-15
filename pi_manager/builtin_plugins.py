@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -79,6 +80,41 @@ def _builtin_assets_dir() -> Path:
     return p
 
 
+def _assert_safe_target_dir(plugin: BuiltinPlugin) -> None:
+    """fail-fast 校验 ``target_dir``：非绝对路径、无 ``..`` 段、解析后在 agent 目录内。
+
+    该校验在 ``_load_manifest`` 解析时执行一次（防清单/资产被篡改后任意写删），
+    同时在所有落盘 / 删除（rmtree）/ npm 执行入口重复执行（纵深防御，防止未来
+    新增调用路径绕过）。任何一条不满足即抛 ``BuiltinPluginError``。
+    """
+    target_dir = plugin.target_dir
+    # 1) 拒绝绝对路径：POSIX 前导 ``/`` 由 ``is_absolute`` 覆盖；Windows 盘符
+    #    （``C:/x``、``C:foo``）在 POSIX 上不被识别为绝对路径，需显式正则拒绝；
+    #    反斜杠开头（Windows 根路径 ``\evil``）在 POSIX 上同样不被识别，一并拒绝。
+    if target_dir.startswith(("/", "\\")) or Path(target_dir).is_absolute() or re.match(
+        r"^[A-Za-z]:", target_dir
+    ):
+        raise BuiltinPluginError(
+            f"内置插件 {plugin.name} 目标路径非法（绝对路径）: {target_dir}"
+        )
+    # 2) 拒绝含 ``..`` 段：解析前按 ``/`` 与 ``\`` 统一切分，避免平台分隔符差异
+    #    导致 ``..\\evil`` 这类变体漏检。
+    segments = [seg for seg in target_dir.replace("\\", "/").split("/") if seg not in ("", ".")]
+    if ".." in segments:
+        raise BuiltinPluginError(
+            f"内置插件 {plugin.name} 目标路径非法（含 .. 段）: {target_dir}"
+        )
+    # 3) 二次确认 resolve 后仍在 agent 目录内（防符号链接 / Unicode 规范化逃逸）。
+    #    必须先 resolve() 解析 .. 与链接，否则 Path.relative_to 不拒绝 ../../escaped。
+    agent_dir = core.pi_agent_dir().resolve()
+    try:
+        plugin.target_path.resolve().relative_to(agent_dir)
+    except ValueError:
+        raise BuiltinPluginError(
+            f"内置插件 {plugin.name} 目标路径越界: {target_dir}"
+        ) from None
+
+
 def _load_manifest() -> list[BuiltinPlugin]:
     p = resources.asset_path(*_MANIFEST_REL)
     if p is None:
@@ -94,22 +130,24 @@ def _load_manifest() -> list[BuiltinPlugin]:
         if not isinstance(item, dict):
             continue
         try:
-            out.append(
-                BuiltinPlugin(
-                    name=str(item["name"]),
-                    type=str(item["type"]),
-                    description=str(item.get("description") or ""),
-                    source=str(item["source"]),
-                    target_dir=str(item["target_dir"]),
-                    templated=bool(item.get("templated", False)),
-                    template_vars=tuple(item.get("template_vars") or ()),
-                    min_version=str(item.get("min_version") or "1.0.0"),
-                    needs_npm_install=bool(item.get("needs_npm_install", False)),
-                    enabled_by_default=bool(item.get("enabled_by_default", True)),
-                )
+            plugin = BuiltinPlugin(
+                name=str(item["name"]),
+                type=str(item["type"]),
+                description=str(item.get("description") or ""),
+                source=str(item["source"]),
+                target_dir=str(item["target_dir"]),
+                templated=bool(item.get("templated", False)),
+                template_vars=tuple(item.get("template_vars") or ()),
+                min_version=str(item.get("min_version") or "1.0.0"),
+                needs_npm_install=bool(item.get("needs_npm_install", False)),
+                enabled_by_default=bool(item.get("enabled_by_default", True)),
             )
         except KeyError as exc:
             raise BuiltinPluginError(f"内置插件清单条目缺字段: {exc}") from exc
+        # 解析后立即校验 target_dir 安全，fail-fast：清单/资产被篡改时
+        # 拒绝继续解析，避免后续落盘 / rmtree 命中越界路径。
+        _assert_safe_target_dir(plugin)
+        out.append(plugin)
     return out
 
 
@@ -173,6 +211,8 @@ def _atomic_write_file(path: Path, content: bytes) -> bool:
 
 def _install_one(plugin: BuiltinPlugin) -> dict[str, Any]:
     """把单个内置插件落盘到 ``pi_agent_dir()`` 下。"""
+    # 纵深防御：落盘前再次确认 target 在 agent 目录内（防绕过 _load_manifest 的调用路径）。
+    _assert_safe_target_dir(plugin)
     src_root = _builtin_assets_dir() / plugin.source
     if not src_root.exists():
         raise BuiltinPluginError(f"内置插件源缺失: {plugin.source}")
@@ -195,7 +235,12 @@ def _install_one(plugin: BuiltinPlugin) -> dict[str, Any]:
             raw = src_file.read_bytes()
             # 仅对文本模板渲染；二进制文件原样落盘。
             if plugin.templated and src_file.suffix in {".tmpl", ".md", ".txt"}:
-                text = raw.decode("utf-8", errors="strict")
+                try:
+                    text = raw.decode("utf-8", errors="strict")
+                except UnicodeDecodeError as exc:
+                    raise BuiltinPluginError(
+                        f"内置插件模板文件不是合法 UTF-8: {src_file}"
+                    ) from exc
                 rendered = resolver(text)
                 payload = rendered.encode("utf-8")
                 # 去掉 .tmpl 后缀，得到最终文件名
@@ -227,6 +272,8 @@ def install_builtin(name: str, force: bool = False) -> dict[str, Any]:
         if plugin.name == name:
             res = _install_one(plugin)
             if force and not res["updated"]:
+                # rmtree 前必须再次确认 target 在 agent 目录内，防止越界删除。
+                _assert_safe_target_dir(plugin)
                 if plugin.target_path.exists():
                     shutil.rmtree(plugin.target_path, ignore_errors=True)
                 res = _install_one(plugin)
@@ -251,17 +298,20 @@ def install_all_builtins(force: bool = False, include_disabled: bool = False) ->
         try:
             res = _install_one(plugin)
             if force and not res["updated"]:
-                # 强制模式下确保至少写一次：删目标再装一次
+                # 强制模式下确保至少写一次：删目标再装一次；
+                # rmtree 前必须再次确认 target 在 agent 目录内，防止越界删除。
+                _assert_safe_target_dir(plugin)
                 if plugin.target_path.exists():
                     shutil.rmtree(plugin.target_path, ignore_errors=True)
                 res = _install_one(plugin)
             # extension 若声明 needs_npm_install，提示用户需手动 npm install
-            # （不在落盘阶段自动跑 npm，避免隐式网络/进程行为）
+            # （不在落盘阶段自动跑 npm，避免隐式网络/进程行为）；提示命令与
+            # npm_install 一致：带 --ignore-scripts，不执行依赖包生命周期脚本。
             if plugin.needs_npm_install and res.get("updated"):
                 res["npm_install_required"] = True
-                res["npm_install_hint"] = (
-                    f"cd {plugin.target_path} && npm install --omit=dev"
-                )
+                args, uses_ci, registry = _npm_install_args(plugin.target_path)
+                res["npm_install_hint"] = _npm_command_text(plugin.target_path, uses_ci, registry)
+                res["npm_install_args"] = args
             results.append(res)
         except (BuiltinPluginError, OSError) as exc:
             results.append({"ok": False, "name": plugin.name, "error": str(exc)})
@@ -311,11 +361,71 @@ def self_check() -> list[str]:
 # ---- extension 的 npm 依赖安装与状态查询 ----
 
 
-def npm_install(plugin_name: str) -> dict[str, Any]:
-    """在插件目录执行 ``npm install --omit=dev``。
+def _npm_install_args(target: Path) -> tuple[list[str], bool, str]:
+    """构造 npm 依赖安装参数，返回 ``(args, uses_ci)``。
 
-    返回 ``{ok, returncode, stdout, stderr, command, path}``。失败时
-    ``command`` 字段给出可复制到终端执行的手动安装命令。
+    供应链加固：
+    - 插件目录存在 ``package-lock.json`` 时优先 ``npm ci``（按锁文件固定版本安装）；
+      无 lockfile 时退回 ``npm install``（浮动版本，仅内置资产受控时接受）。
+    - 两者均带 ``--ignore-scripts``：不执行依赖包自身生命周期脚本
+      （``preinstall/install/postinstall``），消除依赖树投毒导致的隐式 RCE 面。
+    - ``--no-audit --no-fund`` 减少不必要的网络请求与提示噪音。
+    - registry 可由环境变量 ``PI_MANAGER_NPM_REGISTRY`` 限制（有值时传
+      ``--registry``）；默认不限制，但记录日志供审计。
+    """
+    uses_ci = (target / "package-lock.json").is_file()
+    args = (
+        ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"]
+        if uses_ci
+        else ["install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"]
+    )
+    registry = os.environ.get("PI_MANAGER_NPM_REGISTRY", "").strip()
+    if registry:
+        args.extend(["--registry", registry])
+        logger.info("npm registry 已限制为 PI_MANAGER_NPM_REGISTRY=%s", registry)
+    else:
+        logger.info(
+            "npm registry 未限制（未设置 PI_MANAGER_NPM_REGISTRY），将使用 npm 默认源"
+        )
+    return args, uses_ci, registry
+
+
+def _shell_quote(path: str) -> str:
+    """POSIX 风格单引号转义，用于提示命令中的路径（仅提示，不自动执行）。
+
+    单引号内除 ``'`` 外无任何特殊字符，路径含引号 / 分号 / 空格 / ``$`` 时
+    复制到 POSIX shell 或 PowerShell 执行也不会被注入。
+    """
+    return "'" + str(path).replace("'", "'\\''") + "'"
+
+
+def _npm_command_text(target: Path, uses_ci: bool, registry: str = "") -> str:
+    """构造给用户手动执行的 npm 命令文本（仅提示，不自动执行）。
+
+    ``target`` 经 ``_shell_quote`` 安全转义，路径含引号 / 分号 / 空格时
+    复制执行也不会被 shell 注入。命令保留 ``--ignore-scripts``，与程序内
+    实际执行的参数一致（不执行依赖包生命周期脚本）；若有 registry 限制也一并
+    体现在提示命令中。
+    """
+    verb = "ci" if uses_ci else "install"
+    registry_part = f" --registry {_shell_quote(registry)}" if registry else ""
+    return (
+        f"cd {_shell_quote(str(target))} && npm {verb} --omit=dev "
+        f"--ignore-scripts --no-audit --no-fund{registry_part}"
+    )
+
+
+def npm_install(plugin_name: str) -> dict[str, Any]:
+    """在插件目录安装依赖（供应链加固版）。
+
+    有 ``package-lock.json`` 时用 ``npm ci`` 固定版本，无 lockfile 时用
+    ``npm install``；两者均带 ``--ignore-scripts``（不执行依赖包生命周期脚本）、
+    ``--no-audit --no-fund``，registry 可由 ``PI_MANAGER_NPM_REGISTRY`` 限制。
+
+    返回 ``{ok, returncode, stdout, stderr, command, cwd, args, path}``。
+    失败时 ``command`` 字段给出可复制到终端执行的手动安装命令（同样带
+    ``--ignore-scripts``）。``cwd`` 与 ``args``（列表）为结构化字段，供 UI
+    组件化展示；``command`` 字符串保留以兼容现有调用方。
     """
     plugin = None
     for p in _load_manifest():
@@ -326,17 +436,23 @@ def npm_install(plugin_name: str) -> dict[str, Any]:
         raise BuiltinPluginError(f"未知的内置插件: {plugin_name}")
     if not plugin.needs_npm_install:
         return {"ok": True, "skipped": True, "reason": "该插件无需 npm install"}
+    # 纵深防御：npm 在插件目录执行前再次确认 target 在 agent 目录内。
+    _assert_safe_target_dir(plugin)
     target = plugin.target_path
+    args, uses_ci, registry = _npm_install_args(target)
+    shell_cmd = _npm_command_text(target, uses_ci, registry)
     if not target.exists():
         return {
             "ok": False,
             "returncode": -1,
             "stdout": "",
             "stderr": f"插件尚未落盘：{target}",
-            "command": f"cd \"{target}\" && npm install --omit=dev",
+            "command": shell_cmd,
+            "cwd": str(target),
+            "args": args,
             "path": str(target),
         }
-    cmd = core._npm_command("install", "--omit=dev")
+    cmd = core._npm_command(*args)
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
     try:
         proc = subprocess.run(
@@ -352,13 +468,14 @@ def npm_install(plugin_name: str) -> dict[str, Any]:
         )
         stdout = (proc.stdout or "").strip()
         stderr = (proc.stderr or "").strip()
-        shell_cmd = f'cd "{target}" && npm install --omit=dev'
         return {
             "ok": proc.returncode == 0,
             "returncode": proc.returncode,
             "stdout": stdout,
             "stderr": stderr,
             "command": shell_cmd,
+            "cwd": str(target),
+            "args": args,
             "path": str(target),
         }
     except FileNotFoundError:
@@ -367,7 +484,9 @@ def npm_install(plugin_name: str) -> dict[str, Any]:
             "returncode": -1,
             "stdout": "",
             "stderr": "未找到 npm 命令，请先安装 Node.js / npm",
-            "command": f'cd "{target}" && npm install --omit=dev',
+            "command": shell_cmd,
+            "cwd": str(target),
+            "args": args,
             "path": str(target),
         }
     except subprocess.TimeoutExpired:
@@ -376,7 +495,9 @@ def npm_install(plugin_name: str) -> dict[str, Any]:
             "returncode": -1,
             "stdout": "",
             "stderr": "npm install 超时（300s）",
-            "command": f'cd "{target}" && npm install --omit=dev',
+            "command": shell_cmd,
+            "cwd": str(target),
+            "args": args,
             "path": str(target),
         }
 
@@ -435,15 +556,17 @@ def install_one_click(plugin_name: str) -> dict[str, Any]:
         if p.name == plugin_name:
             plugin = p
             break
+    scripts_note = "npm ci/install 使用 --ignore-scripts：不执行依赖包生命周期脚本"
     if plugin and plugin.needs_npm_install:
         result = npm_install(plugin_name)
         status = plugin_status(plugin_name)
         if result.get("ok"):
-            return {"ok": True, "status": status}
+            return {"ok": True, "status": status, "hint": scripts_note}
         return {
             "ok": False,
             "error": result.get("stderr") or "npm install 失败",
             "command": result.get("command", ""),
             "status": status,
+            "hint": scripts_note + "；如手动执行请保留该参数",
         }
     return {"ok": True, "status": plugin_status(plugin_name)}

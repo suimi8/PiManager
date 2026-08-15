@@ -1,0 +1,5 @@
+# 开发与审查工具依赖（CI 的 lint / secret-scan / consistency job 使用）。
+# 运行时依赖见 requirements.txt（== 固定）；本文件仅供开发/CI，不进入打包产物。
+ruff==0.14.4
+pytest==8.4.2
+pytest-cov==6.2.1

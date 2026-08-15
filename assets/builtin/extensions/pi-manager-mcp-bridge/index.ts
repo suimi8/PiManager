@@ -19,6 +19,15 @@
  *   ~/.pi/agent/mcp-servers.json 显式声明的 server，不从网络拉取、不自动启用。
  * - 生命周期：server 进程在 session_start 启动，session_shutdown 关闭，避免泄漏。
  *
+ * 安全边界（凭据隔离）
+ * -------------------
+ * MCP server 不应继承宿主（pi）全部环境，避免凭据扩散：PiManager 启动 pi 时会把
+ * provider 的真实 API Key 注入 pi 进程环境（PI_MANAGER_PROVIDER_*_API_KEY、
+ * OPENAI_API_KEY、ANTHROPIC_API_KEY、ZHIPU_API_KEY 等）。若 spawn 时原样透传
+ * process.env，任何被配置的第三方 MCP server 都能读到全部密钥。因此本桥只向子进程
+ * 透传 SAFE_ENV_WHITELIST 中无密钥语义的基础变量，再叠加 mcp-servers.json 里
+ * 该 server 显式声明的 env：需要给 server 传密钥，必须写进它自己的 env 字段。
+ *
  * SETUP（PiManager 落盘后由用户/脚本执行一次）
  * -------------------------------------------
  *   cd ~/.pi/agent/extensions/pi-manager-mcp-bridge
@@ -97,6 +106,53 @@ function toToolParameters(schema?: object) {
   );
 }
 
+/**
+ * spawn MCP server 时允许透传的基础环境白名单。
+ *
+ * 只保留进程启动所必需、无密钥语义的变量：
+ * - PATH：定位可执行文件；
+ * - SystemRoot / windir：Windows 缺少它们时网络解析与系统 DLL 加载会失败；
+ * - COMSPEC / PATHEXT：Windows 下透过 cmd shim（如 npx.cmd）启动 server；
+ * - USERPROFILE / HOMEDRIVE / HOMEPATH / APPDATA / LOCALAPPDATA：
+ *   npm、npx 等工具定位全局包与缓存目录；
+ * - HOME / USER / LOGNAME / SHELL：POSIX 侧身份与首目录解析；
+ * - TEMP / TMP：临时文件；LANG / TERM：编码与终端输出。
+ *
+ * provider API Key（PI_MANAGER_PROVIDER_*_API_KEY、OPENAI_API_KEY 等）不在此列，
+ * 绝不继承给第三方 MCP server。
+ */
+const SAFE_ENV_WHITELIST = [
+  "PATH",
+  "SystemRoot",
+  "windir",
+  "COMSPEC",
+  "PATHEXT",
+  "USERPROFILE",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "TEMP",
+  "TMP",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "LANG",
+  "TERM",
+] as const;
+
+function buildSafeEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of SAFE_ENV_WHITELIST) {
+    const value = process.env[key];
+    if (value !== undefined) {
+      env[key] = value;
+    }
+  }
+  return env;
+}
+
 async function connectServer(
   name: string,
   cfg: McpServerConfig,
@@ -104,7 +160,9 @@ async function connectServer(
   try {
     const child = spawn(cfg.command, cfg.args ?? [], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, ...(cfg.env ?? {}) },
+      // 安全边界：不透传 process.env（内含 provider API Key），只给白名单基础环境
+      // + 用户在 mcp-servers.json 中为该 server 显式声明的 env。
+      env: { ...buildSafeEnv(), ...(cfg.env ?? {}) },
     });
 
     const transport = new StdioClientTransport(child);
