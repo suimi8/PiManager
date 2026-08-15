@@ -42,12 +42,13 @@
 
 | 平台 | 附件示例 | 如何运行 |
 |------|----------|----------|
-| Windows x64 | `...-windows-x64-dir.zip`（推荐） | 解压后运行 `PiManager\PiManager.exe` |
+| Windows x64 | `...-windows-x64-onefile.zip`（便携版） | 解压后直接运行 `PiManager.exe`（单文件自包含，可单独拷贝） |
 | macOS arm64 | `...-macos-arm64.zip` | 打开 `PiManager.app` |
 | Linux x64 | `...-linux-x64.tar.gz` | `./PiManager/PiManager` |
 | Cursor | `pi-manager-pi-cursor-*.vsix` | 在 Cursor 安装 VSIX |
 
-请保持解压目录完整（Windows/Linux 的 `_internal`、macOS 的 `.app` 不要拆散）。
+Windows 为便携单文件版：解压得到单个 `PiManager.exe`，可放到任意目录 / U 盘使用；
+macOS / Linux 为目录版，请保持解压目录完整（`_internal`、`.app` 不要拆散）。
 
 完整 Pi 会话仍需官方 CLI：
 
@@ -118,7 +119,7 @@ python -m PyInstaller --noconfirm --clean PiManagerOneFile.spec
 # macOS / Linux（目录版 / .app）:
 python -m PyInstaller --noconfirm --clean PiManager.spec
 python scripts/smoke_test_dist.py
-python scripts/package_release.py --version 1.8.1
+python scripts/package_release.py --version 1.8.4
 ```
 
 跨平台（Windows / macOS / Linux）推荐用 GitHub Actions：

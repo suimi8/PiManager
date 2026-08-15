@@ -103,18 +103,18 @@ def tar_gz_dir(src: Path, dst: Path, arc_root: str | None = None) -> None:
 
 def write_run_notes(out_dir: Path, plat: str, version: str) -> Path:
     if plat == "windows":
-        text = f"""PiManager v{version} (Windows x64)
+        text = f"""PiManager v{version} (Windows x64 便携版)
 
 独立运行说明：
-1. 解压本 zip 到任意目录（不要只运行压缩包内路径）
-2. 双击 PiManager\\PiManager.exe
-3. 目录版请保持 PiManager.exe 与 _internal 文件夹同级，勿拆散
+1. 解压本 zip，得到单个 PiManager.exe（自包含，无需 Python / Node）
+2. 双击 PiManager.exe 即可运行；首次启动需解压到临时目录，稍慢属正常
+3. 可把 PiManager.exe 单独拷贝到任意目录 / U 盘便携使用
 
 可选：安装官方 Pi CLI 以启动完整会话
   npm install -g @earendil-works/pi-coding-agent
 
 自检：
-  PiManager\\PiManager.exe --self-check
+  PiManager.exe --self-check
 """
     elif plat == "macos":
         text = f"""PiManager v{version} (macOS)
@@ -170,19 +170,17 @@ def main() -> int:
     written: list[Path] = []
 
     if plat == "windows":
-        dir_src = dist / "PiManager"
+        # 只产便携版（单文件 onefile）：用户要求不留文件夹版（dir）。
         one_src = dist / "PiManager.exe"
-        if dir_src.is_dir():
-            target = out / f"PiManager-v{version}-windows-x64-dir.zip"
-            zip_dir(dir_src, target, arc_root="PiManager")
-            written.append(target)
-        if one_src.is_file():
-            target = out / f"PiManager-v{version}-windows-x64-onefile.zip"
-            if target.exists():
-                target.unlink()
-            with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                zf.write(one_src, arcname="PiManager.exe")
-            written.append(target)
+        if not one_src.is_file():
+            print("dist/PiManager.exe not found（请先用 PyInstaller PiManagerOneFile.spec 打包）", file=sys.stderr)
+            return 1
+        target = out / f"PiManager-v{version}-windows-x64-onefile.zip"
+        if target.exists():
+            target.unlink()
+        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(one_src, arcname="PiManager.exe")
+        written.append(target)
     elif plat == "macos":
         app = dist / "PiManager.app"
         if not app.is_dir():
