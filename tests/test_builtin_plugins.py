@@ -350,38 +350,6 @@ def test_skill_frontmatter_is_valid(isolated_home):
         assert "description:" in text.split("---")[1]
 
 
-def test_geonode_rotator_ships_without_real_credentials(isolated_home):
-    """geonode-ip-rotator 以占位符发布：脚本/文档不得内置真实代理凭据。
-
-    回归守卫——防止真实 GeoNode 账号（主机 IP / 账号用户名）被重新写回内置
-    资产（公开仓库泄漏面）。check_secrets.py 对该凭据形态漏检，故此处用显式
-    断言兜底。
-    """
-    plugin = next(p for p in bp.list_builtins() if p.name == "geonode-ip-rotator")
-    assert plugin.type == "skill"
-    src_root = Path(__file__).resolve().parent.parent / "assets" / "builtin" / plugin.source
-    # frontmatter 合法（name + description）
-    skill = (src_root / "SKILL.md").read_text(encoding="utf-8")
-    assert skill.startswith("---")
-    assert "name:" in skill.split("---")[1]
-    assert "description:" in skill.split("---")[1]
-    # 曾泄漏的真实凭据 token 必须在全部脚本/文档中消失
-    forbidden = ("92.204.164.15", "EeXfK0xZAE")
-    for rel in (
-        "SKILL.md",
-        "scripts/geonode_ip_rotator.py",
-        "scripts/geonode_proxy_server.py",
-        "scripts/geonode_mcp_server.py",
-    ):
-        text = (src_root / rel).read_text(encoding="utf-8")
-        for token in forbidden:
-            assert token not in text, f"{rel} 残留真实凭据: {token}"
-    # 默认凭据必须是占位符（密码为空、主机为占位符）
-    rotator = (src_root / "scripts" / "geonode_ip_rotator.py").read_text(encoding="utf-8")
-    assert 'DEFAULT_PROXY_PASSWORD = ""' in rotator
-    assert "YOUR_GEONODE_HOST" in rotator
-
-
 def test_install_all_builtins_force_rewrites(isolated_home):
     bp.install_builtin("pi-manager-vision")
     result = bp.install_all_builtins(force=True)
@@ -420,6 +388,87 @@ def test_install_all_builtins_hint_uses_ignore_scripts(isolated_home):
     assert mcp.get("npm_install_required") is True
     assert "--ignore-scripts" in mcp["npm_install_hint"]
     assert mcp["npm_install_args"]
+
+
+# ---- 已下架内置插件清理 ----
+
+
+def test_retired_builtins_includes_geonode_rotator():
+    """回归守卫：geonode-ip-rotator 必须留在下架清单里。
+
+    它曾在 v1.8.5 随发布静默落盘（按 HTTP 402/429 轮换住宅代理出口 IP 以绕过
+    提供商额度/限流强制）。manifest 条目已移除，但用户磁盘上的残留只能靠这份
+    下架清单清掉——一旦这里被删，老用户会永远带着该 skill。
+    """
+    assert "skills/geonode-ip-rotator" in bp._RETIRED_BUILTINS
+
+
+def test_geonode_rotator_is_not_a_builtin_anymore(isolated_home):
+    """回归守卫：该插件不得重新出现在内置清单或内置资产里。"""
+    assert all("geonode" not in p.name for p in bp.list_builtins())
+    assets = (
+        Path(__file__).resolve().parent.parent
+        / "assets" / "builtin" / "skills" / "geonode-ip-rotator"
+    )
+    assert not assets.exists(), f"下架插件资产又出现了: {assets}"
+
+
+def test_cleanup_retired_builtins_removes_stale_dir(isolated_home):
+    stale = core.pi_agent_dir() / "skills" / "geonode-ip-rotator"
+    (stale / "scripts").mkdir(parents=True)
+    (stale / "SKILL.md").write_text("stale", encoding="utf-8")
+    result = bp.cleanup_retired_builtins()
+    assert not stale.exists()
+    entry = next(r for r in result if r["target_dir"] == "skills/geonode-ip-rotator")
+    assert entry["removed"] is True
+
+
+def test_cleanup_retired_builtins_is_idempotent(isolated_home):
+    """残留目录不存在时静默跳过：不报错、不返回条目。"""
+    assert bp.cleanup_retired_builtins() == []
+    assert bp.cleanup_retired_builtins() == []
+
+
+def test_install_all_builtins_cleans_retired_dirs(isolated_home):
+    """安装入口必须顺带清理下架残留——这是升级路径的实际触发点。"""
+    stale = core.pi_agent_dir() / "skills" / "geonode-ip-rotator"
+    stale.mkdir(parents=True)
+    (stale / "SKILL.md").write_text("stale", encoding="utf-8")
+    result = bp.install_all_builtins()
+    assert result["ok"] is True
+    assert not stale.exists()
+    assert any(
+        r["target_dir"] == "skills/geonode-ip-rotator" and r["removed"] is True
+        for r in result["retired_removed"]
+    )
+
+
+def test_cleanup_retired_builtins_refuses_escaping_entry(isolated_home, monkeypatch):
+    """下架清单被篡改成越界路径时只记日志跳过，绝不删 agent 目录之外的东西。"""
+    victim = core.pi_agent_dir().parent.parent / "pwned"
+    victim.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(bp, "_RETIRED_BUILTINS", ("../../pwned",))
+    assert bp.cleanup_retired_builtins() == []
+    assert victim.is_dir()
+
+
+def test_cleanup_retired_builtins_reports_rmtree_failure(isolated_home, monkeypatch):
+    """清理失败必须非致命：返回 removed=False + error，且不拖垮后续安装。"""
+    stale = core.pi_agent_dir() / "skills" / "geonode-ip-rotator"
+    stale.mkdir(parents=True)
+
+    def boom(*args, **kwargs):
+        raise OSError("device busy")
+
+    monkeypatch.setattr(bp.shutil, "rmtree", boom)
+    result = bp.install_all_builtins()
+    assert result["ok"] is True
+    entry = next(
+        r for r in result["retired_removed"]
+        if r["target_dir"] == "skills/geonode-ip-rotator"
+    )
+    assert entry["removed"] is False
+    assert "device busy" in entry["error"]
 
 
 # ---- 状态查询 ----

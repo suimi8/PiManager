@@ -49,6 +49,16 @@ _BUILTIN_ROOT = ("builtin",)
 _MANIFEST_REL = _BUILTIN_ROOT + ("manifest.json",)
 _MAX_FILE_BYTES = 2 * 1024 * 1024  # 单个内置文件上限 2 MiB，防止误打包大文件
 
+# 曾随 PiManager 分发、之后被下架的内置插件目标目录（相对 pi_agent_dir()）。
+# 从 manifest 删条目只代表「不再管理」，用户机器上的文件仍在、pi 会继续加载它，
+# 因此升级路径必须主动清理。只删这里列出的固定目录，绝不做「不在清单里就删」
+# 的清扫——那会删掉用户自己手写的 skill / extension。
+_RETIRED_BUILTINS: tuple[str, ...] = (
+    # v1.8.5 误随发布分发：按 HTTP 402/429 轮换住宅代理出口 IP 以绕过提供商的
+    # 额度/限流强制，违反主流 LLM 提供商服务条款。v1.8.6 移除并清理残留。
+    "skills/geonode-ip-rotator",
+)
+
 
 class BuiltinPluginError(RuntimeError):
     """内置插件安装失败。"""
@@ -80,14 +90,13 @@ def _builtin_assets_dir() -> Path:
     return p
 
 
-def _assert_safe_target_dir(plugin: BuiltinPlugin) -> None:
-    """fail-fast 校验 ``target_dir``：非绝对路径、无 ``..`` 段、解析后在 agent 目录内。
+def _assert_safe_relative_target(label: str, target_dir: str) -> Path:
+    """fail-fast 校验相对目标目录，返回解析后的绝对路径。
 
-    该校验在 ``_load_manifest`` 解析时执行一次（防清单/资产被篡改后任意写删），
-    同时在所有落盘 / 删除（rmtree）/ npm 执行入口重复执行（纵深防御，防止未来
-    新增调用路径绕过）。任何一条不满足即抛 ``BuiltinPluginError``。
+    规则：非绝对路径、无 ``..`` 段、解析后仍在 ``pi_agent_dir()`` 内。供清单插件
+    校验（``_assert_safe_target_dir``）与已下架插件清理（``cleanup_retired_builtins``）
+    共用，保证「写」与「删」两条路径的安全判定完全一致。
     """
-    target_dir = plugin.target_dir
     # 1) 拒绝绝对路径：POSIX 前导 ``/`` 由 ``is_absolute`` 覆盖；Windows 盘符
     #    （``C:/x``、``C:foo``）在 POSIX 上不被识别为绝对路径，需显式正则拒绝；
     #    反斜杠开头（Windows 根路径 ``\evil``）在 POSIX 上同样不被识别，一并拒绝。
@@ -95,24 +104,35 @@ def _assert_safe_target_dir(plugin: BuiltinPlugin) -> None:
         r"^[A-Za-z]:", target_dir
     ):
         raise BuiltinPluginError(
-            f"内置插件 {plugin.name} 目标路径非法（绝对路径）: {target_dir}"
+            f"内置插件 {label} 目标路径非法（绝对路径）: {target_dir}"
         )
     # 2) 拒绝含 ``..`` 段：解析前按 ``/`` 与 ``\`` 统一切分，避免平台分隔符差异
     #    导致 ``..\\evil`` 这类变体漏检。
     segments = [seg for seg in target_dir.replace("\\", "/").split("/") if seg not in ("", ".")]
     if ".." in segments:
         raise BuiltinPluginError(
-            f"内置插件 {plugin.name} 目标路径非法（含 .. 段）: {target_dir}"
+            f"内置插件 {label} 目标路径非法（含 .. 段）: {target_dir}"
         )
     # 3) 二次确认 resolve 后仍在 agent 目录内（防符号链接 / Unicode 规范化逃逸）。
     #    必须先 resolve() 解析 .. 与链接，否则 Path.relative_to 不拒绝 ../../escaped。
     agent_dir = core.pi_agent_dir().resolve()
+    resolved = (core.pi_agent_dir() / target_dir).resolve()
     try:
-        plugin.target_path.resolve().relative_to(agent_dir)
+        resolved.relative_to(agent_dir)
     except ValueError:
         raise BuiltinPluginError(
-            f"内置插件 {plugin.name} 目标路径越界: {target_dir}"
+            f"内置插件 {label} 目标路径越界: {target_dir}"
         ) from None
+    return resolved
+
+
+def _assert_safe_target_dir(plugin: BuiltinPlugin) -> None:
+    """校验清单插件的 ``target_dir``（见 ``_assert_safe_relative_target``）。
+
+    在 ``_load_manifest`` 解析时执行一次（防清单/资产被篡改后任意写删），并在所有
+    落盘 / 删除（rmtree）/ npm 执行入口重复执行，防止未来新增调用路径绕过。
+    """
+    _assert_safe_relative_target(plugin.name, plugin.target_dir)
 
 
 def _load_manifest() -> list[BuiltinPlugin]:
@@ -281,6 +301,36 @@ def install_builtin(name: str, force: bool = False) -> dict[str, Any]:
     raise BuiltinPluginError(f"未知的内置插件: {name}")
 
 
+def cleanup_retired_builtins() -> list[dict[str, Any]]:
+    """删除 ``_RETIRED_BUILTINS`` 在 ``pi_agent_dir()`` 下的残留目录。
+
+    幂等：目录不存在则跳过。删除前复用与落盘同一套安全校验，越界目录只记日志
+    并跳过（绝不删 agent 目录之外的任何路径）。单个目录删除失败不影响其它项，
+    也不影响后续安装。返回每个实际处理项的结果，供调用方上屏 / 记录。
+    """
+    results: list[dict[str, Any]] = []
+    for target_dir in _RETIRED_BUILTINS:
+        try:
+            path = _assert_safe_relative_target(f"(已下架){target_dir}", target_dir)
+        except BuiltinPluginError as exc:
+            logger.warning("跳过非法的已下架插件目录 %s：%s", target_dir, exc)
+            continue
+        if not path.is_dir():
+            continue
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            logger.warning("清理已下架内置插件失败 %s：%s", target_dir, exc)
+            results.append(
+                {"target_dir": target_dir, "path": str(path), "removed": False,
+                 "error": str(exc)}
+            )
+            continue
+        logger.info("已清理下架内置插件：%s", target_dir)
+        results.append({"target_dir": target_dir, "path": str(path), "removed": True})
+    return results
+
+
 def install_all_builtins(force: bool = False, include_disabled: bool = False) -> dict[str, Any]:
     """安装清单中的内置插件。
 
@@ -291,6 +341,9 @@ def install_all_builtins(force: bool = False, include_disabled: bool = False) ->
     ``include_disabled=True`` 时连同 ``enabled_by_default=false`` 的插件一起装。
     默认幂等：内容未变则跳过。
     """
+    # 升级路径：先清理已下架内置插件的磁盘残留（从清单删条目不会删用户机器上
+    # 的文件，pi 会继续加载），再安装当前清单。
+    retired_removed = cleanup_retired_builtins()
     results: list[dict[str, Any]] = []
     for plugin in _load_manifest():
         if not include_disabled and not plugin.enabled_by_default:
@@ -319,6 +372,7 @@ def install_all_builtins(force: bool = False, include_disabled: bool = False) ->
         "ok": all(r.get("ok") for r in results),
         "installed": results,
         "total": len(results),
+        "retired_removed": retired_removed,
     }
 
 

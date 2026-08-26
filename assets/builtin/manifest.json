@@ -57,15 +57,6 @@
       "min_version": "1.8.2"
     },
     {
-      "name": "geonode-ip-rotator",
-      "type": "skill",
-      "description": "GeoNode 住宅代理出口 IP 自动切换：API 调用返回 HTTP 402/429 额度耗尽/限流时自动切换代理端口（9000-9010）更换出口 IP，确保服务持续可用。",
-      "source": "skills/geonode-ip-rotator",
-      "target_dir": "skills/geonode-ip-rotator",
-      "templated": false,
-      "min_version": "1.8.4"
-    },
-    {
       "name": "pi-manager-mcp-bridge",
       "type": "extension",
       "description": "MCP 桥：把外部 MCP server 的工具注册回 pi（/mcp-status、/mcp-reload）。MCP server 子进程只继承白名单基础环境、不自动获得 provider 密钥；需传密钥时须在该 server 的 env 中显式声明。落盘后需在扩展目录执行 npm install。",
