@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import json
 import zipfile
 from pathlib import Path
@@ -230,6 +231,43 @@ def test_validation_accepts_quoted_and_extra_frontmatter_fields(isolated_home, t
     result = manager.inspect_plugin(str(source))
 
     assert result["ok"] is True
+
+
+def test_validation_accepts_bom_prefixed_skill_frontmatter(isolated_home, tmp_path):
+    """带 UTF-8 BOM 的 SKILL.md 必须放行：pi 能正常加载，PiManager 不应拒收。
+
+    回归守卫——曾因 lines[0] != "---" 的严格比对，把 BOM 留下的 U+FEFF 首字符
+    误判为「缺少 frontmatter 起始标记」。
+    """
+    source = _make_plugin(tmp_path, plugin_id="bom-skill")
+    skill = source / "skills" / "demo" / "SKILL.md"
+    skill.write_text(
+        """---
+name: demo
+description: demo skill
+---
+
+# Demo
+""",
+        encoding="utf-8-sig",
+    )
+    assert skill.read_bytes().startswith(codecs.BOM_UTF8)
+
+    result = manager.inspect_plugin(str(source))
+
+    assert result["ok"] is True, result.get("error")
+
+
+def test_validation_accepts_bom_prefixed_package_json(isolated_home, tmp_path):
+    """带 UTF-8 BOM 的 package.json 必须能解析（U+FEFF 不是合法 JSON 起始）。"""
+    source = _make_plugin(tmp_path, plugin_id="bom-manifest")
+    pkg = source / "package.json"
+    pkg.write_text(pkg.read_text(encoding="utf-8"), encoding="utf-8-sig")
+    assert pkg.read_bytes().startswith(codecs.BOM_UTF8)
+
+    result = manager.inspect_plugin(str(source))
+
+    assert result["ok"] is True, result.get("error")
 
 
 def test_duplicate_version_is_not_overwritten(isolated_home, tmp_path):

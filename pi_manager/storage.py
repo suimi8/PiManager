@@ -201,7 +201,9 @@ def _read_result_unlocked(path: Path, default: Any) -> LoadResult:
             "unsupported", deepcopy(default), "配置路径不是普通文件", source_path=path
         )
     try:
-        with path.open("r", encoding="utf-8") as handle:
+        # utf-8-sig：用户手工编辑（记事本 / PowerShell）可能带 BOM，而 U+FEFF 不是
+        # 合法 JSON 起始，否则整份配置会被误判为 corrupt 并拒绝写入。
+        with path.open("r", encoding="utf-8-sig") as handle:
             return LoadResult("ok", json.load(handle), source_path=path)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         return LoadResult("corrupt", deepcopy(default), str(exc), source_path=path)

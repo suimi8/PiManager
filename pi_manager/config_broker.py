@@ -358,7 +358,8 @@ def mutate_file(path: str | Path) -> dict[str, Any]:
     if not source.exists() or not source.is_file() or source.stat().st_size > 64 * 1024:
         return {"ok": False, "error": "invalid_request_file"}
     try:
-        payload = json.loads(source.read_text(encoding="utf-8"))
+        # utf-8-sig：请求文件可能由外部工具生成（PowerShell Out-File 默认带 BOM）
+        payload = json.loads(source.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         return {"ok": False, "error": f"invalid_request: {exc}"}
     if not isinstance(payload, dict):

@@ -462,7 +462,10 @@ def _resource_values(manifest: dict[str, Any]) -> dict[str, list[str]]:
 def _validate_frontmatter(path: Path) -> None:
     raw = _read_limited(path, MAX_SKILL_FRONTMATTER_BYTES)
     try:
-        text = raw.decode("utf-8")
+        # utf-8-sig：BOM 本身是合法 UTF-8，decode 不会报错但会留下 U+FEFF 首字符，
+        # 令下方 lines[0] != "---" 误判「缺少 frontmatter」——而 pi 能正常加载该文件。
+        # Windows 上记事本 / PowerShell 5.1 Out-File 默认写 BOM，属常见输入。
+        text = raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise PluginValidationError(f"SKILL.md 不是 UTF-8：{path}") from exc
     lines = text.splitlines()
@@ -598,7 +601,8 @@ def _manifest_from_root(root: Path) -> dict[str, Any]:
         raise PluginValidationError("插件根目录必须包含普通文件 package.json")
     raw = _read_limited(manifest_path, MAX_MANIFEST_BYTES)
     try:
-        manifest = json.loads(raw.decode("utf-8"))
+        # utf-8-sig：U+FEFF 不是合法 JSON 起始，带 BOM 的 package.json 会解析失败
+        manifest = json.loads(raw.decode("utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PluginValidationError(f"package.json 解析失败：{exc}") from exc
     if not isinstance(manifest, dict):

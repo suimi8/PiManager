@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import json
 import logging
 import os
@@ -38,6 +39,34 @@ def test_corrupt_json_is_explicit_and_cannot_be_overwritten(tmp_path):
     with pytest.raises(storage.CorruptJsonError):
         storage.save_json(path, {"replacement": True})
     assert path.read_text(encoding="utf-8") == '{"truncated":'
+
+
+def test_bom_prefixed_json_is_read_not_treated_as_corrupt(tmp_path):
+    """带 UTF-8 BOM 的配置不得被误判 corrupt（Windows 手工编辑很常见）。
+
+    BOM 本身是合法 UTF-8，decode 不会报错，但会留下 U+FEFF 首字符，而它不是
+    合法 JSON 起始。若按 utf-8 严格解码，用户用记事本 / PowerShell 编辑过的
+    settings.json 会整份被拒、且拒绝写入。
+    """
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"version": 7}), encoding="utf-8-sig")
+    assert path.read_bytes().startswith(codecs.BOM_UTF8)  # 确认 fixture 真带 BOM
+
+    result = storage.load_json_result(path, {})
+    assert result.status == "ok"
+    assert result.data == {"version": 7}
+    assert storage.load_json(path, {}) == {"version": 7}
+
+
+def test_bom_is_tolerated_on_read_but_not_propagated_on_write(tmp_path):
+    """容忍读入 BOM，但写回必须是无 BOM 的干净 UTF-8，不把 BOM 传播下去。"""
+    path = tmp_path / "models.json"
+    path.write_text(json.dumps({"a": 1}), encoding="utf-8-sig")
+
+    storage.save_json(path, {"a": 2})
+
+    assert not path.read_bytes().startswith(codecs.BOM_UTF8)
+    assert storage.load_json(path, {}) == {"a": 2}
 
 
 def test_json_writes_keep_two_valid_backups(tmp_path):

@@ -535,7 +535,7 @@ def _parse_bundle_json(files: dict[str, bytes], name: str) -> dict[str, Any] | N
     if name not in files:
         return None
     try:
-        value = json.loads(files[name].decode("utf-8"))
+        value = json.loads(files[name].decode("utf-8-sig"))
     except Exception as exc:
         raise ValueError(f"{name} 不是有效 UTF-8 JSON") from exc
     if not isinstance(value, dict):
@@ -859,7 +859,9 @@ def run_self_check() -> list[dict[str, Any]]:
         if store_path.exists():
             count = ""
             try:
-                store_data = json.loads(store_path.read_text(encoding="utf-8"))
+                store_data = json.loads(
+                    store_path.read_text(encoding="utf-8-sig")
+                )
                 if isinstance(store_data, dict):
                     count = f"（{len(store_data.get('providers') or {})} 个 provider）"
             except Exception:
@@ -880,7 +882,7 @@ def run_self_check() -> list[dict[str, Any]]:
     try:
         trust_path = core.pi_agent_dir() / "trust.json"
         if trust_path.exists():
-            trust_data = json.loads(trust_path.read_text(encoding="utf-8"))
+            trust_data = json.loads(trust_path.read_text(encoding="utf-8-sig"))
             entries = "；".join(f"{k} → {v}" for k, v in trust_data.items()) or "空"
             add("项目信任", True, f"Pi 信任列表：{entries[:120]}")
         else:
