@@ -350,6 +350,38 @@ def test_skill_frontmatter_is_valid(isolated_home):
         assert "description:" in text.split("---")[1]
 
 
+def test_geonode_rotator_ships_without_real_credentials(isolated_home):
+    """geonode-ip-rotator 以占位符发布：脚本/文档不得内置真实代理凭据。
+
+    回归守卫——防止真实 GeoNode 账号（主机 IP / 账号用户名）被重新写回内置
+    资产（公开仓库泄漏面）。check_secrets.py 对该凭据形态漏检，故此处用显式
+    断言兜底。
+    """
+    plugin = next(p for p in bp.list_builtins() if p.name == "geonode-ip-rotator")
+    assert plugin.type == "skill"
+    src_root = Path(__file__).resolve().parent.parent / "assets" / "builtin" / plugin.source
+    # frontmatter 合法（name + description）
+    skill = (src_root / "SKILL.md").read_text(encoding="utf-8")
+    assert skill.startswith("---")
+    assert "name:" in skill.split("---")[1]
+    assert "description:" in skill.split("---")[1]
+    # 曾泄漏的真实凭据 token 必须在全部脚本/文档中消失
+    forbidden = ("92.204.164.15", "EeXfK0xZAE")
+    for rel in (
+        "SKILL.md",
+        "scripts/geonode_ip_rotator.py",
+        "scripts/geonode_proxy_server.py",
+        "scripts/geonode_mcp_server.py",
+    ):
+        text = (src_root / rel).read_text(encoding="utf-8")
+        for token in forbidden:
+            assert token not in text, f"{rel} 残留真实凭据: {token}"
+    # 默认凭据必须是占位符（密码为空、主机为占位符）
+    rotator = (src_root / "scripts" / "geonode_ip_rotator.py").read_text(encoding="utf-8")
+    assert 'DEFAULT_PROXY_PASSWORD = ""' in rotator
+    assert "YOUR_GEONODE_HOST" in rotator
+
+
 def test_install_all_builtins_force_rewrites(isolated_home):
     bp.install_builtin("pi-manager-vision")
     result = bp.install_all_builtins(force=True)
