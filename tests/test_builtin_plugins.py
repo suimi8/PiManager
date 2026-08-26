@@ -20,6 +20,7 @@ import pytest
 
 from pi_manager import builtin_plugins as bp
 from pi_manager import core
+from pi_manager import storage
 
 
 # ---- 测试辅助 ----
@@ -421,6 +422,54 @@ def test_cleanup_retired_builtins_removes_stale_dir(isolated_home):
     assert not stale.exists()
     entry = next(r for r in result if r["target_dir"] == "skills/geonode-ip-rotator")
     assert entry["removed"] is True
+
+
+def test_cleanup_retired_builtins_removes_orphan_lock_sidecar(isolated_home):
+    """目录已不存在、只剩 storage.locked 边车锁时也要回收。
+
+    这是真实机器上观察到的形态：插件目录被删后，安装锁的边车文件仍留在
+    skills/ 下（storage.locked 有意不回收锁）。文件名在此硬编码，与
+    storage.lock_sidecar_path 的推导互为校验——两者不一致即说明命名约定漂移。
+    """
+    skills = core.pi_agent_dir() / "skills"
+    skills.mkdir(parents=True, exist_ok=True)
+    lock = skills / "..geonode-ip-rotator.install.lock.lock"
+    lock.write_bytes(b"x")
+    result = bp.cleanup_retired_builtins()
+    assert not lock.exists(), "孤儿边车锁未被回收"
+    entry = next(r for r in result if r["target_dir"] == "skills/geonode-ip-rotator")
+    assert entry["removed"] is False  # 目录本来就不存在
+    assert entry["lock_removed"] is True
+
+
+def test_cleanup_retired_builtins_removes_dir_and_lock_together(isolated_home):
+    """目录与边车锁同时存在时，两者都回收。"""
+    skills = core.pi_agent_dir() / "skills"
+    stale = skills / "geonode-ip-rotator"
+    stale.mkdir(parents=True)
+    (stale / "SKILL.md").write_text("stale", encoding="utf-8")
+    lock = skills / "..geonode-ip-rotator.install.lock.lock"
+    lock.write_bytes(b"x")
+    entry = next(
+        r for r in bp.cleanup_retired_builtins()
+        if r["target_dir"] == "skills/geonode-ip-rotator"
+    )
+    assert entry["removed"] is True
+    assert entry["lock_removed"] is True
+    assert not stale.exists() and not lock.exists()
+
+
+def test_lock_sidecar_path_is_not_reclaimed_by_normal_locking(isolated_home, tmp_path):
+    """storage.locked 正常路径**不得**删除边车锁：删掉会破坏跨进程互斥。
+
+    这是有意行为的守卫——曾误判为「锁文件不回收」的 bug；实际回收它会让
+    等待中的进程与新建锁文件的进程同时持锁。
+    """
+    target = tmp_path / "some-config.json"
+    sidecar = storage.lock_sidecar_path(target)
+    with storage.locked(target):
+        pass
+    assert sidecar.is_file(), "边车锁应保留供复用（数量按被保护路径收敛）"
 
 
 def test_cleanup_retired_builtins_is_idempotent(isolated_home):

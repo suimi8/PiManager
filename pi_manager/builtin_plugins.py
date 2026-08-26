@@ -302,7 +302,7 @@ def install_builtin(name: str, force: bool = False) -> dict[str, Any]:
 
 
 def cleanup_retired_builtins() -> list[dict[str, Any]]:
-    """删除 ``_RETIRED_BUILTINS`` 在 ``pi_agent_dir()`` 下的残留目录。
+    """删除 ``_RETIRED_BUILTINS`` 在 ``pi_agent_dir()`` 下的残留目录与安装锁。
 
     幂等：目录不存在则跳过。删除前复用与落盘同一套安全校验，越界目录只记日志
     并跳过（绝不删 agent 目录之外的任何路径）。单个目录删除失败不影响其它项，
@@ -315,19 +315,32 @@ def cleanup_retired_builtins() -> list[dict[str, Any]]:
         except BuiltinPluginError as exc:
             logger.warning("跳过非法的已下架插件目录 %s：%s", target_dir, exc)
             continue
-        if not path.is_dir():
+        # 安装锁的边车文件：_install_one 用 .<name>.install.lock 作名义路径，
+        # storage.locked 再据此建真实边车。下架插件永不再安装，该路径不可能再有
+        # 持有者，是唯一可安全回收锁文件的场景（见 storage.lock_sidecar_path）。
+        lock = storage.lock_sidecar_path(path.parent / f".{path.name}.install.lock")
+        if not path.is_dir() and not lock.is_file():
             continue
-        try:
-            shutil.rmtree(path)
-        except OSError as exc:
-            logger.warning("清理已下架内置插件失败 %s：%s", target_dir, exc)
-            results.append(
-                {"target_dir": target_dir, "path": str(path), "removed": False,
-                 "error": str(exc)}
-            )
-            continue
-        logger.info("已清理下架内置插件：%s", target_dir)
-        results.append({"target_dir": target_dir, "path": str(path), "removed": True})
+        entry: dict[str, Any] = {
+            "target_dir": target_dir, "path": str(path),
+            "removed": False, "lock_removed": False,
+        }
+        if path.is_dir():
+            try:
+                shutil.rmtree(path)
+                entry["removed"] = True
+                logger.info("已清理下架内置插件：%s", target_dir)
+            except OSError as exc:
+                entry["error"] = str(exc)
+                logger.warning("清理已下架内置插件失败 %s：%s", target_dir, exc)
+        if lock.is_file():
+            try:
+                lock.unlink()
+                entry["lock_removed"] = True
+            except OSError as exc:
+                entry.setdefault("error", str(exc))
+                logger.warning("清理已下架插件锁文件失败 %s：%s", lock.name, exc)
+        results.append(entry)
     return results
 
 

@@ -121,6 +121,19 @@ def _open_lock_file_win32(path: Path):
         return path.open("a+b")
 
 
+def lock_sidecar_path(path: Path) -> Path:
+    """返回 ``locked(path)`` 实际创建的边车锁文件路径（命名约定的单一来源）。
+
+    边车锁**有意**长期留在磁盘上：它会被后续加锁复用，数量按「被保护路径」收敛
+    （不随操作次数增长）。切勿在释放后顺手删除——POSIX 上删掉仍被其它进程
+    ``flock`` 等待/持有的 inode，会让该进程与随后新建锁文件的进程同时「持锁」，
+    直接破坏互斥；Windows 上则会在有竞争时删除失败。只有确定某路径永不再被
+    加锁（例如已下架插件的安装锁）时，才可以安全回收。
+    """
+    path = Path(path)
+    return path.with_name(f".{path.name}.lock")
+
+
 @contextmanager
 def locked(path: Path) -> Iterator[None]:
     """Hold a per-path thread lock and a best-effort inter-process lock."""
@@ -128,7 +141,7 @@ def locked(path: Path) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     thread_lock = _thread_lock(path)
     with thread_lock:
-        lock_path = path.with_name(f".{path.name}.lock")
+        lock_path = lock_sidecar_path(path)
         try:
             if os.name == "nt":
                 lock_file = _open_lock_file_win32(lock_path)
