@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -52,10 +53,11 @@ def test_desktop_release_defaults_are_resolved_from_repository_root(
 ):
     repository = tmp_path / "repository"
     external_cwd = tmp_path / "external"
-    source = repository / "dist" / "PiManager"
-    source.mkdir(parents=True)
+    dist = repository / "dist"
+    dist.mkdir(parents=True)
     external_cwd.mkdir()
-    (source / "PiManager.exe").write_bytes(b"desktop-package")
+    # Windows 只发布便携单文件版：PyInstaller 的产物就是 dist/PiManager.exe 本身。
+    (dist / "PiManager.exe").write_bytes(b"desktop-package")
 
     monkeypatch.setattr(package_release, "REPO_ROOT", repository)
     monkeypatch.chdir(external_cwd)
@@ -66,13 +68,35 @@ def test_desktop_release_defaults_are_resolved_from_repository_root(
     )
 
     assert package_release.main() == 0
-    assert (
-        repository
-        / "release-assets"
-        / "PiManager-v9.8.7-windows-x64-dir.zip"
-    ).is_file()
+    archive = (
+        repository / "release-assets" / "PiManager-v9.8.7-windows-x64-onefile.zip"
+    )
+    assert archive.is_file()
+    # 解压即得单个自包含 exe（归档根目录不留 PiManager/ 子目录）。
+    with zipfile.ZipFile(archive) as zf:
+        assert zf.namelist() == ["PiManager.exe"]
+        assert zf.read("PiManager.exe") == b"desktop-package"
     assert (repository / "release-assets" / "RUN-windows.txt").is_file()
     assert not (external_cwd / "release-assets").exists()
+
+
+def test_desktop_release_windows_rejects_legacy_directory_layout(monkeypatch, tmp_path):
+    repository = tmp_path / "repository"
+    # 旧的目录版布局（dist/PiManager/PiManager.exe）已不是合法的 Windows 产物，
+    # 必须干净失败而不是打出一个空归档。
+    legacy = repository / "dist" / "PiManager"
+    legacy.mkdir(parents=True)
+    (legacy / "PiManager.exe").write_bytes(b"legacy-dir-package")
+
+    monkeypatch.setattr(package_release, "REPO_ROOT", repository)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["package_release.py", "--platform", "windows", "--version", "9.8.7"],
+    )
+
+    assert package_release.main() == 1
+    assert not list((repository / "release-assets").glob("*.zip"))
 
 
 def test_successful_package_atomically_replaces_existing_target(monkeypatch, tmp_path):
