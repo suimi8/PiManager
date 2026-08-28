@@ -727,7 +727,7 @@ def test_google_model_fetch_uses_real_key_but_redacts_result_endpoint(monkeypatc
     assert "google-real-secret" not in json.dumps(result)
 
 
-def test_google_model_fetch_redacts_endpoint_on_http_error(monkeypatch):
+def test_google_model_fetch_redacts_endpoint_on_http_error(monkeypatch, isolated_home):
     class Opener:
         def open(self, request, timeout):
             raise urllib.error.HTTPError(
