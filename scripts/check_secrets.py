@@ -97,6 +97,10 @@ _INNOCENT_TOKEN_PARTS = (
     # sk-first-secret 挡住了）：tests/test_provider_auth.py:809 的 integration
     # 用例断言 `Bearer real-integration-secret`，是断言用的固定字符串。
     "integration-secret",
+    # .diffharness/diff_harness.py 的请求头测试夹具与
+    # extensions/pi-cursor/test/hardening.test.js 的脱敏断言各含一个 mock
+    # Bearer 值，均为固定测试字符串（硬编码无真实密钥）。
+    "lowercase-header", "sk-live-1234567890",
 )
 
 # 跳过内容检查的文件（构建产物、文档截图占位等）
