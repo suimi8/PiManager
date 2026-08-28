@@ -145,7 +145,11 @@ jobs:
           set -e
           if [ $code -ne 0 ]; then
             echo "::error file=npm.log::npm test failed with exit $code"
-            grep -n "" _npm.log | head -n 220 | sed 's/^/::error file=npm.log::/'
+            grep -n "not ok" _npm.log | head -n 2 | cut -d: -f1 | while read ln; do
+              start=$((ln-14)); [ $start -lt 1 ] && start=1
+              end=$((ln+10))
+              sed -n "${start},${end}p" _npm.log | sed 's/^/::error file=npm.log::/'
+            done
             exit $code
           fi
 
