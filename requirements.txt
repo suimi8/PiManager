@@ -6,7 +6,7 @@
 # 运行时依赖，放在这里曾让 README/BUILD.md 写出 `-r requirements.txt pyinstaller`
 # 这种「已 pin 又追加无约束版本」的冗余命令。
 PySide6==6.11.1
-PyYAML==6.0.2
+PyYAML==6.0.3
 certifi==2026.7.22
 keyring==25.7.0
 cryptography==50.0.0
