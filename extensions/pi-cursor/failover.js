@@ -67,14 +67,14 @@ function failureCounts(manager) {
 // （config_broker.py:increment_failure_count），整段跑在 storage.locked 的
 // **跨进程**锁里，因此对「桌面端 + 扩展同时在写 pi-manager.json」是真正原子的。
 //
-// 由此删掉了扩展侧的「写后回读校验重试」：那段代码只能在**自己的**增量被吞掉
-// 时补写一次，既不是原子性，也无法阻止两侧交错时的丢失更新（R2 扩展审计
-// C-1 / D2）。原子操作到位后重试不再有意义，反而会在 broker 已经成功递增的
-// 情况下再加一次。
-//
 // `incrementFailureCount` 缺席（旧版桌面端不认识这个 operation，或调用失败）
-// 时退回一次性的读-改-写：功能可用性优先，但**不再重试** —— 退化路径只求尽力，
-// 不再假装自己提供了原子性。
+// 时退回读-改-写兼容路径。该路径虽无法与原子操作竞争，也必须做「写后回读
+// 校验 + 有限重试」：并发写入者可能基于陈旧读覆盖写出，把本次自增整个吞掉
+// （R2 扩展审计 C-1 / D2）。吞掉 = 故障计数不递增 = 故障 Key 不会触发轮换，
+// 这会放任一把坏 Key 反复失败。校验不过就在最新值上重算并重试，最多
+// COMPAT_WRITE_ATTEMPTS 次；仍失败则返回最后一次写入值，尽力而为。
+const COMPAT_WRITE_ATTEMPTS = 3;
+
 async function updateFailureCount(
   readManager,
   writeManager,
@@ -93,16 +93,27 @@ async function updateFailureCount(
       // 落到下面的兼容路径（例如 helper 返回 operation_not_allowed）。
     }
   }
-  const manager = (await readManager()) || {};
-  const counts = failureCounts(manager);
-  if (succeeded) {
-    if (!Object.prototype.hasOwnProperty.call(counts, key)) return 0;
-    counts[key] = 0;
-  } else {
-    counts[key] = Number(counts[key] || 0) + 1;
+  let expected;
+  let attempted = 0;
+  for (;;) {
+    const manager = (await readManager()) || {};
+    const counts = failureCounts(manager);
+    if (succeeded) {
+      if (!Object.prototype.hasOwnProperty.call(counts, key)) return 0;
+      counts[key] = 0;
+    } else {
+      counts[key] = Number(counts[key] || 0) + 1;
+    }
+    expected = counts[key];
+    await writeManager({ ...manager, failover_fail_counts: counts });
+    // 写后回读校验：并发写入者若吞掉了本次增量，记录不会包含期望值，
+    // 需要基于最新值重算重试；读到 =/> 期望值说明自增已生效。
+    const latest = (await readManager()) || {};
+    if (Number(failureCounts(latest)[key]) >= Number(expected)) break;
+    attempted += 1;
+    if (attempted >= COMPAT_WRITE_ATTEMPTS) break;
   }
-  await writeManager({ ...manager, failover_fail_counts: counts });
-  return counts[key];
+  return expected;
 }
 
 async function currentFailureCount(readManager, provider, model) {

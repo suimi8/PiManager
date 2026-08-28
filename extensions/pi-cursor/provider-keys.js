@@ -17,12 +17,21 @@
 // 拒绝 = 该 Key 不被标记 = 不轮换，所以这里必须先于 helper 收敛。
 const REASON_MAX_BYTES = 64 * 1024;
 
+// 分类信号的最大字符数：超长错误消息（例如嵌套堆栈）会把末尾的状态码
+// （HTTP 401 / 429）挤出分类窗口，导致轮换决策看不到真正的原因
+// （R2 审查 P2-3 / D1）。取头尾各半，保证尾部标志位保留。
+const CLASSIFICATION_MAX_CHARS = 400;
+
 function classificationSignal(result) {
   const source = result || {};
-  return (
+  const text =
     String(source.error || source.stderr || "").trim() ||
-    `exit ${String(source.returncode === undefined || source.returncode === null ? "" : source.returncode)}`
-  );
+    `exit ${String(source.returncode === undefined || source.returncode === null ? "" : source.returncode)}`;
+  if (text.length > CLASSIFICATION_MAX_CHARS) {
+    const half = CLASSIFICATION_MAX_CHARS >> 1;
+    return text.slice(0, half) + text.slice(-half);
+  }
+  return text;
 }
 
 // 按 UTF-8 **字节**裁剪并保留尾部（标志位在尾部）。按 JS 字符裁剪是不够的：

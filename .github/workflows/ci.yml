@@ -60,6 +60,7 @@ jobs:
       env:
         QT_QPA_PLATFORM: offscreen
         DISPLAY: :99
+      shell: bash
       run: |
         sudo apt-get update && sudo apt-get install -y \
           xvfb \
@@ -85,12 +86,29 @@ jobs:
           libxdamage1 \
           libxrandr2 \
           libxi6
-        xvfb-run -a python -m pytest tests -q --timeout=300 --timeout-method=thread --cov=pi_manager --cov-report=term-missing --cov-fail-under=55
+        xvfb-run -a python -m pytest tests -q --tb=line --timeout=300 --timeout-method=thread --cov=pi_manager --cov-report=term-missing --cov-fail-under=55 | tee _pytest.log
+        code=${PIPESTATUS[0]}
+        if [ $code -ne 0 ]; then
+          echo "::error::pytest failed with exit $code"
+          grep -E "^(FAILED|ERROR)" _pytest.log | head -n 20 | sed 's/^/::error::/'
+          echo "::error::---- tail ----"
+          tail -n 30 _pytest.log | sed 's/^/::error::/'
+          exit $code
+        fi
 
     - name: Run tests (Windows/macOS)
       if: runner.os != 'Linux'
+      shell: bash
       run: |
-        python -m pytest tests -q --timeout=300 --timeout-method=thread --cov=pi_manager --cov-report=term-missing --cov-fail-under=55
+        python -m pytest tests -q --tb=line --timeout=300 --timeout-method=thread --cov=pi_manager --cov-report=term-missing --cov-fail-under=55 | tee _pytest.log
+        code=${PIPESTATUS[0]}
+        if [ $code -ne 0 ]; then
+          echo "::error::pytest failed with exit $code"
+          grep -E "^(FAILED|ERROR)" _pytest.log | head -n 20 | sed 's/^/::error::/'
+          echo "::error::---- tail ----"
+          tail -n 30 _pytest.log | sed 's/^/::error::/'
+          exit $code
+        fi
 
     - name: Self-check
       run: |
