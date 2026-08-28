@@ -20,7 +20,7 @@ from . import core
 from . import secrets as secretstore
 from . import storage
 
-APP_VERSION = "1.8.6"
+APP_VERSION = "1.8.7"
 APP_NAME = "Pi Manager"
 # Optional remote version manifest (JSON: {"version":"x.y.z","notes":"...","url":"..."})
 # 未配置时自动回退 GitHub Releases API
@@ -1939,12 +1939,28 @@ def _chat_attempt(
     hot-switch models via set_model; when `pi --mode rpc` is unusable the
     session layer disables itself for the rest of the run and every attempt
     falls back to the classic one-shot `pi -p` path.
+
+    上游 5xx / ``upstream_overloaded`` 会在同一模型上短暂重试，避免 Grokified
+    这类中转把瞬时过载误报成「无法对话」。
     """
     from . import rpc_session
+    from .core_http import is_transient_upstream_error, transient_retry_delay
 
-    apply_proxy_env()
-    if rpc_session.rpc_chat_enabled():
-        result = rpc_session.rpc_chat_once(
+    def _once() -> dict[str, Any]:
+        apply_proxy_env()
+        if rpc_session.rpc_chat_enabled():
+            result = rpc_session.rpc_chat_once(
+                prompt,
+                provider=provider,
+                model=model,
+                workdir=workdir,
+                timeout=timeout,
+                thinking=thinking,
+            )
+            if result.get("ok") or rpc_session.rpc_chat_enabled():
+                return result
+            # rpc became unavailable during this attempt — retry one-shot
+        return chat_once(
             prompt,
             provider=provider,
             model=model,
@@ -1952,17 +1968,20 @@ def _chat_attempt(
             timeout=timeout,
             thinking=thinking,
         )
-        if result.get("ok") or rpc_session.rpc_chat_enabled():
-            return result
-        # rpc became unavailable during this attempt — retry one-shot
-    return chat_once(
-        prompt,
-        provider=provider,
-        model=model,
-        workdir=workdir,
-        timeout=timeout,
-        thinking=thinking,
-    )
+
+    last = _once()
+    max_attempts = core.TRANSIENT_HTTP_MAX_ATTEMPTS
+    for attempt in range(max_attempts - 1):
+        if last.get("ok"):
+            return last
+        blob = "\n".join(
+            str(last.get(key) or "") for key in ("error", "stderr", "stdout")
+        )
+        if not is_transient_upstream_error(blob):
+            return last
+        core.sleep_transient_retry(transient_retry_delay(attempt))
+        last = _once()
+    return last
 
 
 def chat_with_failover(

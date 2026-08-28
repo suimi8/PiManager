@@ -34,11 +34,18 @@ from . import storage
 # ruff 的 F401 已通过 pyproject.toml 的 per-file-ignores 为本文件豁免。
 # HTTP 工具函数已抽到 core_http，此处重新导出以保持 core.xxx 调用兼容。
 from .core_http import (
+    TRANSIENT_HTTP_MAX_ATTEMPTS,
+    TRANSIENT_HTTP_STATUSES,
     _friendly_fetch_error,
     _ssl_context,
+    is_transient_http_status,
+    is_transient_upstream_error,
     normalize_openai_base_url,
+    parse_retry_after_seconds,
     redact_endpoint_url,
     redact_secret_values,
+    sleep_transient_retry,
+    transient_retry_delay,
 )
 # 视觉识图管道已抽到 core_vision，此处重新导出以保持 core.xxx 调用兼容。
 from .core_vision import (
@@ -515,9 +522,9 @@ def _restore_latest_config_backup(target_path: Path) -> dict[str, Any] | None:
 
 
 _MODELS_MIGRATION_LOCK = threading.Lock()
-# 最近一次跑完三轮迁移时 models.json 的 (mtime_ns, size) 签名。
-# 迁移逻辑是幂等的，但每次 load_models_config() 都重跑三轮全量扫描
-# （密钥迁移 / User-Agent 头 / thinkingLevelMap）纯属浪费 —— 而它是热路径
+# 最近一次跑完格式迁移时 models.json 的 (mtime_ns, size) 签名。
+# 迁移逻辑是幂等的，但每次 load_models_config() 都重跑全量扫描
+# （密钥迁移 / User-Agent 头 / 模型缺省字段 / thinkingLevelMap）纯属浪费 —— 而它是热路径
 # （get_provider_config → provider_runtime_credential / test_model 每次都调）。
 # 用文件签名而不是「一次性布尔」做门槛：另一个进程（pi CLI、helper、配置导入）
 # 写过盘后签名会变，迁移仍会重新执行，不会漏掉外部写入的旧格式配置。
@@ -607,6 +614,46 @@ def _migrate_models_headers(cfg: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     return result, True
 
 
+def _migrate_models_defaults(cfg: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """给手填的不完整模型补上与「添加模型」相同的缺省字段。
+
+    只写 ``{"id": "grok-4.5", "name": "grok-4.5"}`` 时，官方 Pi 缺少
+    ``reasoning`` / ``contextWindow`` / ``thinkingLevelMap``，表现为能保存但无法对话。
+    """
+    providers = cfg.get("providers")
+    if not isinstance(providers, dict):
+        return cfg, False
+    updated_providers = dict(providers)
+    changed = False
+    for name, entry in providers.items():
+        if not isinstance(entry, dict):
+            continue
+        models = entry.get("models")
+        if not isinstance(models, list):
+            continue
+        new_models: list[Any] = []
+        any_changed = False
+        for m in models:
+            if not isinstance(m, dict):
+                new_models.append(m)
+                continue
+            migrated = fill_model_defaults(m)
+            if migrated is not m:
+                any_changed = True
+            new_models.append(migrated)
+        if not any_changed:
+            continue
+        updated_entry = dict(entry)
+        updated_entry["models"] = new_models
+        updated_providers[name] = updated_entry
+        changed = True
+    if not changed:
+        return cfg, False
+    result = dict(cfg)
+    result["providers"] = updated_providers
+    return result, True
+
+
 def _migrate_models_thinking(cfg: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     """给缺少 thinkingLevelMap 的推理模型补上默认映射。
 
@@ -650,12 +697,13 @@ def _migrate_models_thinking(cfg: dict[str, Any]) -> tuple[dict[str, Any], bool]
 _MODELS_MIGRATIONS = (
     _migrate_models_keys,
     _migrate_models_headers,
+    _migrate_models_defaults,
     _migrate_models_thinking,
 )
 
 
 def _migrate_models_config(cfg: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-    """三轮格式迁移的纯变换组合（幂等：``m(m(x)) == m(x)``）。"""
+    """格式迁移的纯变换组合（幂等：``m(m(x)) == m(x)``）。"""
     changed = False
     for step in _MODELS_MIGRATIONS:
         cfg, step_changed = step(cfg)
@@ -989,7 +1037,7 @@ def upsert_custom_provider(
             else str(existing.get("apiKey") or "")
         )
         saved_models = [
-            ensure_thinking_level_map(m)
+            fill_model_defaults(m) if isinstance(m, dict) else m
             for m in (models if models is not None else existing.get("models", []))
         ]
         entry: dict[str, Any] = {
@@ -1319,7 +1367,7 @@ def add_model_to_provider(provider: str, model_id: str, **kwargs: Any) -> dict[s
             for m in (models if isinstance(models, list) else [])
             if not (isinstance(m, dict) and m.get("id") == model_id)
         ]
-        item = ensure_thinking_level_map({"id": model_id, **kwargs})
+        item = fill_model_defaults({"id": model_id, **kwargs})
         if "cost" not in item:
             item["cost"] = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
         kept.append(item)
@@ -1483,12 +1531,45 @@ def run_pi_print(
 def default_model_template(model_id: str) -> dict[str, Any]:
     return {
         "id": model_id,
+        "name": model_id,
         "reasoning": True,
         "input": ["text"],
         "contextWindow": 128000,
         "maxTokens": 32768,
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
     }
+
+
+def fill_model_defaults(model: dict[str, Any]) -> dict[str, Any]:
+    """补全手填模型缺少的 Pi 字段，与拉取 / 「添加模型」使用同一套缺省值。
+
+    只补缺失键，不覆盖用户已写的 ``reasoning: false`` 等显式值。补上
+    ``reasoning`` 后若仍无 ``thinkingLevelMap``，再交给
+    :func:`ensure_thinking_level_map`。未改动时返回原对象，供迁移做身份判断。
+    """
+    if not isinstance(model, dict):
+        return model
+    mid = str(model.get("id") or model.get("name") or "").strip()
+    if not mid:
+        return model
+    result = dict(model)
+    changed = False
+    if not str(result.get("id") or "").strip():
+        result["id"] = mid
+        changed = True
+    if not str(result.get("name") or "").strip():
+        result["name"] = mid
+        changed = True
+    for key, value in default_model_template(mid).items():
+        if key in {"id", "name"}:
+            continue
+        if key not in result:
+            result[key] = value
+            changed = True
+    filled = ensure_thinking_level_map(result)
+    if filled is not result:
+        return filled
+    return result if changed else model
 
 
 

@@ -16,9 +16,11 @@ from typing import Any
 from .core_http import (
     _friendly_fetch_error,
     _ssl_context,
+    is_transient_http_status,
     normalize_openai_base_url,
     redact_endpoint_url,
     redact_secret_values,
+    transient_retry_delay,
 )
 from .core_process import _check_request_scheme
 
@@ -216,68 +218,89 @@ def fetch_remote_models(
     handlers.append(urllib.request.HTTPSHandler(context=_ssl_context(insecure_ssl)))
     opener = urllib.request.build_opener(*handlers)
 
-    try:
-        req = urllib.request.Request(endpoint, headers=req_headers, method="GET")
-        with opener.open(req, timeout=timeout) as resp:
-            body = http_client.read_limited(
-                resp, http_client.MODEL_LIST_MAX_BYTES
-            ).decode("utf-8", errors="replace")
-            status = getattr(resp, "status", 200)
-    except urllib.error.HTTPError as e:
-        err_body = ""
+    body = ""
+    status = 200
+    max_attempts = core.TRANSIENT_HTTP_MAX_ATTEMPTS
+    for attempt in range(max_attempts):
         try:
-            err_body = http_client.read_limited(
-                e, http_client.ERROR_MAX_BYTES
-            ).decode("utf-8", errors="replace")[:500]
-        except Exception:
-            pass
-        err_body = redact_secret_values(err_body, [key])
-        err_body = re.sub(
-            r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+", r"\1***", err_body
-        )
-        detail = f"HTTP {e.code}: {e.reason}"
-        if err_body:
-            detail += f"\n{err_body}"
-        attempted = set(_attempted_key_ids or ())
-        if key_id and key_id not in attempted and core.is_provider_key_error(1, detail, ""):
-            from . import secrets as secretstore
-
-            attempted.add(key_id)
-            secretstore.mark_provider_key_failed(
-                provider, key_id, core.provider_key_failure_reason(1, detail, "")
+            req = urllib.request.Request(endpoint, headers=req_headers, method="GET")
+            with opener.open(req, timeout=timeout) as resp:
+                body = http_client.read_limited(
+                    resp, http_client.MODEL_LIST_MAX_BYTES
+                ).decode("utf-8", errors="replace")
+                status = getattr(resp, "status", 200)
+            break
+        except urllib.error.HTTPError as e:
+            err_body = ""
+            try:
+                err_body = http_client.read_limited(
+                    e, http_client.ERROR_MAX_BYTES
+                ).decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            err_body = redact_secret_values(err_body, [key])
+            err_body = re.sub(
+                r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+", r"\1***", err_body
             )
-            next_credential = secretstore.get_active_provider_credential(provider)
-            if next_credential and next_credential["key_id"] not in attempted:
-                return fetch_remote_models(
-                    base_url,
-                    api_key,
-                    api=api,
-                    timeout=timeout,
-                    headers=headers,
-                    insecure_ssl=insecure_ssl,
-                    proxy=proxy,
-                    provider=provider,
-                    _attempted_key_ids=attempted,
+            detail = f"HTTP {e.code}: {e.reason}"
+            if err_body:
+                detail += f"\n{err_body}"
+            attempted = set(_attempted_key_ids or ())
+            if key_id and key_id not in attempted and core.is_provider_key_error(
+                1, detail, ""
+            ):
+                from . import secrets as secretstore
+
+                attempted.add(key_id)
+                secretstore.mark_provider_key_failed(
+                    provider, key_id, core.provider_key_failure_reason(1, detail, "")
                 )
-        friendly = _friendly_fetch_error(Exception(detail), endpoint)
-        return {
-            "ok": False,
-            "models": [],
-            "endpoint": public_endpoint,
-            "error": friendly,
-            "raw_count": 0,
-            "http_status": e.code,
-            "proxy": proxy or "",
-        }
-    except Exception as e:
-        return {
-            "ok": False,
-            "models": [],
-            "endpoint": public_endpoint,
-            "error": _friendly_fetch_error(e, endpoint),
-            "raw_count": 0,
-            "proxy": proxy or "",
-        }
+                next_credential = secretstore.get_active_provider_credential(provider)
+                if next_credential and next_credential["key_id"] not in attempted:
+                    return fetch_remote_models(
+                        base_url,
+                        api_key,
+                        api=api,
+                        timeout=timeout,
+                        headers=headers,
+                        insecure_ssl=insecure_ssl,
+                        proxy=proxy,
+                        provider=provider,
+                        _attempted_key_ids=attempted,
+                    )
+            retry_after = ""
+            headers_obj = getattr(e, "headers", None)
+            if headers_obj is not None:
+                try:
+                    retry_after = str(headers_obj.get("Retry-After") or "")
+                except Exception:
+                    retry_after = ""
+            if is_transient_http_status(e.code) and attempt < max_attempts - 1:
+                core.sleep_transient_retry(
+                    transient_retry_delay(attempt, retry_after)
+                )
+                continue
+            friendly = _friendly_fetch_error(Exception(detail), endpoint)
+            if attempt > 0:
+                friendly += "\n（已自动重试，上游仍过载或不可用）"
+            return {
+                "ok": False,
+                "models": [],
+                "endpoint": public_endpoint,
+                "error": friendly,
+                "raw_count": 0,
+                "http_status": e.code,
+                "proxy": proxy or "",
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "models": [],
+                "endpoint": public_endpoint,
+                "error": _friendly_fetch_error(e, endpoint),
+                "raw_count": 0,
+                "proxy": proxy or "",
+            }
 
     try:
         data = json.loads(body)
@@ -345,7 +368,7 @@ def fetch_remote_models(
                     coerced = _to_int(extra[src_key])
                     if coerced is not None:
                         item[dst_key] = coerced
-        models.append(item)
+        models.append(core.fill_model_defaults(item))
 
     # OpenAI style: { data: [ {id} ] }
     if isinstance(data, dict) and isinstance(data.get("data"), list):
@@ -507,6 +530,18 @@ def _http_json_request(
         # Network-layer failure through the proxy (e.g. stopped Clash):
         # retry directly once so the test does not report bogus unavailability.
         result = request_once("")
+    max_attempts = core.TRANSIENT_HTTP_MAX_ATTEMPTS
+    attempt = 0
+    while (
+        not result.get("ok")
+        and is_transient_http_status(result.get("status"))
+        and attempt < max_attempts - 1
+    ):
+        core.sleep_transient_retry(transient_retry_delay(attempt))
+        attempt += 1
+        result = request_once(proxy)
+        if not result.get("ok") and result.get("status") == 0 and proxy:
+            result = request_once("")
     return result
 
 

@@ -921,3 +921,111 @@ def test_official_pi_sends_real_key_to_provider(isolated_home, monkeypatch, tmp_
     assert "AUTHORIZED" in (stdout + stderr), (stdout, stderr, received_authorization)
     assert received_authorization == ["Bearer real-integration-secret"]
     assert "__DPAPI__" not in received_authorization[0]
+
+
+def _503_body() -> bytes:
+    return (
+        b'{"error":{"message":"The upstream API is temporarily overloaded. '
+        b'Please retry in a few seconds.","type":"api_error",'
+        b'"code":"upstream_overloaded"}}'
+    )
+
+
+def test_fetch_remote_models_retries_503_then_succeeds(monkeypatch, isolated_home):
+    monkeypatch.setattr(core, "sleep_transient_retry", lambda _seconds: None)
+    calls = {"n": 0}
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"data":[{"id":"grok-4.5"}]}'
+
+    class Opener:
+        def open(self, request, timeout):
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    503,
+                    "Service Unavailable",
+                    {"Retry-After": "1"},
+                    io.BytesIO(_503_body()),
+                )
+            return Response()
+
+    monkeypatch.setattr("urllib.request.build_opener", lambda *_handlers: Opener())
+    result = core.fetch_remote_models(
+        "https://api.grokified.com/v1",
+        "gk_live_testkey",
+        api="openai-completions",
+    )
+    assert result["ok"] is True
+    assert [item["id"] for item in result["models"]] == ["grok-4.5"]
+    assert result["models"][0]["thinkingLevelMap"]["max"] == "max"
+    assert calls["n"] == 2
+
+
+def test_fetch_remote_models_exhausted_503_explains_upstream_overload(
+    monkeypatch, isolated_home
+):
+    monkeypatch.setattr(core, "sleep_transient_retry", lambda _seconds: None)
+    calls = {"n": 0}
+
+    class Opener:
+        def open(self, request, timeout):
+            calls["n"] += 1
+            raise urllib.error.HTTPError(
+                request.full_url,
+                503,
+                "Service Unavailable",
+                {},
+                io.BytesIO(_503_body()),
+            )
+
+    monkeypatch.setattr("urllib.request.build_opener", lambda *_handlers: Opener())
+    result = core.fetch_remote_models(
+        "https://api.grokified.com/v1",
+        "gk_live_testkey",
+        api="openai-completions",
+    )
+    assert result["ok"] is False
+    assert result["http_status"] == 503
+    assert calls["n"] == 3
+    error = str(result.get("error") or "")
+    assert "upstream_overloaded" in error or "过载" in error
+    assert "已自动重试" in error
+    assert "不是 Base URL 或 API Key" in error
+    assert "api.grokified.com" in str(result.get("endpoint") or error)
+
+
+def test_fetch_remote_models_does_not_retry_401(monkeypatch, isolated_home):
+    monkeypatch.setattr(core, "sleep_transient_retry", lambda _seconds: None)
+    calls = {"n": 0}
+
+    class Opener:
+        def open(self, request, timeout):
+            calls["n"] += 1
+            raise urllib.error.HTTPError(
+                request.full_url,
+                401,
+                "Unauthorized",
+                {},
+                io.BytesIO(b'{"error":{"message":"invalid API key"}}'),
+            )
+
+    monkeypatch.setattr("urllib.request.build_opener", lambda *_handlers: Opener())
+    result = core.fetch_remote_models(
+        "https://api.grokified.com/v1",
+        "gk_live_bad",
+        api="openai-completions",
+    )
+    assert result["ok"] is False
+    assert result["http_status"] == 401
+    assert calls["n"] == 1

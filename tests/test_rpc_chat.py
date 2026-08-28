@@ -53,6 +53,52 @@ def test_chat_attempt_falls_back_when_rpc_runtime_disabled(isolated_home, monkey
     assert calls == ["hello"]
 
 
+def test_chat_attempt_retries_upstream_overloaded_then_succeeds(
+    isolated_home, monkeypatch
+):
+    mgr = core.load_manager_config()
+    mgr["chat_persistent_session"] = False
+    core.save_manager_config(mgr)
+    monkeypatch.setattr(core, "sleep_transient_retry", lambda _seconds: None)
+    calls = {"n": 0}
+
+    def fake_chat_once(prompt, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            return {
+                "ok": False,
+                "returncode": 1,
+                "stdout": "",
+                "stderr": (
+                    'HTTP 503: Service Unavailable\n'
+                    '{"error":{"code":"upstream_overloaded"}}'
+                ),
+                "latency_ms": 1,
+                "error": "HTTP 503",
+            }
+        return {
+            "ok": True,
+            "returncode": 0,
+            "stdout": "recovered",
+            "stderr": "",
+            "latency_ms": 1,
+            "error": "",
+        }
+
+    monkeypatch.setattr(extras, "chat_once", fake_chat_once)
+    result = extras._chat_attempt(
+        "hello",
+        provider="grokified",
+        model="grok-4.5",
+        workdir=None,
+        timeout=5,
+        thinking="off",
+    )
+    assert result["ok"] is True
+    assert result["stdout"] == "recovered"
+    assert calls["n"] == 2
+
+
 def test_idle_reaper_closes_idle_session_but_spares_busy_one(isolated_home, monkeypatch):
     import time
 

@@ -80,6 +80,61 @@ def redact_endpoint_url(url: str) -> str:
         return raw
 
 
+# GET /v1/models 与对话请求遇到的瞬时上游故障（Grokified 文档：503 可安全重试）。
+# 不含 429：429 走 Key 轮换 / cooldown，避免和密钥状态机抢同一把 Key。
+TRANSIENT_HTTP_STATUSES = frozenset({500, 502, 503, 504})
+TRANSIENT_HTTP_MAX_ATTEMPTS = 3
+_TRANSIENT_RETRY_AFTER_CAP = 8.0
+
+
+def is_transient_http_status(status: int | None) -> bool:
+    """是否为应自动重试的上游 5xx（不含鉴权/额度类 4xx）。"""
+    try:
+        code = int(status or 0)
+    except (TypeError, ValueError):
+        return False
+    return code in TRANSIENT_HTTP_STATUSES
+
+
+def parse_retry_after_seconds(value: str | None) -> float | None:
+    """解析 Retry-After：只接受秒数，HTTP-date 忽略（避免误等很久）。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return None
+    if seconds < 0:
+        return None
+    return seconds
+
+
+def transient_retry_delay(attempt: int, retry_after: str | None = None) -> float:
+    """第 ``attempt`` 次失败后的等待秒数（0-based）。"""
+    parsed = parse_retry_after_seconds(retry_after)
+    if parsed is not None:
+        return min(parsed, _TRANSIENT_RETRY_AFTER_CAP)
+    return min(1.0 * (2 ** max(0, int(attempt))), 4.0)
+
+
+def sleep_transient_retry(seconds: float) -> None:
+    """可被测试 monkeypatch 的短暂等待，避免用例真睡。"""
+    import time
+
+    delay = float(seconds or 0.0)
+    if delay > 0:
+        time.sleep(delay)
+
+
+def is_transient_upstream_error(text: str) -> bool:
+    """错误正文是否表示上游过载/网关故障（可重试，不是 Key 填错）。"""
+    low = str(text or "").lower()
+    if "upstream_overloaded" in low or "temporarily overloaded" in low:
+        return True
+    return bool(re.search(r"\b(?:http\s*)?(?:500|502|503|504)\b", low))
+
+
 def redact_secret_values(text: str, secret_values: list[str]) -> str:
     result = str(text or "")
     # 过滤掉空值与长度小于 4 的短密钥，避免误伤无关文本
@@ -114,10 +169,23 @@ def _friendly_fetch_error(exc: BaseException, endpoint: str = "") -> str:
         tips.append("连接被拒绝：代理地址错误或目标服务未开放。")
     if "proxy" in low:
         tips.append("代理相关错误：检查 HTTP_PROXY / HTTPS_PROXY。")
+    if is_transient_upstream_error(msg):
+        tips.append(
+            "上游服务暂时过载或网关故障（Grokified 等中转会把 GET /v1/models "
+            "原样转给 xAI）。这不是 Base URL 或 API Key 填错。"
+        )
+        tips.append(
+            "应用会自动重试几次。仍失败时：若 Models JSON 已手填模型（或选用模板），"
+            "可直接点保存，不必等拉取成功。"
+        )
+        tips.append("对话走同一上游：过载未恢复时提问同样会失败，过几秒再试即可。")
 
     header = f"{type(exc).__name__}: {msg}"
     if tips:
-        return header + "\n\n排查建议：\n- " + "\n- ".join(tips)
+        text = header + "\n\n排查建议：\n- " + "\n- ".join(tips)
+        if safe_endpoint:
+            text += f"\n\nendpoint: {safe_endpoint}"
+        return text
     if safe_endpoint:
         return header + f"\nendpoint: {safe_endpoint}"
     return header

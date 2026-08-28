@@ -77,3 +77,57 @@ def test_fetch_remote_models_models_are_filled_after_save(isolated_home):
         api="openai-completions",
     )
     assert not fetched.get("ok")  # 无网络时拿不到模型，只验证保存链路不受影响
+
+
+def test_upsert_fills_incomplete_id_name_models(isolated_home):
+    from pi_manager import core
+
+    core.upsert_custom_provider(
+        "grokified",
+        base_url="https://api.grokified.com/v1",
+        api_key="gk_live_test",
+        models=[{"id": "grok-4.5", "name": "grok-4.5"}],
+    )
+    cfg = core.load_models_config()
+    model = cfg["providers"]["grokified"]["models"][0]
+    assert model["id"] == "grok-4.5"
+    assert model["reasoning"] is True
+    assert model["contextWindow"] == 128000
+    assert model["maxTokens"] == 32768
+    assert model["thinkingLevelMap"]["max"] == "max"
+
+
+def test_fill_model_defaults_preserves_explicit_non_reasoning(isolated_home):
+    from pi_manager import core
+
+    model = core.fill_model_defaults({"id": "gpt-4o-mini", "reasoning": False})
+    assert model["reasoning"] is False
+    assert "thinkingLevelMap" not in model
+    assert model["contextWindow"] == 128000
+
+
+def test_load_models_config_migrates_incomplete_handwritten_models(isolated_home):
+    from pi_manager import core
+    from pi_manager import storage
+
+    storage.save_json(
+        core.models_path(),
+        {
+            "providers": {
+                "grokified": {
+                    "baseUrl": "https://api.grokified.com/v1",
+                    "api": "openai-completions",
+                    "apiKey": "!SKIP_ENV",
+                    "models": [{"id": "grok-4.5", "name": "grok-4.5"}],
+                }
+            }
+        },
+    )
+    core._invalidate_config_cache(None)
+    core._MODELS_MIGRATED_SIGNATURE = None
+    cfg = core.load_models_config()
+    model = cfg["providers"]["grokified"]["models"][0]
+    assert model["reasoning"] is True
+    assert model["thinkingLevelMap"]["max"] == "max"
+    on_disk = storage.load_json(core.models_path(), {})
+    assert on_disk["providers"]["grokified"]["models"][0]["contextWindow"] == 128000

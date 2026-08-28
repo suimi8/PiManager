@@ -52,6 +52,17 @@ def test_apply_preset_unknown_returns_none():
     assert provider_presets.apply_preset("nope") is None
 
 
+def test_grokified_preset_covers_current_grok_slugs():
+    preset = provider_presets.find_preset("grokified")
+    assert preset is not None
+    assert preset["base_url"] == "https://api.grokified.com/v1"
+    assert preset["api"] == "openai-completions"
+    ids = [str(m.get("id")) for m in preset["models"]]
+    assert "grok-4.6" in ids
+    assert "grok-4.5" in ids
+    assert "grok-4.3" in ids
+
+
 def test_upsert_custom_provider_from_preset(isolated_home):
     """模板可直接喂给 core.upsert_custom_provider 完成一键接入。
 

@@ -224,3 +224,24 @@ def test_error_max_bytes_is_below_manifest_budget():
     # 错误摘要限额必须远小于正常清单限额，避免错误正文撑爆内存
     assert http_client.ERROR_MAX_BYTES < http_client.MANIFEST_MAX_BYTES
     assert http_client.MANIFEST_MAX_BYTES <= 1024 * 1024
+
+
+# ---- 上游瞬时故障识别 / Retry-After ---------------------------------------
+
+def test_transient_http_helpers_distinguish_overload_from_auth():
+    from pi_manager import core_http
+
+    assert core_http.is_transient_http_status(503) is True
+    assert core_http.is_transient_http_status(429) is False
+    assert core_http.is_transient_http_status(401) is False
+    assert core_http.is_transient_http_status("503") is True
+    assert core_http.is_transient_http_status(None) is False
+    assert core_http.is_transient_upstream_error(
+        'HTTP 503\n{"error":{"code":"upstream_overloaded"}}'
+    )
+    assert not core_http.is_transient_upstream_error("HTTP 401 invalid API key")
+    assert core_http.parse_retry_after_seconds("2") == 2.0
+    assert core_http.parse_retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT") is None
+    assert core_http.transient_retry_delay(0, "99") == 8.0
+    assert core_http.transient_retry_delay(0) == 1.0
+    assert core_http.transient_retry_delay(2) == 4.0

@@ -111,6 +111,26 @@ _OVERSEAS: list[dict[str, Any]] = [
         ],
     },
     {
+        "name": "grokified",
+        "label": "Grokified (Grok 中转)",
+        "region": "国外",
+        "base_url": "https://api.grokified.com/v1",
+        "api": "openai-completions",
+        "compat": {"supportsDeveloperRole": False, "supportsReasoningEffort": True},
+        "key_url": "https://grokified.com",
+        "hint": (
+            "xAI 透明代理，OpenAI 兼容。API Key 以 gk_live_ 开头。"
+            "GET /v1/models 会打到 xAI，上游过载时返回 503，"
+            "可直接保存本模板中的模型再对话，不必等拉取成功。"
+        ),
+        "models": [
+            _model("grok-4.6", reasoning=True, context=500000, max_tokens=32768),
+            _model("grok-4.5", reasoning=True, context=500000, max_tokens=32768),
+            _model("grok-4.3", reasoning=True, context=1000000, max_tokens=32768),
+            _model("grok-build-0.1", reasoning=True, context=256000, max_tokens=32768),
+        ],
+    },
+    {
         "name": "mistral",
         "label": "Mistral",
         "region": "国外",

@@ -473,7 +473,7 @@ _LEGACY_MODELS = {
 
 
 def test_models_migrations_are_idempotent(isolated_home):
-    """m(m(x)) == m(x)：三轮迁移的幂等性以前只是隐式前提，没有任何守护。
+    """m(m(x)) == m(x)：格式迁移的幂等性以前只是隐式前提，没有任何守护。
 
     一旦某轮不幂等，``load_models_config`` 会每次调用都写一次盘（写放大 + 缓存
     永久未命中），而它是热路径。
@@ -525,7 +525,12 @@ def test_models_migration_does_not_revert_a_concurrent_write(isolated_home, monk
     monkeypatch.setattr(
         core,
         "_MODELS_MIGRATIONS",
-        (core._migrate_models_keys, racing_migrate, core._migrate_models_thinking),
+        (
+            core._migrate_models_keys,
+            racing_migrate,
+            core._migrate_models_defaults,
+            core._migrate_models_thinking,
+        ),
     )
     core.load_models_config()
 
