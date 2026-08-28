@@ -521,6 +521,20 @@ test("a prompt timeout destroys the session so a stale agent_end cannot finish t
   manager.disposeAll();
 });
 
+test("prompt timeout while waiting for prompt ack does not unhandled-reject", async () => {
+  const child = fakeChild();
+  const session = new PiRpcSession({
+    executable: "pi",
+    spawnFn: () => child,
+    platform: "linux",
+  });
+  const result = await session.prompt("q", { timeoutMs: 20 });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /超时/);
+  assert.equal(session.isAlive(), false, "超时即销毁会话");
+  assert.equal(session.timedOut(), true);
+});
+
 test("events from an invalidated turn are dropped by the turn sequence check", async () => {
   const child = fakeChild();
   const session = new PiRpcSession({ executable: "pi", spawnFn: () => child, platform: "linux" });

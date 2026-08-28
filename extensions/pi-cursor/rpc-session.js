@@ -252,6 +252,8 @@ class PiRpcSession {
     if (this._turn) throw new Error("上一个 Pi 请求仍在进行");
     const started = Date.now();
     const seq = (this._turnSeq += 1);
+    const timeoutError = () =>
+      new Error(`Pi 响应超时（${Math.round(timeoutMs / 1000)}s）`);
     const turnDone = new Promise((resolve, reject) => {
       this._turn = {
         seq,
@@ -268,11 +270,14 @@ class PiRpcSession {
           // 并被 failover 记为成功、重置失败计数（审查报告 P2-5）。
           // sticky --session-id 让下一次提问重建同一会话，上下文照样恢复，
           // 代价只是一次进程启动。
+          // 超时用 resolve 而不是 reject：时钟可能在 await send() 期间响，
+          // 那时还没有人 await turnDone，reject 会变成 unhandledRejection
+          // 打崩扩展宿主（CI Linux runner 上 30ms 窗口即可复现）。
           this._turn = null;
           this._turnSeq += 1;
           this._timedOut = true;
           this.send({ type: "abort" }).catch(() => {});
-          turn.reject(new Error(`Pi 响应超时（${Math.round(timeoutMs / 1000)}s）`));
+          turn.resolve({ timedOut: true });
           this.dispose();
         }, timeoutMs),
       };
@@ -297,6 +302,7 @@ class PiRpcSession {
         this._turn = null;
         clearTimeout(turn.timer);
       }
+      if (this._timedOut) return finish({ error: timeoutError().message });
       if (error.sessionDead) throw error;
       return finish({ error: error.message });
     }
@@ -309,8 +315,12 @@ class PiRpcSession {
     }
 
     try {
-      await turnDone;
+      const outcome = await turnDone;
+      if (outcome && outcome.timedOut) {
+        return finish({ error: timeoutError().message });
+      }
     } catch (error) {
+      if (this._timedOut) return finish({ error: timeoutError().message });
       if (error.sessionDead) throw error;
       return finish({ error: error.message });
     }
