@@ -89,10 +89,10 @@ jobs:
         xvfb-run -a python -m pytest tests -q --tb=line --timeout=300 --timeout-method=thread --cov=pi_manager --cov-report=term-missing --cov-fail-under=55 | tee _pytest.log
         code=${PIPESTATUS[0]}
         if [ $code -ne 0 ]; then
-          echo "::error::pytest failed with exit $code"
-          grep -E "^(FAILED|ERROR)" _pytest.log | head -n 20 | sed 's/^/::error::/'
-          echo "::error::---- tail ----"
-          tail -n 30 _pytest.log | sed 's/^/::error::/'
+          echo "::error file=pytest.log::pytest failed with exit $code"
+          grep -E "^(FAILED|ERROR)" _pytest.log | head -n 20 | sed 's/^/::error file=pytest.log::/'
+          echo "::error file=pytest.log::---- tail ----"
+          tail -n 40 _pytest.log | sed 's/^/::error file=pytest.log::/'
           exit $code
         fi
 
@@ -103,10 +103,10 @@ jobs:
         python -m pytest tests -q --tb=line --timeout=300 --timeout-method=thread --cov=pi_manager --cov-report=term-missing --cov-fail-under=55 | tee _pytest.log
         code=${PIPESTATUS[0]}
         if [ $code -ne 0 ]; then
-          echo "::error::pytest failed with exit $code"
-          grep -E "^(FAILED|ERROR)" _pytest.log | head -n 20 | sed 's/^/::error::/'
-          echo "::error::---- tail ----"
-          tail -n 30 _pytest.log | sed 's/^/::error::/'
+          echo "::error file=pytest.log::pytest failed with exit $code"
+          grep -E "^(FAILED|ERROR)" _pytest.log | head -n 20 | sed 's/^/::error file=pytest.log::/'
+          echo "::error file=pytest.log::---- tail ----"
+          tail -n 40 _pytest.log | sed 's/^/::error file=pytest.log::/'
           exit $code
         fi
 
@@ -131,7 +131,13 @@ jobs:
         # （v1.8.4 起强制）和 DEVELOPMENT_STANDARDS.md §7 的要求一致。
         run: |
           npm ci --ignore-scripts
-          npm test
+          npm test > _npm.log 2>&1
+          code=$?
+          if [ $code -ne 0 ]; then
+            echo "::error file=npm.log::npm test failed with exit $code"
+            tail -n 40 _npm.log | sed 's/^/::error file=npm.log::/'
+            exit $code
+          fi
 
   # ---- 开发规范强制（docs/DEVELOPMENT_STANDARDS.md 第 8 节）----
   # 注意：以下 job 只覆盖 push main / PR 路径；发布路径（tag 推送 /
