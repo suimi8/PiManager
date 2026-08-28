@@ -72,9 +72,12 @@ function crossUserWritableRoots(env = process.env) {
   const systemRoot = env.SystemRoot || env.windir || "C:\\Windows";
   const systemDrive = String(env.SystemDrive || "C:").replace(/\\+$/, "");
   const roots = [
-    path.join(`${systemDrive}\\`, "Users", "Public"),
-    path.join(`${systemDrive}\\`, "ProgramData"),
-    path.join(systemRoot, "Temp"),
+    // 这些是 Windows 路径，必须用 path.win32 拼接：node:path 在 Linux/macOS
+    // 上是 POSIX 实现，path.join("C:\\", "Users") 会拼成 "C:\\/Users"，
+    // 使本函数在非 Windows 平台对整个 Windows 判据失效（R2 helper 回归测试）。
+    path.win32.join(`${systemDrive}\\`, "Users", "Public"),
+    path.win32.join(`${systemDrive}\\`, "ProgramData"),
+    path.win32.join(systemRoot, "Temp"),
     env.PUBLIC,
     env.ProgramData,
     env.ALLUSERSPROFILE,
@@ -132,7 +135,9 @@ function windowsPathAllows(
   for (const root of crossUserWritableRoots(env)) {
     if (isWithin(effective, root, "win32")) return false;
   }
-  if (isDriveRoot(path.dirname(effective))) return false;
+  // Windows 盘符根目录判据同样用 win32 语义：POSIX dirname 在 Linux 上会把
+  // "D:\\PiManager.exe" 当作单个文件名而返回 "."，盘根检查就此失效。
+  if (isDriveRoot(path.win32.dirname(effective))) return false;
   if (within && !isWithin(effective, within, "win32")) return false;
   return true;
 }
@@ -184,9 +189,15 @@ function registeredHelperCommand({
   if (!payload || payload.schema_version !== 1 || !Array.isArray(payload.command)) return null;
   const command = payload.command.map((part) => String(part || "").trim());
   if (!command.length || command.some((part) => !part)) return null;
-  if (!path.isAbsolute(command[0]) || !pathExists(command[0])) return null;
+  // Windows 平台的可执行参数须用 win32 判绝对路径：在 Linux/macOS 上
+  // path.isAbsolute("C:\\...") 恒为 false，会把合法 Windows helper 一律拒掉。
+  const isAbsolute =
+    platform === "win32"
+      ? (value) => path.win32.isAbsolute(value)
+      : (value) => path.isAbsolute(value);
+  if (!isAbsolute(command[0]) || !pathExists(command[0])) return null;
   if (command.length > 1 && /\.py$/i.test(command[1])) {
-    if (!path.isAbsolute(command[1]) || !pathExists(command[1])) return null;
+    if (!isAbsolute(command[1]) || !pathExists(command[1])) return null;
   }
   const checkOptions = { platform, uid, statFile, lstatFile, realPath, env };
   // 注册表文件额外要求真实落在当前用户 profile 之内：即使 ~/.pi 被替换成
