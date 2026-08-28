@@ -3,8 +3,8 @@
 # `pip install -r requirements-dev.txt` 安装本文件，不再手写 `pip install ruff`
 # 之类的无约束命令——否则这里钉死的版本形同虚设，ruff 发新版当天一次无关的
 # push 就可能因规则集变化红掉。
-ruff==0.14.4
-pytest==8.4.2
+ruff==0.16.4
+pytest==9.1.1
 # 与本地实测一致（7.1.0）；此前钉在 6.2.1 而 CI 根本没装本文件，三方版本各不相同。
 pytest-cov==7.1.0
 # 单条用例挂起时 120s 失败，而不是把 job 拖到 GitHub 默认的 6 小时上限。
