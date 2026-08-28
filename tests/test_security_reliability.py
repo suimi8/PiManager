@@ -329,7 +329,7 @@ def test_broker_token_creation_is_exclusive(isolated_home):
     assert config_broker._verify_broker_token("wrong-token") is False
 
 
-def test_provider_redirect_does_not_replay_credentials(monkeypatch):
+def test_provider_redirect_does_not_replay_credentials(monkeypatch, isolated_home):
     _clear_proxy_environment(monkeypatch)
     target_requests = []
 

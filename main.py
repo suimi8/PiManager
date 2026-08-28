@@ -171,6 +171,13 @@ def main():
         # 请求文件是一次性凭据载体，用完即焚（P2-11）。
         _shred_request_file(args.request_file)
         encoded = json.dumps(result, ensure_ascii=False)
+        # 结果可能含中文（错误信息等）；Windows CI 等控制台默认代码页非 UTF-8，
+        # print(encoded) 会抛 UnicodeEncodeError 让 --config-mutate 契约崩掉
+        # （Cursor 扩展热路径）。stdout 统一 UTF-8 + 替换容错。
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass  # 流不支持 reconfigure（如已被包装）时保持原样
         if args.output:
             try:
                 # Same hardened write as provider-env responses (pre-created
