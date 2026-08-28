@@ -380,7 +380,7 @@ def test_provider_redirect_does_not_replay_credentials(monkeypatch, isolated_hom
     assert "redirect-secret" not in json.dumps(result)
 
 
-def test_model_response_without_length_stops_at_limit(monkeypatch):
+def test_model_response_without_length_stops_at_limit(monkeypatch, isolated_home):
     _clear_proxy_environment(monkeypatch)
 
     class LargeHandler(BaseHTTPRequestHandler):
