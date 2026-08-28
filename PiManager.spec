@@ -35,7 +35,12 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[str(project_root / "scripts" / "pyi_rth_pimanager.py")],
+    # 无自定义 runtime hook：PyInstaller 把自定义 rthook 排在最前执行，随后
+    # 官方 hooks/rthooks/pyi_rth_pyside6.py 会**无条件**赋值 QT_PLUGIN_PATH /
+    # QML2_IMPORT_PATH，任何自定义设置都会被覆盖。旧的
+    # scripts/pyi_rth_pimanager.py 因此是死代码，已删除
+    # （docs/review/r2-build.md B-3 / B-14）。
+    runtime_hooks=[],
     excludes=pyi_common.EXCLUDES,
     noarchive=False,
     optimize=0,

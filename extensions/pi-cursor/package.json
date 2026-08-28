@@ -18,17 +18,7 @@
     "@vscode/vsce": "3.9.2"
   },
   "activationEvents": [
-    "onStartupFinished",
-    "onCommand:pi.openTerminal",
-    "onCommand:pi.openWithDefaultModel",
-    "onCommand:pi.askPrompt",
-    "onCommand:pi.openConfig",
-    "onCommand:pi.checkVersion",
-    "onCommand:pi.checkExtensionUpdate",
-    "onCommand:pi.switchModel",
-    "onCommand:pi.openPanel",
-    "onCommand:pi.refreshModels",
-    "onView:pi.managerView"
+    "onStartupFinished"
   ],
   "main": "./extension.js",
   "capabilities": {

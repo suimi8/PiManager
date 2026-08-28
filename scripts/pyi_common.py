@@ -53,8 +53,20 @@ QT_TRIM_TAGS = (
     "QtQuick",
     "QtVirtualKeyboard",
     "qtvirtualkeyboard",
+    # plugins/imageformats/qpdf.dll (libqpdf.so / .dylib) is the Qt6Pdf image
+    # format plugin; its basename carries no Qt6Pdf/QtPdf tag, so it used to
+    # survive as a dangling plugin whose load always failed
+    # (docs/review/r2-build.md B-11).
+    "qpdf",
 )
 QM_KEEP_SUFFIXES = ("_zh_CN.qm", "_zh_TW.qm", "_en.qm")
+
+# Development-only files that live in assets/ but must not ship in a product
+# (docs/review/r2-build.md B-12). Matched against the top-level entries of
+# assets/ only, so plugin payloads such as
+# assets/builtin/skills/*/scripts/extract_*.py are never touched.
+ASSET_EXCLUDE_TOP_LEVEL = ("README.md",)
+ASSET_EXCLUDE_TOP_LEVEL_PREFIXES = ("_",)
 
 
 def read_app_version(project_root: Path = PROJECT_ROOT) -> str:
@@ -88,10 +100,35 @@ def _collect_submodules(package: str) -> list[str]:
         return _walk_package_submodules(package)
 
 
+def collect_asset_datas(project_root: Path = PROJECT_ROOT) -> list[tuple[str, str]]:
+    """Enumerate assets/ file by file so dev-only files can be skipped.
+
+    The plain ``(assets_dir, "assets")`` tuple form shipped ``assets/README.md``
+    and ``assets/_gen_logo.py`` into every product (B-12). Filtering happens at
+    the top level only; everything under assets/builtin/** is kept verbatim
+    because builtin_plugins copies those payloads to ~/.pi/agent/.
+    """
+    assets = project_root / "assets"
+    out: list[tuple[str, str]] = []
+    for path in sorted(assets.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(assets)
+        top = rel.parts[0]
+        if len(rel.parts) == 1:
+            if top in ASSET_EXCLUDE_TOP_LEVEL or top.startswith(ASSET_EXCLUDE_TOP_LEVEL_PREFIXES):
+                continue
+        if "__pycache__" in rel.parts or path.suffix in {".pyc", ".pyo"}:
+            continue
+        dest = "assets" if len(rel.parts) == 1 else "assets/" + rel.parent.as_posix()
+        out.append((str(path), dest))
+    return out
+
+
 def build_datas(project_root: Path = PROJECT_ROOT) -> list:
     from PyInstaller.utils.hooks import collect_data_files
 
-    datas = [(str(project_root / "assets"), "assets")]
+    datas = list(collect_asset_datas(project_root))
     datas += collect_data_files("certifi")
     # Bundle package data that may be imported dynamically.
     try:

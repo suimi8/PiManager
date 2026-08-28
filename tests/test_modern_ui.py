@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -11,7 +12,7 @@ from PySide6.QtWidgets import QApplication, QDialog
 from pi_manager import core
 from pi_manager.presentation.design.tokens import tokens_for
 from pi_manager.presentation.main_window import ModernMainWindow
-from pi_manager.ui import InstallPiDialog
+from pi_manager.ui import InstallPiDialog, Worker
 
 
 def _color_close(actual: str, expected: str, tolerance: int = 60) -> bool:
@@ -275,5 +276,369 @@ def test_chat_persistent_toggle_and_key_health_surface(qapp, isolated_home):
         # Failed key is surfaced on the dashboard provider metric.
         window.refresh_dashboard()
         assert "密钥失效" in window.dashboard_provider_metric.label_label.text()
+    finally:
+        _dispose(window, qapp)
+
+
+def test_provider_keys_dialog_reveal_toggle_and_copy(qapp, isolated_home):
+    """密钥管理对话框：默认掩码，可切换明文/隐藏，掩码模式下也能复制明文。"""
+    from pi_manager.ui import ProviderKeysDialog
+
+    core.upsert_custom_provider(
+        "RV", base_url="https://rv.example/v1", api_key="sk-reveal-first", models=[{"id": "m"}]
+    )
+    core.add_provider_api_key("RV", "sk-reveal-second")
+
+    dialog = ProviderKeysDialog("RV")
+    try:
+        assert dialog.table.rowCount() == 2
+        assert dialog._reveal is False
+        assert dialog.reveal_btn.text() == "显示明文"
+
+        # 默认掩码：不泄露明文，也不暴露长度
+        texts = [dialog.table.item(i, 0).text() for i in range(dialog.table.rowCount())]
+        assert all("sk-reveal" not in text for text in texts)
+        assert all("*" in text for text in texts)
+
+        # 切换到明文显示
+        dialog.reveal_btn.click()
+        qapp.processEvents()
+        shown = {dialog.table.item(i, 0).text() for i in range(dialog.table.rowCount())}
+        assert shown == {"sk-reveal-first", "sk-reveal-second"}
+        assert dialog.reveal_btn.text() == "隐藏明文"
+        assert "明文" in dialog.status_label.text()
+
+        # 切换回掩码
+        dialog.reveal_btn.click()
+        qapp.processEvents()
+        texts = [dialog.table.item(i, 0).text() for i in range(dialog.table.rowCount())]
+        assert all("sk-reveal" not in text for text in texts)
+        assert dialog.reveal_btn.text() == "显示明文"
+
+        # 掩码模式下「复制选中」仍复制明文到剪贴板
+        dialog.table.selectRow(0)
+        key_id = dialog.selected_key_id()
+        dialog.copy_key()
+        expected = next(
+            str(row.get("value") or "")
+            for row in core.list_provider_api_keys("RV", reveal=True)
+            if row.get("id") == key_id
+        )
+        assert QApplication.clipboard().text() == expected
+        assert "剪贴板" in dialog.status_label.text()
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qapp.processEvents()
+
+
+# ---- P1-3 / P1-4：模型表增量刷新、选中与滚动保留、主题查询次数 --------------
+
+def test_batch_progress_updates_one_row_and_keeps_selection(qapp, isolated_home):
+    """批量测试每完成一项原本整树重建：抹掉多选 → 「重测选中」事实失效。"""
+    window = ModernMainWindow(start_background=False)
+    try:
+        window.models = [core.ModelInfo("p", f"m{i}") for i in range(6)]
+        window.fill_models_table()
+        group = window.models_table.topLevelItem(0)
+        picked = [group.child(i) for i in (1, 3)]
+        for item in picked:
+            item.setSelected(True)
+        window.models_table.setCurrentItem(picked[0])
+        for item in picked:
+            item.setSelected(True)
+        selected_before = {m.key for m in window.selected_model_rows()}
+        assert len(selected_before) == 2
+
+        window._test_total = 6
+        window._on_model_test_progress(
+            {"provider": "p", "model": "m3", "available": True, "latency_ms": 111}
+        )
+
+        # 增量路径：同一批 QTreeWidgetItem 仍在，选中集合原样保留
+        assert {m.key for m in window.selected_model_rows()} == selected_before
+        row = window._model_row_index["p/m3"]
+        assert row.text(3) == "✓"
+        assert row.text(4) == "111ms"
+        expected = tokens_for(*window._theme_pair()).success.upper()
+        assert row.foreground(3).color().name().upper() == expected
+    finally:
+        _dispose(window, qapp)
+
+
+def test_full_rebuild_restores_selection_and_current_row(qapp, isolated_home):
+    window = ModernMainWindow(start_background=False)
+    try:
+        window.models = [core.ModelInfo("p", f"m{i}") for i in range(5)]
+        window.fill_models_table()
+        group = window.models_table.topLevelItem(0)
+        for index in (0, 2, 4):
+            group.child(index).setSelected(True)
+        window.models_table.setCurrentItem(group.child(2))
+        for index in (0, 2, 4):
+            group.child(index).setSelected(True)
+        before = {m.key for m in window.selected_model_rows()}
+        assert len(before) == 3
+
+        window.fill_models_table()  # 全量重建（tree.clear()）
+
+        assert {m.key for m in window.selected_model_rows()} == before
+        current = window._model_item_key(window.models_table.currentItem())
+        assert current is not None and current[1] == "m2"
+    finally:
+        _dispose(window, qapp)
+
+
+def test_fill_models_table_theme_lookups_do_not_scale_with_rows(
+    qapp, isolated_home, monkeypatch
+):
+    """以前每行 2 次 core.get_ui_theme()（实测 58 us/次）→ 200 模型批测 ~5s。"""
+    window = ModernMainWindow(start_background=False)
+    try:
+        calls = {"n": 0}
+        real = core.get_ui_theme
+
+        def counted():
+            calls["n"] += 1
+            return real()
+
+        monkeypatch.setattr(core, "get_ui_theme", counted)
+
+        window.models = [core.ModelInfo("p", f"m{i}") for i in range(5)]
+        window.fill_models_table()
+        small = calls["n"]
+
+        calls["n"] = 0
+        window.models = [core.ModelInfo("p", f"m{i}") for i in range(60)]
+        window.fill_models_table()
+        large = calls["n"]
+
+        assert large == small, (
+            f"主题查询次数必须与行数无关：5 行 {small} 次 vs 60 行 {large} 次"
+        )
+    finally:
+        _dispose(window, qapp)
+
+
+def test_model_filter_is_debounced(qapp, isolated_home):
+    """搜索框以前按每次击键触发整树重建。"""
+    window = ModernMainWindow(start_background=False)
+    try:
+        window.models = [core.ModelInfo("p", "alpha"), core.ModelInfo("p", "beta")]
+        window.fill_models_table()
+        assert window._model_filter_debounce.isSingleShot() is True
+        window.model_filter.setText("alph")
+        # 击键后不立即重建，只是把防抖定时器拉起
+        assert window._model_filter_debounce.isActive() is True
+        assert len(window._model_row_index) == 2
+        window._model_filter_debounce.stop()
+        window.fill_models_table()
+        assert set(window._model_row_index) == {"p/alpha"}
+    finally:
+        _dispose(window, qapp)
+
+
+def test_model_test_cancel_button_exists_and_interrupts(qapp, isolated_home):
+    """BatchTestWorker 一直支持取消，但此前 UI 上没有任何入口。"""
+    window = ModernMainWindow(start_background=False)
+    try:
+        assert window.model_test_cancel_btn.isEnabled() is False
+
+        class _FakeWorker:
+            def __init__(self):
+                self.interrupted = False
+
+            def isRunning(self):
+                return True
+
+            def requestInterruption(self):
+                self.interrupted = True
+
+        fake = _FakeWorker()
+        window._test_worker = fake
+        window._set_test_cancel_enabled(True)
+        assert window.model_test_cancel_btn.isEnabled() is True
+        window.model_test_cancel()
+        assert fake.interrupted is True
+        assert window.model_test_cancel_btn.isEnabled() is False
+    finally:
+        _dispose(window, qapp)
+
+
+# ---- P1-5：会话筛选只做内存过滤 ---------------------------------------------
+
+def test_session_filter_does_not_rescan_disk(qapp, isolated_home, monkeypatch):
+    window = ModernMainWindow(start_background=False)
+    try:
+        rows = [
+            {"path": "/s/a.json", "cwd": "/proj/alpha", "model": "m1", "preview": "hello"},
+            {"path": "/s/b.json", "cwd": "/proj/beta", "model": "m2", "preview": "world"},
+        ]
+        calls = {"n": 0}
+
+        def fake_list_sessions(limit=100):
+            calls["n"] += 1
+            return list(rows)
+
+        monkeypatch.setattr(core, "list_sessions", fake_list_sessions)
+        window.refresh_sessions()
+        assert calls["n"] == 1
+        assert window.sessions_table.rowCount() == 2
+
+        for text in ("a", "al", "alp", "alph"):
+            window.session_filter_wd.setText(text)
+            window.sessions_apply_filter()
+        assert calls["n"] == 1, "筛选期间不应再遍历会话目录"
+        assert window.sessions_table.rowCount() == 1
+
+        window.session_filter_wd.setText("")
+        window.sessions_apply_filter()
+        assert window.sessions_table.rowCount() == 2
+    finally:
+        _dispose(window, qapp)
+
+
+# ---- P1-6：单实例唤醒必须取走挂起连接 ---------------------------------------
+
+def test_wake_drains_pending_local_connections(qapp):
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
+
+    from pi_manager.ui import drain_pending_connections
+
+    name = f"PiManagerTest-{os.getpid()}"
+    QLocalServer.removeServer(name)
+    server = QLocalServer()
+    assert server.listen(name), server.errorString()
+    clients = []
+    try:
+        for _ in range(3):
+            sock = QLocalSocket()
+            sock.connectToServer(name)
+            assert sock.waitForConnected(2000)
+            clients.append(sock)
+        deadline = time.monotonic() + 3
+        while not server.hasPendingConnections() and time.monotonic() < deadline:
+            qapp.processEvents()
+        assert server.hasPendingConnections() is True
+
+        assert drain_pending_connections(server) >= 1
+        # 反复排空后队列必须为空（以前从不取走 → 满 30 后不再发 newConnection）
+        qapp.processEvents()
+        drain_pending_connections(server)
+        assert server.hasPendingConnections() is False
+    finally:
+        for sock in clients:
+            sock.abort()
+        server.close()
+        QLocalServer.removeServer(name)
+
+
+# ---- P2-9：InstallPiDialog 关闭时不再碰悬垂的 self._worker -------------------
+
+def test_install_dialog_close_after_worker_deleted(qapp, isolated_home):
+    from PySide6.QtGui import QCloseEvent
+
+    dialog = InstallPiDialog(status={"node_version": "22", "npm_version": "11"})
+    try:
+        worker = dialog._track(Worker(lambda: (0, "ok", "")))
+        dialog._worker = worker
+        worker.start()
+        deadline = time.monotonic() + 3
+        while worker in dialog._workers and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.005)
+        assert dialog._workers == []
+        qapp.processEvents()  # 处理 deleteLater：dialog._worker 变成悬垂包装器
+        event = QCloseEvent()
+        dialog.closeEvent(event)  # 以前这里 RuntimeError: C++ object already deleted
+        assert event.isAccepted() is True
+        assert dialog.btn_install.isDefault() is True  # 回车键有默认按钮
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qapp.processEvents()
+
+
+# ---- P3-17 / P3-18 / P3-19：主题覆盖、版本标签、按钮参数 --------------------
+
+def test_stylesheet_covers_previously_orphaned_object_names():
+    from pi_manager.presentation.design.stylesheet import build_stylesheet
+
+    for mode in ("day", "night"):
+        css = build_stylesheet(mode, "blue")
+        for selector in ("QLabel#cardTitle", "QLabel#chatThumb", "QSplitter::handle"):
+            assert selector in css, f"{mode} mode missing {selector}"
+        # 迁移遗留的死选择器
+        assert "QLabel#pill" not in css
+        assert "QFrame#heroCard" not in css
+
+
+def test_success_button_hover_brightens_in_both_modes():
+    for mode in ("day", "night"):
+        colors = tokens_for(mode, "blue")
+        base = QColor(colors.success)
+        hover = QColor(colors.success_hover)
+        assert hover.lightness() > base.lightness(), (
+            f"{mode} mode: success hover must brighten"
+        )
+
+
+def test_nav_version_label_is_visible_when_expanded(qapp, isolated_home):
+    window = ModernMainWindow(start_background=False)
+    try:
+        window.nav.set_collapsed(False)
+        window.nav.set_version("pi: 0.80.10")
+        assert window.nav.version_label.isVisibleTo(window.nav) is True
+        assert window.nav.version_label.text() == "pi: 0.80.10"
+        window.nav.set_collapsed(True)
+        assert window.nav.version_label.isVisibleTo(window.nav) is False
+    finally:
+        _dispose(window, qapp)
+
+
+def test_app_button_swallows_clicked_checked_argument(qapp):
+    from pi_manager.presentation.components.primitives import AppButton
+
+    received = []
+
+    def slot(force=None):
+        received.append(force)
+
+    button = AppButton("test", slot)
+    try:
+        button.click()
+        assert received == [None], "clicked(bool) must not fill the slot's first arg"
+    finally:
+        button.deleteLater()
+        qapp.processEvents()
+
+
+def test_navigation_shortcuts_and_page_headings(qapp, isolated_home):
+    window = ModernMainWindow(start_background=False)
+    try:
+        assert len(window._nav_shortcuts) == 11  # Ctrl+1..9 + Ctrl+Tab 双向
+        window._goto_page("plugins")
+        qapp.processEvents()
+        # 页头标题不再依赖两个 pageChanged 槽的连接顺序
+        assert window.page_heading.text() == "插件管理"
+        window._cycle_page(1)
+        qapp.processEvents()
+        assert window.nav.current_key() == "settings"
+        window._cycle_page(-1)
+        qapp.processEvents()
+        assert window.nav.current_key() == "plugins"
+    finally:
+        _dispose(window, qapp)
+
+
+# ---- 架构收敛第 1 步：隐式 widget 契约显式化 -------------------------------
+
+def test_window_widget_contract_is_complete(qapp, isolated_home):
+    from pi_manager.presentation.contract import WINDOW_WIDGET_NAMES
+
+    window = ModernMainWindow(start_background=False)
+    try:
+        missing = [n for n in WINDOW_WIDGET_NAMES if not hasattr(window, n)]
+        assert missing == [], f"presentation layer did not inject: {missing}"
     finally:
         _dispose(window, qapp)

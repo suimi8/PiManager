@@ -19,6 +19,22 @@ function sameEnv(a, b) {
 
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
+// 最小权限：respawn 时只保留最近使用的少数 Provider 凭据，而不是让
+// failover 链走过的**每一把 API Key** 都永久留在长驻子进程的环境变量里
+// （审查报告 C-6）。保留 2 个即可支撑「当前 Provider + 下一个候选」的
+// set_model 热切换，同时把内存转储/崩溃报告的暴露面压到最小。
+const MAX_RETAINED_PROVIDER_ENVS = 2;
+
+// 按最近使用顺序裁剪：provider 为本轮使用者，永远保留。
+function retainRecentProviderEnvs(envByProvider, provider, limit = MAX_RETAINED_PROVIDER_ENVS) {
+  const keys = [...envByProvider.keys()].filter((key) => key !== provider);
+  // Map 保持插入顺序，最早插入的先淘汰。
+  while (keys.length && envByProvider.size > Math.max(1, limit)) {
+    envByProvider.delete(keys.shift());
+  }
+  return envByProvider;
+}
+
 class RpcChatManager {
   constructor({ createSession = (spec) => new PiRpcSession(spec), idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS } = {}) {
     this._createSession = createSession;
@@ -112,7 +128,10 @@ class RpcChatManager {
     if (needsRespawn) {
       const sessionId = entry ? entry.sessionId : crypto.randomUUID();
       const envByProvider = new Map(entry ? entry.envByProvider : []);
+      // 重新插入以刷新最近使用顺序，再裁剪到上限。
+      envByProvider.delete(provider);
       envByProvider.set(provider, { ...(providerEnv || {}) });
+      retainRecentProviderEnvs(envByProvider, provider);
       if (entry) {
         this._clearTimer(entry);
         try {
@@ -147,6 +166,8 @@ class RpcChatManager {
 }
 
 module.exports = {
+  MAX_RETAINED_PROVIDER_ENVS,
   RpcChatManager,
+  retainRecentProviderEnvs,
   sameEnv,
 };

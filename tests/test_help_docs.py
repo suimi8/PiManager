@@ -6,8 +6,13 @@
 """
 from __future__ import annotations
 
+import re
+from pathlib import Path
 
 from pi_manager import help_docs
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+TUTORIAL_DOC = REPO_ROOT / "docs" / "使用教程.md"
 
 
 def test_h1_h2_h3_headings_rendered():
@@ -158,3 +163,63 @@ def test_help_section_html_wraps_markdown():
     section = help_docs.help_section_html("### 小节\n\n- 条目\n")
     assert section.startswith("<html>")
     assert "<h3" in section and "<li" in section
+
+
+# ---- 文档单一来源：docs/使用教程.md 由 HELP_MARKDOWN 生成 ----
+
+
+def test_tutorial_doc_is_generated_from_help_markdown():
+    """`docs/使用教程.md` 必须与 `HELP_MARKDOWN` 逐字一致（消除重复源）。
+
+    此前二者是同一份教程的两个手工副本、已双向漂移（审查 G2）：应用内帮助页有
+    「插件」「识图」「Provider 一键模板」整节而文档站没有，FAQ 编号还错位到同号
+    不同题。现在文档是生成产物，任何一次只改一边都会让本用例与 CI 的
+    `consistency` job 直接红。
+
+    改教程内容请改 `pi_manager/help_docs.py`，再运行
+    `python scripts/check_versions.py --write`。
+    """
+    assert TUTORIAL_DOC.is_file(), f"缺少 {TUTORIAL_DOC}"
+    doc = TUTORIAL_DOC.read_text(encoding="utf-8").replace("\r\n", "\n")
+    assert doc.startswith("<!-- 本文件由 pi_manager/help_docs.py"), (
+        "使用教程缺少「自动生成、请勿手工编辑」头注释"
+    )
+    body = doc.split("-->", 2)[-1].lstrip("\n")
+    assert body == help_docs.HELP_MARKDOWN.lstrip("\n"), (
+        "docs/使用教程.md 与 help_docs.HELP_MARKDOWN 不一致；"
+        "请运行 python scripts/check_versions.py --write 重新生成"
+    )
+
+
+def test_tutorial_covers_every_navigation_page():
+    """11 个侧边栏页面每一个都必须在教程「功能分类说明」里有对应小节。
+
+    「插件」页（v1.8.4 主特性）此前在文档站完全缺失，用户读到的是上一代产品。
+    这条断言让"加了新页面但没写文档"变成可检测项。
+    """
+    from pi_manager.ui import NAV_PAGES
+
+    md = help_docs.HELP_MARKDOWN
+    headings = set(re.findall(r"^### (.+?)$", md, flags=re.MULTILINE))
+    missing = [
+        label
+        for _key, label, _desc in NAV_PAGES
+        if label != "使用教程"  # 教程页本身不需要自我介绍
+        and not any(label in heading for heading in headings)
+    ]
+    assert not missing, f"教程「功能分类说明」缺少这些导航页的小节: {missing}"
+
+
+def test_faq_numbering_is_contiguous_and_unique():
+    """FAQ 编号必须连续且不重复（漂移期两份副本出现过同号不同题）。"""
+    numbers = [int(n) for n in re.findall(r"^\*\*Q(\d+)[：:]", help_docs.HELP_MARKDOWN,
+                                          flags=re.MULTILINE)]
+    assert numbers, "未解析到任何 FAQ 条目"
+    assert numbers == sorted(numbers), f"FAQ 编号非递增: {numbers}"
+    assert len(numbers) == len(set(numbers)), f"FAQ 编号重复: {numbers}"
+    assert numbers == list(range(1, len(numbers) + 1)), f"FAQ 编号不连续: {numbers}"
+
+
+def test_tutorial_does_not_advertise_removed_windows_directory_build():
+    """Windows 目录版已在 v1.8.5/1.8.6 移除，教程不得再引导用户去用它。"""
+    assert "目录版或新单文件" not in help_docs.HELP_MARKDOWN

@@ -7,5 +7,86 @@ the official Pi Coding Agent (@earendil-works/pi-coding-agent).
 PiManager is an independent third-party tool and is not affiliated with
 or endorsed by the Pi Coding Agent authors unless otherwise stated.
 
-Third-party dependencies are distributed under their respective licenses
-(see each package metadata, for example PySide6/Qt, keyring, cryptography).
+--------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------
+
+PiManager itself is licensed under the Apache License 2.0 (see LICENSE).
+The following third-party components are bundled into the distributed
+binaries (PyInstaller onefile / onedir / .app) and remain under their own
+licenses. None of them is a strong-copyleft (GPL) component; see the
+PyInstaller note below.
+
+  Component      License                        Project
+  ------------------------------------------------------------------------
+  PySide6 / Qt   LGPL v3 (see LGPL note below)  https://doc.qt.io/qtforpython/
+  cryptography   Apache-2.0 OR BSD-3-Clause     https://github.com/pyca/cryptography
+  keyring        MIT                            https://github.com/jaraco/keyring
+  PyYAML         MIT                            https://pyyaml.org/
+  certifi        MPL-2.0 (see MPL note below)   https://github.com/certifi/python-certifi
+  PyInstaller    GPL-2.0 WITH Bootloader-       https://pyinstaller.org/
+                 exception (build tool only)
+
+--------------------------------------------------------------------------
+PySide6 / Qt — LGPL v3 notice and relinking rights
+--------------------------------------------------------------------------
+
+PiManager uses PySide6 (Qt for Python) under the terms of the GNU Lesser
+General Public License version 3 (LGPL v3). PiManager holds no commercial
+Qt license; the LGPL is the license under which Qt is used here.
+
+The Windows release is a PyInstaller *onefile* executable, and the macOS /
+Linux releases are PyInstaller bundles: in all cases PySide6/Qt shared
+libraries are embedded in the distributed artifact rather than resolved from
+the user's system. LGPL v3 therefore requires that recipients be able to
+replace or relink the LGPL-covered libraries. We satisfy that as follows.
+
+1. Complete corresponding source for PiManager itself (the LGPL "work that
+   uses the Library") is published at:
+       https://github.com/suimi8/PiManager
+   The exact revision of every release is tagged (vX.Y.Z).
+
+2. PySide6/Qt is used **unmodified**, installed from PyPI at the exact
+   version pinned in `requirements.txt`. Its source is available from:
+       https://download.qt.io/official_releases/QtForPython/
+       https://pypi.org/project/PySide6/
+   (Upstream Qt sources: https://download.qt.io/official_releases/qt/)
+
+3. To relink PiManager against a different PySide6/Qt build, install that
+   build and rebuild from source — no PiManager change is needed:
+       python -m pip install -r requirements.txt -r requirements-dev.txt
+       python -m pip install --force-reinstall PySide6==<your version>
+       python -m PyInstaller --noconfirm --clean PiManager.spec
+   See BUILD.md for the full procedure. Alternatively, run PiManager
+   directly from source (`python main.py`), which links against whichever
+   PySide6 is installed in the environment.
+
+4. The LGPL v3 and GPL v3 license texts accompany the PySide6 distribution
+   and are also available at https://www.gnu.org/licenses/lgpl-3.0.html
+   and https://www.gnu.org/licenses/gpl-3.0.html .
+
+Nothing in this notice restricts the rights LGPL v3 grants you. Where this
+notice and LGPL v3 conflict, LGPL v3 governs the PySide6/Qt components.
+
+--------------------------------------------------------------------------
+certifi — MPL-2.0 notice
+--------------------------------------------------------------------------
+
+certifi is distributed under the Mozilla Public License 2.0, a file-level
+weak-copyleft license. certifi is bundled unmodified; its source and license
+text are available at https://github.com/certifi/python-certifi . Under
+MPL-2.0 §3.2 you may obtain the source of the covered files from that
+repository. PiManager does not modify certifi.
+
+--------------------------------------------------------------------------
+PyInstaller — GPL with bootloader exception
+--------------------------------------------------------------------------
+
+PyInstaller is a build-time tool and is not a runtime dependency of
+PiManager (it is declared in `requirements-dev.txt`, not
+`requirements.txt`). The PyInstaller bootloader embedded in the frozen
+executables is covered by GPL-2.0 **with the PyInstaller bootloader
+exception**, which explicitly permits distributing frozen applications
+under any license of the author's choosing. PiManager's Apache-2.0
+licensing is therefore unaffected; no GPL obligation propagates to
+PiManager's own source.

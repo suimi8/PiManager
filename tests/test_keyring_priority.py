@@ -209,3 +209,64 @@ def test_keyring_probe_retriable_after_cooldown(monkeypatch):
     secretstore._get_keyring()
     # It should not be None if the retry succeeds
     # (may still be None due to probe logic, but _KEYRING_TRIED should be reset)
+
+
+class _RecordingKeyring(_FakeKeyring):
+    """记录所有调用，用于断言探测阶段没有副作用。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[str, str]] = []
+
+    def get_password(self, service: str, username: str) -> str | None:
+        self.calls.append(("get", username))
+        return super().get_password(service, username)
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        self.calls.append(("set", username))
+        super().set_password(service, username, password)
+
+    def delete_password(self, service: str, username: str) -> None:
+        self.calls.append(("delete", username))
+        super().delete_password(service, username)
+
+
+def test_keyring_probe_is_read_only(isolated_home, monkeypatch):
+    """R2 P3-7：探测不得向 keyring 写入/删除记录（macOS 上会弹授权框并在钥匙串
+    审计日志留痕）。只读探测足够，写能力由 set_secret 的写后回读校验兜住。
+    """
+    fake = _RecordingKeyring()
+    previous = keyring.get_keyring()
+    keyring.set_keyring(fake)
+    monkeypatch.setattr(secretstore, "_KEYRING", None)
+    monkeypatch.setattr(secretstore, "_KEYRING_TRIED", False)
+    try:
+        assert secretstore._get_keyring() is not None
+        assert [kind for kind, _name in fake.calls] == ["get"]
+        assert fake.store == {}
+    finally:
+        keyring.set_keyring(previous)
+
+
+def test_keyring_write_is_verified_before_dropping_the_vault_copy(
+    isolated_home, monkeypatch
+):
+    """写后回读校验：后端「写不报错但读回是空」时必须保留 vault 副本，否则密钥会
+    在 keyring 与 vault 两端同时消失。"""
+
+    class _SilentlyDroppingKeyring(_FakeKeyring):
+        def set_password(self, service: str, username: str, password: str) -> None:
+            pass  # 假装成功，实际不持久化
+
+    fake = _SilentlyDroppingKeyring()
+    previous = keyring.get_keyring()
+    keyring.set_keyring(fake)
+    monkeypatch.setattr(secretstore, "_KEYRING", None)
+    monkeypatch.setattr(secretstore, "_KEYRING_TRIED", False)
+    try:
+        secretstore.set_secret("test:key", "must-survive")
+        assert secretstore.load_vault().get("test:key") == "must-survive"
+        assert secretstore.get_secret("test:key") == "must-survive"
+    finally:
+        keyring.set_keyring(previous)
+

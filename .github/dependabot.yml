@@ -1,0 +1,44 @@
+# 依赖全部 == 精确钉版（可复现性好），但此前无任何自动更新机制：上游安全补丁
+# （cryptography / certifi 尤其相关）完全依赖人工发现（审查 Dep7 / P2-6）。
+# 每周一次，逐个 ecosystem 限流，避免 PR 洪水。
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "@chore"
+    labels: ["dependencies", "python"]
+
+  # Cursor 扩展
+  - package-ecosystem: "npm"
+    directory: "/extensions/pi-cursor"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "@chore"
+    labels: ["dependencies", "javascript"]
+
+  # 内置 MCP 桥 extension（随包分发，DEVELOPMENT_STANDARDS.md §7 要求提交 lockfile）
+  - package-ecosystem: "npm"
+    directory: "/assets/builtin/extensions/pi-manager-mcp-bridge"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "@chore"
+    labels: ["dependencies", "javascript"]
+
+  # workflow 里 17 处 `uses:` 全部钉到 40 位 commit SHA（做得好，必须保持）。
+  # dependabot 会在保持 SHA 钉死的前提下更新，并在 PR 里带上版本注释。
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "@chore"
+    labels: ["dependencies", "github-actions"]

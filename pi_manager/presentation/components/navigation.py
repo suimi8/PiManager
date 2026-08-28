@@ -86,6 +86,7 @@ class NavigationRail(QFrame):
         self.collapse_button.setObjectName("navToggle")
         self.collapse_button.setCursor(Qt.PointingHandCursor)
         self.collapse_button.setToolTip("收起侧边栏")
+        self.collapse_button.setAccessibleName("折叠侧边栏")
         self.collapse_button.clicked.connect(lambda: self.set_collapsed(not self._collapsed))
         brand_row.addWidget(self.collapse_button)
         root.addWidget(brand)
@@ -166,7 +167,10 @@ class NavigationRail(QFrame):
         self.version_label = QLabel("pi: 检查中")
         self.version_label.setObjectName("versionPill")
         self.version_label.setAlignment(Qt.AlignCenter)
-        self.version_label.setWordWrap(True)
+        # 固定单行高度：footer 高度用常量算（见 _apply_footer_layout 注释），
+        # 换行会让版本标签溢出 footer 边界。长文本靠 tooltip 兜底。
+        self.version_label.setWordWrap(False)
+        self.version_label.setFixedHeight(20)
         footer.addWidget(self.version_label)
         root.addWidget(self.footer)
         self.update_icons()
@@ -176,6 +180,8 @@ class NavigationRail(QFrame):
         button.setObjectName("iconButton")
         button.setCursor(Qt.PointingHandCursor)
         button.setToolTip(tooltip)
+        # 纯图标按钮：屏幕阅读器拿不到任何名称，直接复用 tooltip 文案。
+        button.setAccessibleName(tooltip)
         button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         button.setFixedHeight(32)
         button.clicked.connect(signal)
@@ -274,6 +280,8 @@ class NavigationRail(QFrame):
         if self._collapsed:
             layout.setContentsMargins(7, 9, 7, 9)
             layout.setSpacing(6)
+            # 折叠态内部只有 ~38px 宽，放不下版本文本；版本仍可从 launch_button
+            # 的 tooltip 看到（见 set_version）。
             self.version_label.setVisible(False)
             layout.addWidget(self.launch_button)
             for button in (self.refresh_button, self.theme_button, self.config_button):
@@ -284,7 +292,10 @@ class NavigationRail(QFrame):
         else:
             layout.setContentsMargins(9, 9, 9, 9)
             layout.setSpacing(7)
-            self.version_label.setVisible(False)
+            # 展开态恢复显示 pi 版本：_apply_footer_layout 曾用 takeAt(0) 清空
+            # footer 后没有把 version_label 重新 addWidget 回去，且两个分支都
+            # setVisible(False)，导致 set_version() 写入的文本永远不可见。
+            self.version_label.setVisible(True)
             layout.addWidget(self.launch_button)
             utility = QHBoxLayout()
             utility.setSpacing(4)
@@ -294,6 +305,7 @@ class NavigationRail(QFrame):
                 button.setFixedHeight(32)
                 utility.addWidget(button)
             layout.addLayout(utility)
+            layout.addWidget(self.version_label)
         layout.activate()
         self.footer.updateGeometry()
         # Footer items are built while the rail may still be hidden and before
@@ -307,7 +319,8 @@ class NavigationRail(QFrame):
         if self._collapsed:
             hint = 9 + 40 + 6 + 48 * 3 + 6 * 2 + 9 + 2
         else:
-            hint = 9 + 40 + 7 + 48 + 9 + 2
+            #   version pill: 固定 20 px 单行
+            hint = 9 + 40 + 7 + 48 + 7 + 20 + 9 + 2
         self.footer.setFixedHeight(hint)
         self.footer.setMinimumHeight(hint)
         self.footer.updateGeometry()
@@ -317,6 +330,7 @@ class NavigationRail(QFrame):
 
     def set_version(self, text: str) -> None:
         self.version_label.setText(text)
+        self.version_label.setToolTip(text)
         self.launch_button.setToolTip(
             "启动完整 Pi" + (f"\n{text}" if text else "")
         )

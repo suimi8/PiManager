@@ -1,7 +1,7 @@
 # PiManager
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-green.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](#)
 
 跨平台 GUI，用于配置、切换、测试和启动官方 [Pi Coding Agent](https://github.com/badlogic/pi-mono)（`@earendil-works/pi-coding-agent`）。
@@ -73,7 +73,7 @@ macOS 若提示无法打开未签名应用：右键打开，或到系统设置 �
 
 **依赖**
 
-- Python 3.10+
+- Python 3.11+（CI 测试矩阵 3.11 / 3.12；权威声明见 `pyproject.toml` 的 `requires-python`）
 - Node.js + 官方 Pi CLI（`npm install -g @earendil-works/pi-coding-agent`）
 
 ```bash
@@ -86,9 +86,11 @@ python main.py
 ### 运行测试
 
 ```bash
-python -m pip install pytest
+python -m pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
+
+提交前的完整门禁见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## Cursor 扩展
 
@@ -108,12 +110,18 @@ pi.providerEnvCommand = python /path/to/PiManager/main.py --print-provider-env
 
 打包版可写为：`/path/to/PiManager.exe --print-provider-env`。
 
+> **扩展与桌面端必须同版本升级**：`--print-provider-env` 现在要求调用方按值出示
+> `~/.pi/agent/.broker-token`（`--token <值>` / `--token-file <文件>`），与
+> `--config-mutate` 共用同一套授权模型。扩展 0.7.2+ 会自己读取并附加 token，
+> 上面的 `pi.providerEnvCommand` 写法**不需要改**；但**旧版 VSIX 不带 token，
+> 升级桌面端后会取不到密钥**，请同步安装 Release 中配套的 `.vsix`。
+
 ## 打包
 
 详见 [BUILD.md](BUILD.md)。本地（当前操作系统）：
 
 ```bash
-python -m pip install -r requirements.txt pyinstaller
+python -m pip install -r requirements.txt -r requirements-dev.txt
 # Windows（单文件版）:
 python -m PyInstaller --noconfirm --clean PiManagerOneFile.spec
 # macOS / Linux（目录版 / .app）:
@@ -136,9 +144,14 @@ Actions → **Build** → **Run workflow**。CI 会在三端分别构建并做 `
 
 主要文件：
 
-- `settings.json` / `models.json` / `pi-manager.json`
-- `secrets.vault`（仅在 OS keyring 不可用时使用）
-- `pi-manager-test-history.json` / `pi-manager-health.json`
+- `settings.json` / `models.json` / `pi-manager.json` / `auth.json`
+- `secrets.vault`（仅在 OS keyring 不可用时使用）；`secrets.index.json` 与 `.vault_master_key` 是它的索引与盐，**与密钥同等敏感，不要拷贝或提交**
+- `pi-plugins.json`（插件注册表）/ `pimanager/plugins/<id>/<version>/`（已安装插件副本）/ `skills/`、`extensions/`（内置插件落盘）
+- `mcp-servers.json`（MCP 桥）/ `themes/`（CLI 主题）
+- `pi-manager-test-history.json` / `pi-manager-health.json` / `pi-manager-helper.json`
+- `.broker-token` / `.config-revisions.json`（配置 Broker 凭据与修订记录，**凭据等价物**）
+
+完整清单与「哪些该备份、哪些不该拷」见 [使用教程 → 路径速查](docs/使用教程.md#五路径速查)。迁移请用「工具 → 导出配置包」，不要手工拷贝目录。
 
 真实 API Key **不会**明文写入 `models.json`。配置中仅保存官方 Pi 支持的引用，例如：
 
@@ -152,8 +165,11 @@ PiManager 启动官方 Pi 时从安全存储读取并注入子进程环境。
 
 ## 文档
 
-- [使用教程与 FAQ](docs/使用教程.md)
+- [使用教程与 FAQ](docs/使用教程.md)（由 `pi_manager/help_docs.py` 生成，与应用内帮助页同源）
+- [发布说明 / 变更记录](docs/发布说明.md)
 - [构建说明](BUILD.md)
+- [开发规范（唯一权威正文）](docs/DEVELOPMENT_STANDARDS.md) · [贡献指南](CONTRIBUTING.md)
+- [安全策略与威胁模型](SECURITY.md) · [插件格式](docs/PLUGIN_FORMAT.md)
 - [Cursor 扩展说明](extensions/pi-cursor/README.md)
 
 ## 安全说明
@@ -162,7 +178,12 @@ PiManager 启动官方 Pi 时从安全存储读取并注入子进程环境。
 - 回退文件库 `secrets.vault`（OS keyring 不可用时使用）的机密性依赖文件权限（仅当前用户可读/写）与随机盐（PBKDF2-HMAC-SHA256 派生 AES 密钥）；Windows 上另有 DPAPI 保护，密钥绑定当前 Windows 用户
 - 导出含密钥的配置包时务必设置强密码
 - 内置 MCP 桥扩展 spawn 第三方 MCP server 时仅透传白名单基础环境（`PATH`/`HOME`/`TEMP` 等），provider API Key 不会被继承；如需给某个 MCP server 传密钥，必须在 `~/.pi/agent/mcp-servers.json` 该 server 的 `env` 中显式写出
-- 发现安全问题请优先私下联系维护者，避免在公开 Issue 中粘贴密钥
+- 冻结产物**只信任内嵌资源**（`sys._MEIPASS`），便携单文件版不再读取 exe 同级目录的 `assets/`——否则在 exe 旁投放 `assets/builtin/manifest.json` 即可让应用把攻击者的内置扩展（拥有当前用户完整权限）落盘到 `~/.pi/agent/extensions/`
+- Provider / Model / Thinking 名称有字符白名单（Provider：字母数字与 `. _ - : @ +`；Model 再加 `/`；Thinking：字母数字与 `_ -`）；含 `"` `&` `|` `%` 等字符的名称会拒绝启动 Pi（这些字符此前可经 Windows `cmd.exe` shim 注入任意命令），校验全平台生效
+- Windows 上 `.broker-token` / `secrets.vault` / `.vault_master_key` / `secrets.index.json` / `pi-manager-helper.json` 会真正收紧 DACL 到仅当前用户
+- 导入配置包默认**不覆盖 `AGENTS.md`**，且拒绝含可执行语义键（`hook` / `mcpServer` / `command` / `shell` / `exec` / `env` / `permissions` 等）的 `settings.json`——覆盖 `AGENTS.md` 等于让下一次运行的 Pi 遵循配置包作者的指令（Pi 有 shell 权限）
+- 升级到本版本的行为变更（旧 VSIX 取不到密钥、旧格式 vault 需重填或一次性迁移）见 [发布说明 → 破坏性变更](docs/发布说明.md) 与 [使用教程 FAQ 第 G 组](docs/使用教程.md)
+- 发现安全问题请走 GitHub Security Advisory 私密报告（仓库 **Security → Report a vulnerability**），流程见 [SECURITY.md](SECURITY.md)；避免在公开 Issue 中粘贴密钥
 
 ## 许可证
 

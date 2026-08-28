@@ -1,6 +1,7 @@
 """Modern session browser page."""
 from __future__ import annotations
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
@@ -28,8 +29,18 @@ def build_sessions_page(window) -> QWidget:
     window.session_filter_wd.setPlaceholderText("筛选项目或工作目录…")
     window.session_filter_name = QLineEdit()
     window.session_filter_name.setPlaceholderText("筛选模型、预览或文件名…")
-    window.session_filter_wd.textChanged.connect(window.sessions_apply_filter)
-    window.session_filter_name.textChanged.connect(window.sessions_apply_filter)
+    # 筛选防抖：sessions_apply_filter 只对 refresh_sessions 缓存做内存过滤，
+    # 但仍要重建整表；按每次击键触发在数百会话时可感知。
+    window._session_filter_debounce = QTimer(window)
+    window._session_filter_debounce.setSingleShot(True)
+    window._session_filter_debounce.setInterval(180)
+    window._session_filter_debounce.timeout.connect(window.sessions_apply_filter)
+    window.session_filter_wd.textChanged.connect(
+        lambda _text: window._session_filter_debounce.start()
+    )
+    window.session_filter_name.textChanged.connect(
+        lambda _text: window._session_filter_debounce.start()
+    )
     filters.addWidget(window.session_filter_wd, 1)
     filters.addWidget(window.session_filter_name, 1)
     filters.addWidget(window._btn("刷新", window.refresh_sessions, secondary=True))

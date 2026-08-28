@@ -143,19 +143,14 @@ QFrame#pageBody {{
 }}
 
 /* Surfaces */
-QFrame#surfaceCard, QFrame#card {{
+QFrame#surfaceCard {{
     background: {c.surface};
     border: 1px solid {c.border};
     border-radius: 12px;
 }}
-QFrame#surfaceCard[elevated="true"], QFrame#card[elevated="true"] {{
+QFrame#surfaceCard[elevated="true"] {{
     background: {c.surface_raised};
     border-color: {c.border_strong};
-}}
-QFrame#heroCard {{
-    background: {c.surface_raised};
-    border: 1px solid {c.border_strong};
-    border-radius: 14px;
 }}
 QFrame#metricCard {{
     background: {c.surface};
@@ -179,6 +174,41 @@ QLabel#sectionTitle {{
     color: {c.text};
     font-size: 14px;
     font-weight: 650;
+}}
+/* 插件卡片标题（plugins.py 用 cardTitle）：以前无选择器，以正文字号/颜色
+   渲染，与其他页面用 sectionTitle 的卡片视觉不一致。 */
+QLabel#cardTitle {{
+    color: {c.text};
+    font-size: 13px;
+    font-weight: 640;
+}}
+/* 聊天图片缩略图（ui_features.py 用 chatThumb）：以前无边框/圆角。 */
+QLabel#chatThumb {{
+    background: {c.surface_hover};
+    border: 1px solid {c.border};
+    border-radius: 6px;
+    padding: 2px;
+}}
+/* 导航滚动区：以前只靠 QWidget{{background:transparent}} 兜底。 */
+QWidget#navHost, QScrollArea#navScroll {{
+    background: {c.sidebar};
+    border: none;
+}}
+/* QSplitter（models.py / chat.py 均在用）：以前无规则，分隔手柄使用 Fusion
+   默认外观，夜间模式下与周围表面色不协调。 */
+QSplitter::handle {{
+    background: {c.border};
+}}
+QSplitter::handle:horizontal {{
+    width: 4px;
+    margin: 6px 2px;
+}}
+QSplitter::handle:vertical {{
+    height: 4px;
+    margin: 2px 6px;
+}}
+QSplitter::handle:hover {{
+    background: {c.accent};
 }}
 QLabel#sectionKicker {{
     color: {c.text_muted};
@@ -332,8 +362,10 @@ QPushButton[success="true"] {{
     color: #FFFFFF;
 }}
 QPushButton[success="true"]:hover {{
-    background: #2FB565;
-    border-color: #2FB565;
+    /* 曾硬编码 #2FB565：白天模式比 success(#16A34A) 亮 → 对；夜间模式比
+       success(#35C56F) 暗 → hover 反馈方向与其他按钮相反。改走 token。 */
+    background: {c.success_hover};
+    border-color: {c.success_hover};
 }}
 QPushButton[danger="true"] {{
     background: {c.danger_soft};
@@ -591,13 +623,6 @@ QFrame#dropZone {{
 QFrame#dropZone[active="true"] {{
     background: {c.accent_soft};
     border: 1px solid {c.accent};
-}}
-QLabel#pill {{
-    color: {c.text_secondary};
-    background: {c.surface_hover};
-    border: 1px solid {c.border};
-    border-radius: 9px;
-    padding: 4px 8px;
 }}
 QProgressBar {{
     background: {c.input};

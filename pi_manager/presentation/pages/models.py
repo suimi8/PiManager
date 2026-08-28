@@ -1,7 +1,7 @@
 """Modern model catalog page."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -44,7 +44,15 @@ def build_models_page(window) -> QWidget:
         window.model_filter.setClearButtonEnabled(True)
     except Exception:
         pass
-    window.model_filter.textChanged.connect(window.fill_models_table)
+    # 搜索防抖：整树重建在 200 模型规模下是 25 ms+，按每次击键触发会让输入
+    # 明显发涩。180 ms 静默后才重建；用户直接调 fill_models_table 不受影响。
+    window._model_filter_debounce = QTimer(window)
+    window._model_filter_debounce.setSingleShot(True)
+    window._model_filter_debounce.setInterval(180)
+    window._model_filter_debounce.timeout.connect(window.fill_models_table)
+    window.model_filter.textChanged.connect(
+        lambda _text: window._model_filter_debounce.start()
+    )
     window.model_only_favorites = QCheckBox("仅看收藏")
     window.model_only_favorites.toggled.connect(window.fill_models_table)
     filters.addWidget(window.model_provider_filter)
@@ -102,6 +110,11 @@ def build_models_page(window) -> QWidget:
     action_row.addWidget(window._btn("设为默认", window.model_set_default, success=True))
     action_row.addWidget(window._btn("启动 Pi", window.model_launch, secondary=True))
     action_row.addWidget(window._btn("测试选中", window.model_test_selected, secondary=True))
+    # BatchTestWorker 一直支持协作式取消，但此前没有任何 UI 入口。
+    window.model_test_cancel_btn = window._btn("停止测试", window.model_test_cancel, danger=True)
+    window.model_test_cancel_btn.setEnabled(False)
+    window.model_test_cancel_btn.setToolTip("停止正在进行的批量测试；未开始的项不再执行")
+    action_row.addWidget(window.model_test_cancel_btn)
     action_row.addWidget(window._btn("收藏", window.model_add_favorite_batch, ghost=True))
     action_row.addStretch(1)
     action_row.addWidget(QLabel("Thinking"))

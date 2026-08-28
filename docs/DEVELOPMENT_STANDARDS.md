@@ -13,16 +13,40 @@
 ```text
 CONTRIBUTING.md（新贡献者第一入口，导航壳）
   └── docs/DEVELOPMENT_STANDARDS.md（本文档，唯一权威正文）← 冲突时以这里为准
-        ├── AGENTS.md（机器可读不可破坏边界 + 检测不变量）
-        ├── BUILD.md（构建/发布操作手册）
-        ├── SECURITY.md（威胁模型/漏洞报告）
-        └── docs/PLUGIN_FORMAT.md（插件开发者规范）
+        ├── 维护者向
+        │     ├── AGENTS.md（机器可读不可破坏边界 + 检测不变量）
+        │     ├── BUILD.md（构建/发布操作手册）
+        │     ├── SECURITY.md（威胁模型/漏洞报告）
+        │     └── docs/PLUGIN_FORMAT.md（插件开发者规范）
+        └── 用户向（同样有更新义务，见下表）
+              ├── README.md（项目介绍 / 安装 / 配置目录 / 安全说明）
+              ├── pi_manager/help_docs.py → docs/使用教程.md（教程与 FAQ，生成关系）
+              ├── docs/发布说明.md（变更记录，兼产品介绍）
+              ├── NOTICE（第三方许可 + LGPL 重新链接说明）
+              └── docs/安全审计与修复Design.md（历史安全设计，状态见其文首）
 ```
 
 - 新贡献者：先读 `CONTRIBUTING.md`，再按需读本文档对应章节。
 - AI 编码代理（pi 等）：`AGENTS.md` 会被自动注入，原则性红线在其内；可自动化的
   检测项在本规范登记"由 X 强制"。
 - 插件开发者：`docs/PLUGIN_FORMAT.md` + 本规范第 7 节。
+
+### 0.1 用户向文档的更新义务（R10）
+
+用户向文档此前不在任何规范的责任范围内，直接导致 `docs/使用教程.md` 实质性过时：
+它描述的是上一代的 `pi -p` 快速提问实现，且完全没有「插件」「识图」「Provider
+一键模板」三块功能——而这些在应用内帮助页里都有。以下义务现在是红线 R10：
+
+| 改了什么 | 必须同步 | 强制者 |
+|---|---|---|
+| 新增/改名侧边栏页面（`ui.py:NAV_PAGES`） | `help_docs.py` 的「功能分类说明」小节 | `tests/test_help_docs.py::test_tutorial_covers_every_navigation_page` |
+| 改用户可见功能行为 | `help_docs.py`（`docs/使用教程.md` 由它生成） | `scripts/check_versions.py` + `tests/test_help_docs.py` |
+| 改配置目录下的文件布局 | `help_docs.py` 路径速查 + `README.md` 配置目录 + `docs/发布说明.md` | 人工 review |
+| 发版 | `docs/发布说明.md` 新增条目（**不留版本断层**）+ `README.md`/`BUILD.md` 的版本引用 | `scripts/check_versions.py` |
+| 新增/更换第三方依赖 | `NOTICE`（许可证 + 弱 copyleft 的源码获取途径） | 人工 review（见第 11 节） |
+
+**不要手工编辑 `docs/使用教程.md`**：它是 `pi_manager/help_docs.py` 的生成产物
+（改内容 → 改 `help_docs.py` → 跑 `python scripts/check_versions.py --write`）。
 
 ---
 
@@ -34,11 +58,14 @@ CONTRIBUTING.md（新贡献者第一入口，导航壳）
 | R2 | 用户配置目录固定 `~/.pi/agent/`（Windows `%USERPROFILE%\.pi\agent\`），不得改写 | 源码 grep + 现有测试 | `tests/test_plugin_standards.py` |
 | R3 | keyring 优先、vault 回退；导出含密钥必须 PBKDF2 + AES-256-GCM；密钥绝不落日志/未加密导出 | 现有安全测试 | `tests/test_keyring_priority.py` 等（AGENTS.md 已列） |
 | R4 | 轻量 CLI（`--print-provider-env` / `--vision-describe` / `--config-mutate`）不得 import PySide6 | AST 静态断言 | `tests/test_cli_dispatch.py` + `tests/test_plugin_standards.py` |
-| R5 | 桌面版本单一来源 = `pi_manager/extras.py:APP_VERSION`；Cursor 扩展版本 = `extensions/pi-cursor/package.json`；`docs/发布说明.md` / `docs/使用教程.md` 顶部版本同步 | `scripts/check_versions.py` | CI `consistency` job + `tests/test_plugin_standards.py` |
+| R5 | 桌面版本单一来源 = `pi_manager/extras.py:APP_VERSION`；Cursor 扩展版本 = `extensions/pi-cursor/package.json`；`docs/发布说明.md` / `docs/使用教程.md` 顶部版本同步；`README.md` / `BUILD.md` 的**操作性版本引用**（`--version X.Y.Z`、`vX.Y.Z`）同步 | `scripts/check_versions.py` | CI `consistency` job + `build.yml` `gate` job + `tests/test_plugin_standards.py` |
 | R6 | `pytest tests -q` 全绿；`main.py --self-check` 输出 OK；打包产物过 `smoke_test_dist.py`；Linux 用 xvfb | CI 现有 job | `ci.yml` test / self-check / nightly-packaging；`build.yml` |
 | R7 | 发布产物（`release-assets/`、`dist/`、构建目录）不得入库；二进制走 GitHub Releases | `git ls-files` 白名单 + review | 人工 + `tests/test_plugin_standards.py` 抽查 |
 | R8 | 用户可见文案中文；代码标识符/命令/路径不翻译 | 人工 review | PR 审查 |
 | R9 | 插件包必须通过 `plugin_manager.inspect_plugin` 级校验（SemVer、ID、资源路径、frontmatter） | `tests/test_plugin_security_matrix.py` 等 | CI test job |
+| R10 | 用户向文档随功能同步更新（见 §0.1 义务表）；`docs/使用教程.md` 是 `pi_manager/help_docs.py` 的生成产物，不得手改 | `scripts/check_versions.py` + 导航页覆盖断言 | CI `consistency` job + `tests/test_help_docs.py` |
+| R11 | 测试不得写开发者真实 `~/.pi/agent/` 或真实 OS keyring；写用户配置的用例必须声明 `isolated_home` | 静态 AST 门禁 + autouse 运行时守卫（阻断 + 兜底检测） | `tests/test_plugin_standards.py::test_home_mutating_tests_declare_isolated_home` + 仓库根 `conftest.py` |
+| R12 | 发布路径与合并路径过同一组门禁（ruff / check_secrets / check_versions / 覆盖率）；CI 的 `npm ci` 一律 `--ignore-scripts`；所有 `uses:` 钉到 40 位 commit SHA；每个 job 有 `timeout-minutes` | workflow 静态断言 | `build.yml` `gate` job + `tests/test_plugin_standards.py` 的 CI 卫生用例 |
 
 ---
 
@@ -149,16 +176,30 @@ CONTRIBUTING.md（新贡献者第一入口，导航壳）
 
 ## 8. 自动化审查（CI 强制项）
 
-CI（`.github/workflows/ci.yml`）在 push/PR 上强制以下 job：
+| job | 工作流 | 触发路径 | 内容 | 失败即阻断 |
+|-----|-----|-----|------|:---:|
+| `test` | `ci.yml` | push main / PR | 3 OS × 2 Python：pytest + 覆盖率（55%）+ self-check | 是 |
+| `lint` | `ci.yml` | push main / PR | `ruff check .` | 是 |
+| `secret-scan` | `ci.yml` | push main / PR | `check_secrets.py --scan-tests` | 是 |
+| `consistency` | `ci.yml` | push main / PR | `check_versions.py` + 规范/教程一致性测试 | 是 |
+| `extension-test` | `ci.yml` | push main / PR | `npm ci --ignore-scripts` + npm test | 是 |
+| `nightly-packaging` | `ci.yml` | 每日 schedule | PyInstaller + smoke + 覆盖率 | 是（发布回归） |
+| `supply-chain` | `ci.yml` | 每日 schedule | `pip-audit` + `npm audit` | 否（只报告） |
+| **`gate`** | `build.yml` | **tag 推送 / 手动 Build** | ruff + check_secrets + check_versions | **是（门禁不过不出包）** |
+| `build` | `build.yml` | tag 推送 / 手动 Build | `needs: gate`；pytest + 覆盖率 + PyInstaller + smoke + Release 上传 | 是 |
+| `package-vsix` | `build.yml` | tag 推送 / 手动 Build | `needs: [gate, build]`；扩展测试 + VSIX 打包上传 | 是 |
 
-| job | 内容 | 失败即阻断 |
-|-----|------|:---:|
-| `test` | 3 OS × 2 Python：pytest + 覆盖率 + self-check | 是 |
-| `lint` | `ruff check .` | 是 |
-| `secret-scan` | `python scripts/check_secrets.py --scan-tests` | 是 |
-| `consistency` | `python scripts/check_versions.py` + 规范一致性测试 | 是 |
-| `extension-test` | `extensions/pi-cursor` npm test | 是 |
-| `nightly-packaging` | 每日 PyInstaller + smoke | 是（发布回归） |
+**发布路径不再绕过门禁**：`build.yml` 曾经一个门禁都不跑，给任意从未进过 `main`
+的 commit 打个 tag 就能直接产出 GitHub Release 资产，也没有覆盖率门禁。现在
+`gate` 是 `build` 与 `package-vsix` 的前置依赖，两条路径用同一把尺子（R12）。
+
+流水线卫生（均由 `tests/test_plugin_standards.py` 静态断言守卫）：
+
+- 每个 job 有 `timeout-minutes`（GitHub 默认上限 6 小时）。
+- 全部 `uses:` 钉到 40 位 commit SHA；action 版本在两个 workflow 间保持一致。
+- 所有 `npm ci` 带 `--ignore-scripts`（这些 job 持有 `GITHUB_TOKEN`）。
+- 依赖一律 `pip install -r requirements-dev.txt`，不手写无约束的包名。
+- `concurrency`：`ci.yml` 取消进行中的旧轮次；`build.yml` 只排队不取消（发布不该被打断）。
 
 本地建议：pre-commit 挂 `ruff check`、`check_secrets.py`、`check_versions.py`。
 

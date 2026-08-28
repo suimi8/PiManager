@@ -1,9 +1,33 @@
 # Pi Manager 安全审计与修复 Design
 
-> 状态：Proposed  
-> 审计快照：2026-07-15 当前工作树  
-> 适用版本：Pi Manager 1.6.4、Pi Cursor 扩展 0.5.0  
+> 状态：**Superseded（历史设计文档，多数条目已实施）**  
+> 审计快照：2026-07-15 工作树 · 适用版本：Pi Manager **1.6.4**、Pi Cursor 扩展 **0.5.0**  
+> 复核时版本（2026-08-27）：Pi Manager 1.8.6 / 扩展 0.7.2 —— 本文的行号引用**均按 1.6.4 的代码**，
+> 现已大量失效；请把它当作「设计意图与验收标准」来读，不要当作现状描述。  
 > 文档目标：把已确认的安全、可靠性、内存和性能问题转换为可实施、可迁移、可验收的修复方案。
+
+## 0. 实施状态对照（2026-08-27 复核）
+
+本文长期停留在 `Proposed`，读者无法判断哪些结论仍然有效。下表按 §4 的问题 ID
+逐条标注**当前源码的实际状态**；每行都给出可自行复核的代码位点。
+
+| ID | 结论 | 当前实现位点 |
+|---|---|---|
+| SEC-001 不可信工作区控制扩展执行命令 | **已修复** | `extensions/pi-cursor/security-policy.js:19` `requireTrustedExecution()` 要求 `workspace.isTrusted === true`；可执行配置项走白名单 |
+| SEC-002 带引号 `!command` 绕过导入确认 | **已修复（改为直接拒绝）** | `pi_manager/extras.py` 对 `!command` 凭据/Header 抛错（「包含已禁用的 `!command` 凭据」），不再是「确认后执行」 |
+| SEC-003 更新无完整性校验、TAR 可逃逸 | **已缓解，但方案未实施** | `extras.py:apply_manager_update_inplace()` 无条件拒绝原地安装（「签名更新链尚未启用」）。风险靠**禁用功能**关闭；本文的签名/校验设计**仍然有效待实施** |
+| SEC-004 Provider 凭据随重定向传播 | **已修复（强于原方案）** | `pi_manager/http_client.py:18` `DenyRedirectHandler` 完全不跟随 3xx，把响应交回调用方，而非「同 Origin 才转发」 |
+| SEC-005 敏感 Header 明文持久化、脱敏不完整 | **已修复** | 含可执行语义的 Header 拒绝导入；脱敏模式扩充至 AKIA/xoxb/PEM/私钥块等（v1.8.4） |
+| SEC-006 回退主密钥权限窗口与启动校验 | **已修复** | `secrets.py` 用 `os.open(..., O_EXCL, 0o600)` 创建、写后 `chmod 0o600`；Windows 侧 DACL 收紧在 1.8.6 后一版真正生效（此前为空操作，见 `SECURITY.md`「平台文件权限加固」） |
+| REL-001 Python/Node 配置写入竞态 | **已修复** | 新增 `pi_manager/config_broker.py`：broker token 授权 + `.config-revisions.json` 修订记录 + `verify_recorded_revision()`；写入统一走 `storage.locked` 原子写 |
+| REL-002 QThread 取消无效并强制终止 | **已修复** | `ui.py` / `ui_features.py` 已无 `terminate()` 调用（实测 0 处） |
+| REL-003 损坏配置/Vault 静默当空数据 | **已修复** | `storage.py` 引入 `LoadResult` 显式状态（`ok`/`missing`/`corrupt`/`unsupported`），`corrupt`/`unsupported` 进入 fail-closed 只读并隔离到 `.corrupt.*` |
+| REL-004 429/Quota/Billing 被当永久失效 | **已修复** | 只有明确的 Key 错误进入失效池，HTTP 5xx / 超时 / DNS / 网络中断不停用 Key，失效 Key 可手动恢复（见 `README.md`、发布说明 v1.6.5） |
+| PERF-001 HTTP/子进程/扩展 JSON/聊天无界内存峰值 | **部分修复** | `http_client.py` 提供 `read_limited()` 与分类字节预算（`MODEL_LIST_MAX_BYTES` 4 MiB、`MODEL_TEST_MAX_BYTES` 2 MiB、`ERROR_MAX_BYTES` 64 KiB、`MANIFEST_MAX_BYTES` 1 MiB）；子进程输出与聊天历史上限未逐条复核 |
+
+> 复核范围说明：上表由只读静态核对得出，覆盖 §4 问题清单中 P0/P1 全部条目；
+> §4 表格中 P2 及更低条目（`SEC-006` 之后）未逐条复核，状态以本文原文为准。
+> 本文其余章节（§5 起）保留原始设计方案，未随实现改写——实现细节请以源码为准。
 
 ---
 

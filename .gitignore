@@ -41,9 +41,19 @@ desktop.ini
 **/secrets.dpapi
 **/auth.json
 **/.secrets.*
+# vault 盐文件与 secrets.vault 同等敏感（SECURITY.md「回退 vault 的威胁模型」：
+# pepper 随二进制公开，盐是剩余的全部保护）。此前不匹配上面任何一条规则。
+**/.vault_master_key
+**/secrets.index.json
+# config_broker 的 broker token 是凭据等价物（扩展凭它调用 --config-mutate）
+**/.broker-token
 # Lock files (keep specific; avoid over-broad *.lock)
 *.mutation.lock
 *.broker.lock
+
+# 子代理审查报告是过程产物，按 docs/DEVELOPMENT_STANDARDS.md §9.5「可归档不入库」
+# 处理；此前无规则，一次 `git add .` 就会把它们全部提交进来。
+docs/review/
 
 # Local workbench & build artifacts (not part of the open-source tree)
 work/

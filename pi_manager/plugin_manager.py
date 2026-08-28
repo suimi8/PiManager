@@ -50,6 +50,9 @@ MAX_MANIFEST_BYTES = 1 * 1024 * 1024
 MAX_DESCRIPTION_BYTES = 16 * 1024
 MAX_SKILL_FRONTMATTER_BYTES = 128 * 1024
 MAX_COMPRESSION_RATIO = 1_000
+# permissions.filesystem / process 是自由文本，会落进注册表并显示在 UI 卡片上；
+# 限长 + 拒绝控制字符，防止 UI 伪造状态行与注册表被超长文本撑爆。
+MAX_PERMISSION_VALUE_CHARS = 256
 # ZIP 目录成员数量与路径深度上限：防止恶意包用海量目录/超深路径触发 mkdir 风暴。
 MAX_ZIP_DIR_MEMBERS = 20_000
 MAX_ZIP_PATH_DEPTH = 64
@@ -378,6 +381,21 @@ def _validate_manager_metadata(manager: dict[str, Any]) -> None:
                         raise PluginValidationError(
                             f"piManager.permissions.network 只能填写主机名，"
                             f"不得包含路径、空白或凭据：{value!r}"
+                        )
+            else:
+                # filesystem / process 的取值是自由文本（如 workspace-read），
+                # 不做词表约束以免误拒；但必须限长并拒绝控制字符 / 换行：
+                # 这些值会原样落进 pi-plugins.json 并显示在插件卡片上，
+                # 多行文本可以在 UI 里伪造出额外的状态行，长文本会撑爆注册表。
+                for value in values:
+                    if len(value) > MAX_PERMISSION_VALUE_CHARS:
+                        raise PluginValidationError(
+                            f"piManager.permissions.{kind} 单项过长"
+                            f"（>{MAX_PERMISSION_VALUE_CHARS} 字符）"
+                        )
+                    if any(ch == "\x7f" or ord(ch) < 0x20 for ch in value):
+                        raise PluginValidationError(
+                            f"piManager.permissions.{kind} 不允许换行或控制字符：{value!r}"
                         )
 
     compatibility = manager.get("compatibility")
@@ -831,9 +849,39 @@ def _copy_file_safely(source: Path, destination: Path) -> None:
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if nofollow:
         flags |= nofollow
+    # Windows 没有 O_NOFOLLOW（实测 hasattr(os, "O_NOFOLLOW") 为 False），
+    # os.open 会跟随符号链接 / junction。此前 _walk_regular_files 的检查与这里的
+    # open 之间存在 TOCTOU：本地并发进程把源文件换成指向包外的链接，就能把任意
+    # 文件内容注入插件暂存包。这里用「打开前 lstat + 打开后 fstat 比对文件身份
+    # (st_dev, st_ino)」把窗口关掉：句柄指向的必须还是当初校验过的那个普通文件。
+    try:
+        before = os.stat(source, follow_symlinks=False)
+    except OSError as exc:
+        raise PluginValidationError(f"无法安全读取插件文件：{source}: {exc}") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise PluginValidationError(f"插件包含非普通文件：{source}")
     try:
         fd = os.open(source, flags)
     except OSError as exc:
+        raise PluginValidationError(f"无法安全读取插件文件：{source}: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise PluginValidationError(f"插件包含非普通文件：{source}")
+        if getattr(opened, "st_nlink", 1) > 1:
+            raise PluginValidationError(f"插件禁止硬链接文件：{source}")
+        # st_ino/st_dev 在 Windows 上由 Python 用 128 位 File ID 填充（实测非零）；
+        # 极少数文件系统可能返回 0，此时退回上面的 S_ISREG + nlink 检查，不误拒。
+        if before.st_ino and opened.st_ino:
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                raise PluginValidationError(
+                    f"插件文件在校验后被替换（疑似符号链接竞态）：{source}"
+                )
+    except PluginValidationError:
+        os.close(fd)
+        raise
+    except OSError as exc:
+        os.close(fd)
         raise PluginValidationError(f"无法安全读取插件文件：{source}: {exc}") from exc
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1375,7 +1423,19 @@ def list_plugins() -> list[dict[str, Any]]:
             record = copy.deepcopy(_registry_versions(entry).get(active_version, record))
             record["active_version"] = active_version
         versions = _registry_versions(entry)
-        record["available_versions"] = sorted(versions, key=_semver_key)
+        # available_versions 只列物理目录仍在的版本：UI 的回滚菜单直接用这个列表，
+        # 列出目录已被手工删除的版本只会让用户选中后必然收到
+        # 「回滚目标目录不存在」——把不可用选项挡在菜单之外。
+        installed_versions: list[str] = []
+        for candidate_version in versions:
+            try:
+                candidate_root = _absolute_install_root(plugin_id, candidate_version)
+            except PluginManagerError:
+                continue
+            if candidate_root.is_dir() and not _is_reparse_or_symlink(candidate_root):
+                installed_versions.append(candidate_version)
+        record["available_versions"] = sorted(installed_versions, key=_semver_key)
+        record["registry_versions"] = sorted(versions, key=_semver_key)
         # 绝对路径统一经 _absolute_install_root 构造（含 _under 校验），
         # 不信任注册表字符串直接拼接，杜绝 .. 越界。
         absolute: Path | None = None

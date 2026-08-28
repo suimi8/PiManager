@@ -67,13 +67,23 @@ def vision_model_choice() -> str:
 
 
 def set_vision_model_choice(value: str) -> None:
-    """Persist the vision model choice ('' = auto) into pi-manager.json."""
+    """Persist the vision model choice ('' = auto) into pi-manager.json.
+
+    走 ``update_manager_config`` 而不是 load → 改 → save：pi-manager.json 是本项目
+    争用最激烈的一份配置（GUI 主线程、测试线程池、健康检查、失败计数、更新检查
+    快照、``--config-mutate`` helper 进程都在写它），裸的读-改-写会把 load 与 save
+    之间别人的写入整份覆盖掉。
+    """
     try:
         from . import core
 
-        cfg = core.load_manager_config()
-        cfg["vision_model"] = (value or "").strip()
-        core.save_manager_config(cfg)
+        choice = (value or "").strip()
+
+        def _apply(cfg: dict) -> dict:
+            cfg["vision_model"] = choice
+            return cfg
+
+        core.update_manager_config(_apply)
     except Exception:
         pass
 
@@ -231,20 +241,35 @@ def build_vision_prompt(user_prompt: str = "") -> str:
 # ==== 视觉：智谱识图 / 图片校验 / 技能安装 ====
 
 
-_ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff"}
+# 扩展名 → MIME 的单一真相点：load_image_for_describe 已经在做扩展名白名单
+# 校验，顺便把 MIME 一起返回，避免调用方（CLI / GUI）各自猜测而把 JPEG /
+# WebP 都标成 image/png。
+_IMAGE_EXT_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".webp": "image/webp",
+    ".tiff": "image/tiff",
+}
+_ALLOWED_IMAGE_EXTS = frozenset(_IMAGE_EXT_MIME)
 _MAX_IMAGE_BYTES = 20 * 1024 * 1024
+DEFAULT_VISION_PROMPT = "请详细描述这张图片的内容，包括界面元素、文字与布局。"
 
 
 def load_image_for_describe(path: str) -> dict:
     """Validate + read an image file for ``--vision-describe`` (no GUI deps).
 
-    Returns ``{"ok": True, "data": bytes}`` on success, or
-    ``{"ok": False, "error": <中文错误>}`` otherwise. Error strings and
-    acceptance rules (extension whitelist, 20 MB cap) are the single source
-    of truth for the CLI hot path so behavior cannot drift.
+    Returns ``{"ok": True, "data": bytes, "mime": str, "path": str}`` on
+    success, or ``{"ok": False, "error": <中文错误>}`` otherwise. Error
+    strings and acceptance rules (extension whitelist, 20 MB cap) — and the
+    detected MIME type — are the single source of truth for the CLI hot path
+    so behavior cannot drift from the GUI path.
     """
     p = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
-    if os.path.splitext(p)[1].lower() not in _ALLOWED_IMAGE_EXTS:
+    ext = os.path.splitext(p)[1].lower()
+    if ext not in _ALLOWED_IMAGE_EXTS:
         return {"ok": False, "error": "仅支持图片文件（png/jpg/jpeg/gif/bmp/webp/tiff）"}
     try:
         if os.path.getsize(p) > _MAX_IMAGE_BYTES:
@@ -256,13 +281,18 @@ def load_image_for_describe(path: str) -> dict:
             data = fh.read()
     except OSError as exc:
         return {"ok": False, "error": f"无法读取图片：{exc}"}
-    return {"ok": True, "data": data}
+    return {
+        "ok": True,
+        "data": data,
+        "mime": _IMAGE_EXT_MIME[ext],
+        "path": p,
+    }
 
 
 def describe_image(
     image_bytes: bytes,
     mime: str = "image/png",
-    prompt: str = "请详细描述这张图片的内容，包括界面元素、文字与布局。",
+    prompt: str = DEFAULT_VISION_PROMPT,
     timeout: float = 90,
     model: str | None = None,
 ) -> dict:
@@ -289,6 +319,9 @@ def describe_image(
         }
     configured = model or vision_model_choice()
     candidates = [configured] if configured else list(ZHIPU_VISION_MODELS)
+    # 防御：调用方显式传 prompt=None 会覆盖掉签名默认值，请求体里就会出现
+    # {"type":"text","text":null}（智谱直接 400）。在此兜底成默认提示词。
+    text_prompt = str(prompt or "").strip() or DEFAULT_VISION_PROMPT
     data_uri = (
         f"data:{mime or 'image/png'};base64,"
         f"{base64.b64encode(image_bytes or b'').decode('ascii')}"
@@ -298,7 +331,7 @@ def describe_image(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": text_prompt},
                     {"type": "image_url", "image_url": {"url": data_uri}},
                 ],
             }

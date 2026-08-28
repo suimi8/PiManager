@@ -1,0 +1,43 @@
+# 行尾规范
+#
+# 为什么需要这个文件：仓库此前没有 .gitattributes，而开发机普遍是
+# core.autocrlf=true。当时 index 里全是 LF、工作区也碰巧是 LF，所以 diff 是干净的
+# ——但那是运气。换一台机器、或一次 fresh checkout，工作区就会变成 CRLF，接着
+# 任何用 LF 写文件的工具（编辑器、格式化器、脚本）都会把整个文件标成已修改，
+# 真实改动被淹没在几百行行尾差异里。
+#
+# 核对依据：`git ls-files --eol` 显示当前 index 中**全部文本文件都是 lf**
+# （二进制为 -text），因此下面的 eol=lf 与 index 完全一致，不会产生任何
+# index 变更，只会在 checkout 时把工作区统一成 LF。
+
+# 默认：由 git 判断是否文本；文本一律以 LF 存入 index 并以 LF 检出。
+* text=auto eol=lf
+
+# Windows 批处理与 PowerShell 必须是 CRLF：cmd.exe 对 LF 结尾的 .bat/.cmd
+# 解析行为不可靠（尤其是标签跳转与行尾续行）。当前仓库没有这类已跟踪文件，
+# 这几条是为将来新增时兜底。
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+
+# 明确标记二进制，避免 text=auto 误判后做行尾转换损坏内容。
+*.png   binary
+*.ico   binary
+*.icns  binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.exe   binary
+*.dll   binary
+*.so    binary
+*.dylib binary
+*.vsix  binary
+*.ttf   binary
+*.woff  binary
+*.woff2 binary
+
+# 语言统计与 diff 呈现：锁文件与打包产物不参与语言统计，diff 默认折叠。
+package-lock.json linguist-generated=true -diff

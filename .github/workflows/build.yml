@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version label (e.g. 1.8.1)"
+        description: "Release version label (e.g. 1.8.6)"
         required: false
         default: ""
       upload_to_release:
-        description: "Existing GitHub Release tag to upload into (e.g. v1.8.1). Leave empty for artifacts only."
+        description: "Existing GitHub Release tag to upload into (e.g. v1.8.6). Leave empty for artifacts only."
         required: false
         default: ""
   push:
@@ -18,8 +18,41 @@ on:
 permissions:
   contents: read
 
+# 发布链路刻意 **不** cancel-in-progress：连续打两个 tag 时后者不应把前者的发布
+# 打断到只上传了一半资产。只做排队，避免两次发布交叉写同一个 Release。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # 发布路径的质量门禁。此前 lint / secret-scan / consistency 只在 push main 与 PR
+  # 上跑，而真正产出 GitHub Release 资产的本工作流（tag 推送 / workflow_dispatch）
+  # 一个都不跑：给任意 commit 打个 tag 就能直接出包，AGENTS.md 把这四项并列为
+  # 「发布前必过」，流水线却只在合并路径上强制了其中一项半（审查 P1-1）。
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install dev tooling
+        run: python -m pip install -r requirements-dev.txt
+      - name: Ruff check
+        run: ruff check .
+      - name: Secret / sensitive-file scan
+        run: python scripts/check_secrets.py --scan-tests
+      # check_versions.py 是零第三方依赖的纯标准库脚本，不需要装 requirements.txt。
+      - name: Version + docs single-source consistency
+        run: python scripts/check_versions.py
+
   build:
+    needs: gate # 门禁不过不出包
     strategy:
       fail-fast: false
       matrix:
@@ -32,11 +65,12 @@ jobs:
             platform: linux
 
     runs-on: ${{ matrix.os }}
-    # Artifact upload and `gh release upload` need write scopes; keep them
-    # job-local instead of global.
+    timeout-minutes: 60
+    # `gh release upload` 需要写权限；保持 job 级而不是全局。
+    # 刻意不给 actions: write —— upload-artifact 与 gh release upload 都不需要它
+    # （审查 P2-5 的过度授权项）。
     permissions:
       contents: write
-      actions: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -45,6 +79,10 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install Linux GUI / smoke deps
         if: matrix.platform == 'linux'
@@ -78,18 +116,20 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install pytest
+          python -m pip install -r requirements.txt -r requirements-dev.txt
 
-      - name: Run tests (pytest)
+      # 发布路径与合并路径用同一把尺子：此前这里没有 --cov-fail-under，
+      # 覆盖率跌到 0 也照样出包。
+      - name: Run tests (pytest + coverage gate)
         shell: bash
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
+          PYTEST_ARGS="tests -q -p no:cacheprovider --timeout=300 --timeout-method=thread --cov=pi_manager --cov-report=term-missing --cov-fail-under=55"
           if [ "${{ matrix.platform }}" = "linux" ]; then
-            xvfb-run -a -s "-screen 0 1024x768x24" python -m pytest tests -q -p no:cacheprovider
+            xvfb-run -a -s "-screen 0 1024x768x24" python -m pytest $PYTEST_ARGS
           else
-            python -m pytest tests -q -p no:cacheprovider
+            python -m pytest $PYTEST_ARGS
           fi
 
       - name: Build macOS icon (.icns)
@@ -130,9 +170,17 @@ jobs:
       - name: Package release archives
         shell: bash
         run: |
+          # macOS 上让 codesign --verify --deep --strict 成为**硬闸门**：
+          # 此前是「先 ad-hoc 签名、再用 Python zipfile 打包」，而 zipfile 会丢掉
+          # PyInstaller 必然生成的 Frameworks<->Resources 交叉符号链接，用户解压后
+          # 得到的是「已损坏，无法打开」——比未签名更糟（右键→打开无法绕过）。
+          # 打包侧已改为保留符号链接，这里加 --strict-sign 让回归立刻在 CI 上暴露。
+          EXTRA=()
+          if [ "${{ matrix.platform }}" = "macos" ]; then EXTRA+=(--strict-sign); fi
           python scripts/package_release.py \
             --platform "${{ matrix.platform }}" \
-            --version "${{ steps.ver.outputs.version }}"
+            --version "${{ steps.ver.outputs.version }}" \
+            "${EXTRA[@]}"
           ls -lah release-assets
 
       - name: Upload workflow artifacts
@@ -156,28 +204,41 @@ jobs:
           else
             TAG="${{ github.event.inputs.upload_to_release }}"
           fi
+          # 4 个 job（3 个平台 + package-vsix）会并行到这里，`view || create` 存在
+          # 竞争窗口：两个 job 同时判定"不存在"，其中一个的 create 会失败。容忍
+          # create 失败后再确认 Release 真的存在——真建不出来时下一行会明确失败。
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "PiManager ${TAG}" --generate-notes
+            gh release create "$TAG" --title "PiManager ${TAG}" --generate-notes || true
           fi
-          # Upload archives only (skip plain text notes if desired, but notes are helpful)
+          gh release view "$TAG" >/dev/null
           gh release upload "$TAG" release-assets/* --clobber
 
   package-vsix:
+    # needs: build —— 此前没有这条：三平台构建全挂时本 job 仍会跑完，创建一个
+    # 只含 VSIX 的公开 Release（用户下载到一个没有桌面端的发布）。
+    needs: [gate, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
-      actions: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.11"
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements-dev.txt
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "20"
-      - name: Package Cursor extension
+          cache: "npm"
+          cache-dependency-path: extensions/pi-cursor/package-lock.json
+      # --ignore-scripts：本 job 持有 contents: write 与 GITHUB_TOKEN，任一被投毒
+      # 的传递依赖都能靠 postinstall 在这里窃取 token。v1.8.4 已为运行时插件安装器
+      # 强制了 --ignore-scripts，CI 自己反而没做（审查项）。
+      - name: Install Cursor extension deps
         working-directory: extensions/pi-cursor
-        run: npm ci
+        run: npm ci --ignore-scripts
       - name: Run Cursor extension tests
         working-directory: extensions/pi-cursor
         run: npm test
@@ -204,6 +265,7 @@ jobs:
             TAG="${{ github.event.inputs.upload_to_release }}"
           fi
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "PiManager ${TAG}" --generate-notes
+            gh release create "$TAG" --title "PiManager ${TAG}" --generate-notes || true
           fi
+          gh release view "$TAG" >/dev/null
           gh release upload "$TAG" release-assets/*.vsix --clobber

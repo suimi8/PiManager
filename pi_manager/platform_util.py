@@ -71,6 +71,388 @@ def is_reparse_point(path: str | Path) -> bool:
     return attrs is not None and bool(attrs & FILE_ATTRIBUTE_REPARSE_POINT)
 
 
+# --- Windows ACL 加固 --------------------------------------------------------
+# 为什么需要这一层：POSIX 的 chmod 0600 在 Windows 上几乎是空操作（CPython 只映射
+# 只读位），敏感文件（broker token / secrets.vault / pi-manager-helper.json）的实际
+# 权限 100% 来自父目录的继承 ACE。历史实现（config_broker._restrict_windows_acl）
+# 引用了并不存在的 ctypes.wintypes.PVOID，在设置 argtypes 时就抛 AttributeError，
+# 又被 `except Exception: pass` 吞掉 —— 在任何 Windows 机器上都是彻底的 no-op，
+# 而注释与历史修复记录都声称它生效了。这里重写为可用实现，并且**加固失败必须留下
+# 日志**：安全加固静默失败伪装成成功，是本次审查发现的系统性反模式。
+_SE_FILE_OBJECT = 1
+_DACL_SECURITY_INFORMATION = 0x00000004
+_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+_SE_DACL_PROTECTED = 0x1000
+_INHERITED_ACE = 0x10
+_WRITE_DAC = 0x00040000
+_READ_CONTROL = 0x00020000
+_OPEN_EXISTING = 3
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000  # 打开目录句柄必需
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000  # 绝不跟随符号链接去改别人的 ACL
+_FILE_ALL_ACCESS = 0x001F01FF
+_GRANT_ACCESS = 1
+_NO_INHERITANCE = 0
+_SUB_CONTAINERS_AND_OBJECTS_INHERIT = 0x3
+_TRUSTEE_IS_SID = 0
+_TRUSTEE_IS_USER = 1
+_TOKEN_QUERY = 0x0008
+_TOKEN_USER_CLASS = 1
+
+
+def _win_acl_api() -> dict:
+    """惰性构建 Windows ACL 所需的 ctypes 原型与结构体。
+
+    只在 Windows 上调用；任何失败都向上抛，由调用方记录日志（绝不静默吞掉）。
+    注意 LocalFree 由 kernel32 导出，advapi32 并不导出它 —— 旧实现写成
+    advapi32.LocalFree，即使修好 PVOID 也会在设置 argtypes 时再抛一次
+    AttributeError。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    lpvoid = wintypes.LPVOID  # wintypes 没有 PVOID，只有 LPVOID
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, lpvoid,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    kernel32.LocalFree.restype = wintypes.HLOCAL
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, lpvoid, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.SetEntriesInAclW.argtypes = [
+        wintypes.ULONG, lpvoid, lpvoid, ctypes.POINTER(lpvoid),
+    ]
+    advapi32.SetEntriesInAclW.restype = wintypes.DWORD
+    advapi32.SetSecurityInfo.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, wintypes.DWORD,
+        lpvoid, lpvoid, lpvoid, lpvoid,
+    ]
+    advapi32.SetSecurityInfo.restype = wintypes.DWORD
+    advapi32.GetSecurityInfo.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, wintypes.DWORD,
+        ctypes.POINTER(lpvoid), ctypes.POINTER(lpvoid),
+        ctypes.POINTER(lpvoid), ctypes.POINTER(lpvoid),
+        ctypes.POINTER(lpvoid),
+    ]
+    advapi32.GetSecurityInfo.restype = wintypes.DWORD
+    advapi32.GetSecurityDescriptorControl.argtypes = [
+        lpvoid, ctypes.POINTER(wintypes.WORD), ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetSecurityDescriptorControl.restype = wintypes.BOOL
+    advapi32.GetAce.argtypes = [lpvoid, wintypes.DWORD, ctypes.POINTER(lpvoid)]
+    advapi32.GetAce.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [lpvoid, ctypes.POINTER(wintypes.LPWSTR)]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+
+    class TRUSTEE_W(ctypes.Structure):
+        _fields_ = [
+            ("pMultipleTrustee", lpvoid),
+            ("MultipleTrusteeOperation", wintypes.DWORD),
+            ("TrusteeForm", wintypes.DWORD),
+            ("TrusteeType", wintypes.DWORD),
+            # TrusteeForm=TRUSTEE_IS_SID 时这里放的是 PSID 而不是字符串，
+            # 因此声明为 LPVOID（旧实现声明 LPWSTR 再 cast，容易误导）。
+            ("ptstrName", lpvoid),
+        ]
+
+    class EXPLICIT_ACCESS_W(ctypes.Structure):
+        _fields_ = [
+            ("grfAccessPermissions", wintypes.DWORD),
+            ("grfAccessMode", wintypes.DWORD),
+            ("grfInheritance", wintypes.DWORD),
+            ("Trustee", TRUSTEE_W),
+        ]
+
+    class SID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Sid", lpvoid), ("Attributes", wintypes.DWORD)]
+
+    class TOKEN_USER(ctypes.Structure):
+        _fields_ = [("User", SID_AND_ATTRIBUTES)]
+
+    class ACL_HEADER(ctypes.Structure):
+        _fields_ = [
+            ("AclRevision", ctypes.c_ubyte), ("Sbz1", ctypes.c_ubyte),
+            ("AclSize", wintypes.WORD), ("AceCount", wintypes.WORD),
+            ("Sbz2", wintypes.WORD),
+        ]
+
+    class ACE_HEADER(ctypes.Structure):
+        _fields_ = [
+            ("AceType", ctypes.c_ubyte), ("AceFlags", ctypes.c_ubyte),
+            ("AceSize", wintypes.WORD),
+        ]
+
+    class ACCESS_ALLOWED_ACE(ctypes.Structure):
+        _fields_ = [
+            ("Header", ACE_HEADER), ("Mask", wintypes.DWORD),
+            ("SidStart", wintypes.DWORD),
+        ]
+
+    return {
+        "ctypes": ctypes, "wintypes": wintypes, "lpvoid": lpvoid,
+        "advapi32": advapi32, "kernel32": kernel32,
+        "TRUSTEE_W": TRUSTEE_W, "EXPLICIT_ACCESS_W": EXPLICIT_ACCESS_W,
+        "TOKEN_USER": TOKEN_USER, "ACL_HEADER": ACL_HEADER,
+        "ACCESS_ALLOWED_ACE": ACCESS_ALLOWED_ACE,
+    }
+
+
+def _current_user_sid(api: dict) -> tuple:
+    """取当前进程 token 的用户 SID。
+
+    比「读文件属主」更准确：管理员账户创建的文件属主可能是 Administrators 组，
+    那样加固出来的 ACL 就不是「仅当前用户」。SID 内存随 buffer 生命周期，
+    调用方必须在 buffer 存活期间用完，故一并返回 buffer。
+    """
+    ctypes = api["ctypes"]
+    wintypes = api["wintypes"]
+    advapi32 = api["advapi32"]
+    kernel32 = api["kernel32"]
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(token)
+    ):
+        raise OSError(f"OpenProcessToken 失败: {ctypes.get_last_error()}")
+    try:
+        size = wintypes.DWORD(0)
+        advapi32.GetTokenInformation(token, _TOKEN_USER_CLASS, None, 0, ctypes.byref(size))
+        buffer = ctypes.create_string_buffer(size.value)
+        if not advapi32.GetTokenInformation(
+            token, _TOKEN_USER_CLASS, buffer, size, ctypes.byref(size)
+        ):
+            raise OSError(f"GetTokenInformation 失败: {ctypes.get_last_error()}")
+    finally:
+        kernel32.CloseHandle(token)
+    sid = ctypes.cast(buffer, ctypes.POINTER(api["TOKEN_USER"])).contents.User.Sid
+    return sid, buffer
+
+
+def _open_for_acl(api: dict, path: str | Path, access: int):
+    """以不跟随重解析点的方式打开句柄；目录需要 BACKUP_SEMANTICS。"""
+    ctypes = api["ctypes"]
+    kernel32 = api["kernel32"]
+    flags = _FILE_FLAG_OPEN_REPARSE_POINT
+    if Path(path).is_dir():
+        flags |= _FILE_FLAG_BACKUP_SEMANTICS
+    handle = kernel32.CreateFileW(str(path), access, 0, None, _OPEN_EXISTING, flags, None)
+    invalid = ctypes.c_void_p(-1).value
+    if not handle or handle == invalid:
+        raise OSError(f"CreateFileW 失败: {ctypes.get_last_error()}: {path}")
+    return handle
+
+
+def restrict_windows_acl(path: str | Path) -> bool:
+    """把 path 的 DACL 收紧为「仅当前用户完全控制」，并阻断继承。
+
+    实现要点：
+    - 用 SetEntriesInAclW 构造一条显式 ACE（当前用户 / FILE_ALL_ACCESS）。
+    - 用 PROTECTED_DACL_SECURITY_INFORMATION 让 DACL 受保护，父目录的继承 ACE
+      被剥离；这正是旧实现 docstring 承诺、但从未生效的部分。
+    - **绝不能传 NULL DACL**：Microsoft 明确说明 NULL DACL 授予所有本地用户完全
+      访问，会把保护反转成放开（本项目历史上出过这个严重漏洞）。
+    - 目录额外带 (OI)(CI) 继承标志，使后续新建的文件自动继承收紧后的权限。
+
+    非 Windows 平台直接返回 False（不适用）。失败记 WARNING 并返回 False，
+    调用方据此决定是否升级为更醒目的告警 —— 但绝不静默当作成功。
+    """
+    if not is_windows():
+        return False
+    try:
+        api = _win_acl_api()
+        ctypes = api["ctypes"]
+        advapi32 = api["advapi32"]
+        kernel32 = api["kernel32"]
+        sid, _sid_buffer = _current_user_sid(api)
+        handle = _open_for_acl(api, path, _WRITE_DAC | _READ_CONTROL)
+        try:
+            entry = api["EXPLICIT_ACCESS_W"]()
+            entry.grfAccessPermissions = _FILE_ALL_ACCESS
+            entry.grfAccessMode = _GRANT_ACCESS
+            entry.grfInheritance = (
+                _SUB_CONTAINERS_AND_OBJECTS_INHERIT
+                if Path(path).is_dir()
+                else _NO_INHERITANCE
+            )
+            entry.Trustee.pMultipleTrustee = None
+            entry.Trustee.MultipleTrusteeOperation = 0
+            entry.Trustee.TrusteeForm = _TRUSTEE_IS_SID
+            entry.Trustee.TrusteeType = _TRUSTEE_IS_USER
+            entry.Trustee.ptstrName = sid
+            new_dacl = api["lpvoid"]()
+            # OldAcl=None：从零构造，不合并任何既有 ACE。
+            code = advapi32.SetEntriesInAclW(
+                1, ctypes.byref(entry), None, ctypes.byref(new_dacl)
+            )
+            if code != 0 or not new_dacl:
+                raise OSError(f"SetEntriesInAclW 失败: {code}")
+            try:
+                code = advapi32.SetSecurityInfo(
+                    handle, _SE_FILE_OBJECT,
+                    _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION,
+                    None, None, new_dacl, None,
+                )
+                if code != 0:
+                    raise OSError(f"SetSecurityInfo 失败: {code}")
+            finally:
+                kernel32.LocalFree(new_dacl)
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception as exc:
+        logger.warning(
+            "Windows ACL 加固失败（文件仍可能被同机其他账户访问）: %s: %s", path, exc
+        )
+        return False
+    return True
+
+
+def windows_dacl_summary(path: str | Path) -> dict | None:
+    """读回 DACL 供验证/测试断言，非 Windows 或失败返回 None。
+
+    返回 {"protected": bool, "null_dacl": bool, "ace_count": int,
+    "inherited_ace_count": int, "trustee_sids": [str, ...]}。测试必须断言这些
+    **实际效果**，而不是「函数没抛异常」—— 旧的 no-op 正是因为只有后者才潜伏至今。
+    """
+    if not is_windows():
+        return None
+    try:
+        api = _win_acl_api()
+        ctypes = api["ctypes"]
+        wintypes = api["wintypes"]
+        advapi32 = api["advapi32"]
+        kernel32 = api["kernel32"]
+        lpvoid = api["lpvoid"]
+        handle = _open_for_acl(api, path, _READ_CONTROL)
+        try:
+            dacl = lpvoid()
+            descriptor = lpvoid()
+            code = advapi32.GetSecurityInfo(
+                handle, _SE_FILE_OBJECT, _DACL_SECURITY_INFORMATION,
+                None, None, ctypes.byref(dacl), None, ctypes.byref(descriptor),
+            )
+            if code != 0:
+                raise OSError(f"GetSecurityInfo 失败: {code}")
+            try:
+                control = wintypes.WORD()
+                revision = wintypes.DWORD()
+                if not advapi32.GetSecurityDescriptorControl(
+                    descriptor, ctypes.byref(control), ctypes.byref(revision)
+                ):
+                    raise OSError(
+                        f"GetSecurityDescriptorControl 失败: {ctypes.get_last_error()}"
+                    )
+                protected = bool(control.value & _SE_DACL_PROTECTED)
+                if not dacl:
+                    # NULL DACL：所有人完全访问。必须能被测试识别出来。
+                    return {
+                        "protected": protected, "null_dacl": True,
+                        "ace_count": 0, "inherited_ace_count": 0, "trustee_sids": [],
+                    }
+                header = ctypes.cast(dacl, ctypes.POINTER(api["ACL_HEADER"])).contents
+                sids: list[str] = []
+                inherited = 0
+                sid_offset = api["ACCESS_ALLOWED_ACE"].SidStart.offset
+                for index in range(header.AceCount):
+                    ace = lpvoid()
+                    if not advapi32.GetAce(dacl, index, ctypes.byref(ace)):
+                        continue
+                    typed = ctypes.cast(
+                        ace, ctypes.POINTER(api["ACCESS_ALLOWED_ACE"])
+                    ).contents
+                    if typed.Header.AceFlags & _INHERITED_ACE:
+                        inherited += 1
+                    sid_ptr = ctypes.cast(ctypes.addressof(typed) + sid_offset, lpvoid)
+                    text = wintypes.LPWSTR()
+                    if advapi32.ConvertSidToStringSidW(sid_ptr, ctypes.byref(text)):
+                        try:
+                            sids.append(str(text.value))
+                        finally:
+                            kernel32.LocalFree(text)
+                return {
+                    "protected": protected, "null_dacl": False,
+                    "ace_count": int(header.AceCount),
+                    "inherited_ace_count": inherited, "trustee_sids": sids,
+                }
+            finally:
+                kernel32.LocalFree(descriptor)
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception as exc:
+        logger.debug("读取 DACL 失败: %s: %s", path, exc)
+        return None
+
+
+def current_user_sid_string() -> str:
+    """当前进程用户的 SID 字符串（S-1-5-...）；非 Windows 或失败返回空串。"""
+    if not is_windows():
+        return ""
+    try:
+        api = _win_acl_api()
+        ctypes = api["ctypes"]
+        wintypes = api["wintypes"]
+        sid, _buffer = _current_user_sid(api)
+        text = wintypes.LPWSTR()
+        if not api["advapi32"].ConvertSidToStringSidW(sid, ctypes.byref(text)):
+            return ""
+        try:
+            return str(text.value)
+        finally:
+            api["kernel32"].LocalFree(text)
+    except Exception:
+        return ""
+
+
+def harden_private_path(path: str | Path) -> bool:
+    """跨平台把敏感文件/目录收紧为「仅当前用户可读写」。
+
+    POSIX 走 chmod 0600/0700；Windows 走 restrict_windows_acl（chmod 在
+    Windows 上不产生任何访问控制效果）。返回是否真的完成了平台对应的加固。
+    """
+    target = Path(path)
+    if is_windows():
+        return restrict_windows_acl(target)
+    try:
+        os.chmod(target, 0o700 if target.is_dir() else 0o600)
+    except OSError as exc:
+        logger.warning("chmod 加固失败: %s: %s", target, exc)
+        return False
+    return True
+
+
+def wt_escape(text: str) -> str:
+    """为 Windows Terminal 转义参数中的分号。
+
+    wt.exe 会对**自己的命令行**再解析一次，`;` 是它的子命令（新 pane/tab）分隔符。
+    Python 的 list2cmdline 只保证参数原样传到 wt.exe，管不住 wt 的二次解析。
+
+    实测（本机 Windows 11 + wt.exe，子进程回写 sys.argv 验证）：
+        wt -d <dir> python probe.py "a;b" "c d"     -> 子进程只收到 ["a"]
+        wt -d <dir> -- python probe.py "a;b" "c d"   -> 仍然只收到 ["a"]（-- 无效）
+        wt new-tab -d <dir> -- python probe.py ...   -> 仍然只收到 ["a"]
+        wt -d <dir> python probe.py "a\\;b" "c d"     -> 正确收到 ["a;b", "c d"]
+    也就是说 `--` 分隔符在 wt 上不起作用，只有反斜杠转义有效。
+
+    同一实测确认转义不会损坏其他内容：反斜杠 Windows 路径、含空格的参数、
+    多行 --append-system-prompt、以 `--` 开头的参数都原样送达。
+    """
+    return text.replace(";", "\\;")
+
+
 def platform_name() -> str:
     if is_windows():
         return "windows"
@@ -375,7 +757,7 @@ def _launch_windows(argv: list[str], workdir: str, mode: str, env: dict[str, str
             # Pass each Pi argument directly to Windows Terminal. Going through
             # cmd /k corrupts quoted paths and multiline system prompts.
             subprocess.Popen(
-                [wt, "-d", workdir, *argv],
+                [wt, "-d", wt_escape(workdir), *(wt_escape(a) for a in argv)],
                 cwd=workdir,
                 env=env,
             )
@@ -481,7 +863,14 @@ def _launch_macos(argv: list[str], workdir: str, mode: str, env: dict[str, str])
             except OSError:
                 pass
             wrapper.unlink(missing_ok=True)
-            private_dir.rmdir(missing_ok=True)
+            # Path.rmdir 从来没有 missing_ok 参数（截至 3.13 仍是 rmdir(self)）。
+            # 之前写成 rmdir(missing_ok=True) 会在这个异常处理器里抛 TypeError，
+            # 把原始失败原因（磁盘满 / 无权限 / 沙箱）整个替换掉，raise 永不执行，
+            # 而且 private_dir 目录还会残留。清理失败绝不能覆盖原始异常。
+            try:
+                private_dir.rmdir()
+            except OSError:
+                pass
             raise
         # The wrapper self-deletes when it runs; if the terminal launch fails
         # it never runs, so a detached janitor removes the secret-bearing file

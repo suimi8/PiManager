@@ -94,6 +94,7 @@ test("registered helper is rejected when ownership or permissions look wrong", (
     home,
     pathExists: (candidate) => candidate === executable,
     statFile: (target) => stats.get(target),
+    realPath: (target) => target,
     uid: 1000,
     platform: "linux",
   };
@@ -112,9 +113,74 @@ test("registered helper is rejected when ownership or permissions look wrong", (
 
     stats.set(executable, { uid: 1000, mode: 0o777 });
     assert.equal(registeredHelperCommand(options), null, "other-writable executable is rejected");
+  } finally {
+    fs.readFileSync = originalRead;
+  }
+});
 
-    stats.set(executable, { uid: 1000, mode: 0o755 });
-    assert.deepEqual(registeredHelperCommand({ ...options, platform: "win32" }), [executable]);
+// 回归测试：旧的 win32 断言用 POSIX 风格的 mode 0o755 —— 那个值在 Windows 上
+// **永远不会出现**，恰好不带 world-write 位，因此掩盖了 15e3901 引入的回归。
+// Windows 上 Node 不读 ACL，statSync().mode 仅由只读属性合成：任何可写文件
+// 恒为 0o100666，只读文件为 0o100444。桩必须用真实值。
+test("Windows helper discovery works with the mode value Windows actually reports", () => {
+  const fs = require("node:fs");
+  const originalRead = fs.readFileSync;
+  const home = "C:\\Users\\tester";
+  const registryFile = helperRegistryPath(home);
+  const executable = "C:\\Program Files\\PiManager\\PiManager.exe";
+  fs.readFileSync = () => JSON.stringify({ schema_version: 1, command: [executable] });
+  // 真实 Windows 值：可写文件恒为 0o100666，mode & 0o002 恒真。
+  const stats = new Map([
+    [registryFile, { uid: 0, mode: 0o100666, isFile: () => true, isSymbolicLink: () => false }],
+    [executable, { uid: 0, mode: 0o100666, isFile: () => true, isSymbolicLink: () => false }],
+  ]);
+  const options = {
+    home,
+    platform: "win32",
+    pathExists: (candidate) => candidate === executable,
+    statFile: (target) => stats.get(target),
+    lstatFile: (target) => stats.get(target),
+    realPath: (target) => target,
+    env: {
+      SystemDrive: "C:",
+      SystemRoot: "C:\\Windows",
+      PUBLIC: "C:\\Users\\Public",
+      ProgramData: "C:\\ProgramData",
+      TEMP: "C:\\Users\\tester\\AppData\\Local\\Temp",
+    },
+  };
+  try {
+    assert.deepEqual(
+      registeredHelperCommand(options),
+      [executable],
+      "0o100666 是 Windows 上每个可写文件的 mode，必须被接受"
+    );
+
+    // Windows 侧的保护力来自路径判据，而不是"跳过检查"。
+    stats.set(executable, { uid: 0, mode: 0o100666, isFile: () => true, isSymbolicLink: () => true });
+    assert.equal(registeredHelperCommand(options), null, "symlink/reparse point is rejected");
+
+    stats.set(executable, { uid: 0, mode: 0o100666, isFile: () => false, isSymbolicLink: () => false });
+    assert.equal(registeredHelperCommand(options), null, "non-regular file is rejected");
+
+    stats.set(executable, { uid: 0, mode: 0o100666, isFile: () => true, isSymbolicLink: () => false });
+    assert.equal(
+      registeredHelperCommand({
+        ...options,
+        realPath: (target) => (target === executable ? "C:\\Users\\Public\\evil.exe" : target),
+      }),
+      null,
+      "junction redirection into a public directory is rejected"
+    );
+
+    assert.equal(
+      registeredHelperCommand({
+        ...options,
+        realPath: (target) => (target === registryFile ? "C:\\Users\\Public\\reg.json" : target),
+      }),
+      null,
+      "a registry file that really lives outside the user profile is rejected"
+    );
   } finally {
     fs.readFileSync = originalRead;
   }

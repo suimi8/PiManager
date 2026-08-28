@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from pi_manager import config_broker
 from pi_manager import core
 from pi_manager import platform_util
 from pi_manager import secrets as secretstore
@@ -157,15 +158,30 @@ def test_runtime_persists_reference_if_eager_migration_save_failed(
             }
         },
     )
+    # 必须 patch 真正的落盘出口。迁移落盘已从 save_models_config 改走
+    # update_models_config -> _update_config（为了「全程持锁读改写」的正确性），
+    # 继续 patch save_models_config 的话根本拦不住写入，本用例会变成空测试
+    # ——声称测「落盘失败」，实际落盘成功了。
     monkeypatch.setattr(
-        core, "save_models_config", lambda _cfg: (_ for _ in ()).throw(OSError("locked"))
+        core,
+        "_update_config",
+        lambda *_a, **_kw: (_ for _ in ()).throw(OSError("locked")),
     )
-    assert core.load_models_config()["providers"]["Old Provider"]["apiKey"].startswith(
-        "__DPAPI__"
-    )
+    # 落盘失败时内存里仍然拿到迁移后的引用形式：调用方看到的视图必须自洽，
+    # 否则上层会同时见到 __DPAPI__ 与 ${...} 两种形态。磁盘没写成功没关系，
+    # 迁移是幂等的，下次 load 会重试。
+    loaded = core.load_models_config()["providers"]["Old Provider"]["apiKey"]
+    assert loaded == secretstore.provider_api_key_reference("Old Provider")
+    # 先确认落盘真的失败了：磁盘上仍是迁移前的形态。这一条是本用例的「非空转」
+    # 守卫——没有它，patch 打错函数时用例照样全绿（曾经就是如此）。
+    on_disk = core.load_json(core.models_path(), {})
+    assert on_disk["providers"]["Old Provider"]["apiKey"] == "__DPAPI__:Old Provider"
+    # 本用例的真正意图：落盘失败也不能影响运行时解析出正确的密钥。
     assert core.provider_runtime_env("Old Provider") == {
         secretstore.provider_env_name("Old Provider"): "old-secret"
     }
+    # 而且运行时路径会把引用补写回磁盘（用例名里 persists 的由来）：
+    # 急切迁移失败只是延后，最终一致性仍然达成。
     stored = core.load_json(core.models_path(), {})
     assert stored["providers"]["Old Provider"]["apiKey"] == (
         secretstore.provider_api_key_reference("Old Provider")
@@ -261,7 +277,13 @@ def test_provider_env_helper_writes_private_response(isolated_home, tmp_path):
     _save_provider("Demo")
     output = tmp_path / "response.json"
     output.touch()
-    assert provider_env_main(["--output", str(output), "Demo"]) == 0
+    # provider-env 现在与 --config-mutate 共用同一套 broker token 授权：
+    # 此前它零认证就能吐明文 API Key，而只写白名单字段的 --config-mutate
+    # 反而要 token，授权模型是倒置的（R2 安全审计 P1-5）。
+    token = config_broker._create_broker_token()
+    assert provider_env_main(
+        ["--output", str(output), "--token", token, "Demo"]
+    ) == 0
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["ok"] is True
     assert payload["env"] == {
@@ -288,11 +310,23 @@ def test_provider_env_helper_rotates_pool_across_processes(
     env["HOME"] = str(isolated_home)
     env["USERPROFILE"] = str(isolated_home)
 
+    # 子进程同样要按值出示 broker token（父进程先确保 token 存在）。
+    child_token = config_broker._create_broker_token()
+
     def invoke(name: str, *args: str) -> tuple[int, dict[str, object]]:
         output = tmp_path / name
         output.touch()
         completed = subprocess.run(
-            [sys.executable, "-c", child_code, "--output", str(output), *args],
+            [
+                sys.executable,
+                "-c",
+                child_code,
+                "--output",
+                str(output),
+                "--token",
+                child_token,
+                *args,
+            ],
             cwd=repo_root,
             env=env,
             capture_output=True,
@@ -756,10 +790,13 @@ def test_all_failed_keys_require_manual_restore_and_helper_can_mark(
 
     output = tmp_path / "mark.json"
     output.touch()
+    token = config_broker._create_broker_token()
     assert provider_env_main(
         [
             "--output",
             str(output),
+            "--token",
+            token,
             "--mark-failed",
             "--key-id",
             rows[0]["id"],

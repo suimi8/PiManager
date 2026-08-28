@@ -1,5 +1,15 @@
-# 开发与审查工具依赖（CI 的 lint / secret-scan / consistency job 使用）。
-# 运行时依赖见 requirements.txt（== 固定）；本文件仅供开发/CI，不进入打包产物。
+# 开发 / CI / 打包工具依赖。运行时依赖见 requirements.txt（== 固定）。
+# CI 的 test / lint / secret-scan / consistency / gate job 一律用
+# `pip install -r requirements-dev.txt` 安装本文件，不再手写 `pip install ruff`
+# 之类的无约束命令——否则这里钉死的版本形同虚设，ruff 发新版当天一次无关的
+# push 就可能因规则集变化红掉。
 ruff==0.14.4
 pytest==8.4.2
-pytest-cov==6.2.1
+# 与本地实测一致（7.1.0）；此前钉在 6.2.1 而 CI 根本没装本文件，三方版本各不相同。
+pytest-cov==7.1.0
+# 单条用例挂起时 120s 失败，而不是把 job 拖到 GitHub 默认的 6 小时上限。
+# 只在 CI 命令行上用 `--timeout=...`，不写进 addopts：本地缺这个包时 pytest 不会
+# 因为未知参数直接报错。
+pytest-timeout==2.4.0
+# 构建工具（本地打包与 CI 的 build / nightly-packaging job）
+PyInstaller==6.19.0

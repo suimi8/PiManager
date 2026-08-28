@@ -726,3 +726,59 @@ def test_npm_install_handles_timeout(isolated_home, monkeypatch):
     assert "超时" in result["stderr"]
     assert result["args"]
     assert result["cwd"]
+
+
+# ---- target_dir 边界：不得等于 agent 目录本身 ----
+# 本轮实证发现的残余漏洞：``_assert_safe_relative_target`` 只做
+# ``resolved.relative_to(agent_dir)``，而 relative_to 对「完全相等」也返回成功，
+# 于是 target_dir="" / "." / "./" 全部通过校验且 resolve 后正好等于 ~/.pi/agent。
+# install_builtin(force=True) 的 rmtree 因此会清空用户全部配置（实测 models.json /
+# settings.json / 用户自建 skills 一并消失）。
+
+
+@pytest.mark.parametrize("target_dir", ["", ".", "./", "././", "  "])
+def test_load_manifest_rejects_target_dir_equal_to_agent_dir(
+    isolated_home, monkeypatch, tmp_path, target_dir
+):
+    """target_dir 解析后等于 agent 目录本身时必须 fail-fast。"""
+    _tamper_manifest_target_dir(monkeypatch, tmp_path, target_dir)
+    with pytest.raises(bp.BuiltinPluginError, match="agent 目录本身|目标路径"):
+        bp.list_builtins()
+
+
+def test_force_install_never_wipes_agent_dir(isolated_home, monkeypatch, tmp_path):
+    """force 分支的 rmtree 绝不能落在 agent 目录本身上。
+
+    非空转守卫：先在 agent 目录里放三份真实用户数据，操作后逐一断言仍存在，
+    并断言目标目录从未被创建——若校验失效，这三个断言会同时失败。
+    """
+    agent = core.pi_agent_dir()
+    agent.mkdir(parents=True, exist_ok=True)
+    (agent / "models.json").write_text('{"providers": []}', encoding="utf-8")
+    (agent / "settings.json").write_text('{"packages": []}', encoding="utf-8")
+    (agent / "skills").mkdir()
+    (agent / "skills" / "user-own.md").write_text("用户自建", encoding="utf-8")
+
+    src = tmp_path / "assets" / "s"
+    src.mkdir(parents=True)
+    (src / "SKILL.md").write_text("---\nname: x\ndescription: y\n---\n", encoding="utf-8")
+    plugin = _make_plugin(name="probe", type="skill", source="s", target_dir=".")
+    monkeypatch.setattr(bp, "_load_manifest", lambda: [plugin])
+    monkeypatch.setattr(bp, "_builtin_assets_dir", lambda: tmp_path / "assets")
+
+    with pytest.raises(bp.BuiltinPluginError, match="agent 目录本身|目标路径"):
+        bp.install_builtin("probe", force=True)
+
+    assert (agent / "models.json").is_file(), "models.json 被 rmtree 删除"
+    assert (agent / "settings.json").is_file(), "settings.json 被 rmtree 删除"
+    assert (agent / "skills" / "user-own.md").is_file(), "用户自建 skill 被 rmtree 删除"
+
+
+def test_cleanup_retired_refuses_agent_dir_itself(isolated_home, monkeypatch):
+    """已下架清单被改成 "." 时，清理流程也不得 rmtree 整个 agent 目录。"""
+    agent = core.pi_agent_dir()
+    agent.mkdir(parents=True, exist_ok=True)
+    (agent / "models.json").write_text('{"providers": []}', encoding="utf-8")
+    monkeypatch.setattr(bp, "_RETIRED_BUILTINS", (".",))
+    assert bp.cleanup_retired_builtins() == [], "非法条目应被跳过而不是执行删除"
+    assert (agent / "models.json").is_file(), "agent 目录被整体删除"

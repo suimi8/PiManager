@@ -41,6 +41,40 @@ def _ensure_windows_cli_stdio() -> None:
         logging.getLogger("pi_manager").debug("stdio redirect failed: %s", exc, exc_info=True)
 
 
+def _shred_request_file(path: str) -> None:
+    """覆盖擦除并删除一次性请求文件（P2-11）。
+
+    ``--config-mutate`` 的请求文件里带着 broker token，调用后留在临时目录等于
+    把凭据落盘（与 ``provider_env._emit`` 的严格加固标准明显不一致）。这里做
+    best-effort 清理：先零覆盖再删除，任何失败都不影响主流程返回值。
+
+    只处理「普通文件且非重解析点」：否则同机攻击者可以用 junction 把请求路径
+    指向别处，让本函数去零覆盖一个不该动的文件。
+    """
+    import stat
+
+    try:
+        from pi_manager import platform_util
+
+        info = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode) or platform_util.is_reparse_point(path):
+            return
+        size = info.st_size
+    except (OSError, ImportError):
+        return
+    try:
+        with open(path, "r+b") as fh:
+            fh.write(b"\x00" * size)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError:
+        pass
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def _cli_json_error(error: str) -> int:
     """Print a JSON error payload (extension contract) and return exit code 2."""
     import json
@@ -60,7 +94,11 @@ def main():
         import argparse as _argparse
         import json
 
-        from pi_manager.core import describe_image, load_image_for_describe
+        from pi_manager.core import (
+            build_vision_prompt,
+            describe_image,
+            load_image_for_describe,
+        )
 
         parser = _argparse.ArgumentParser(
             prog="PiManager --vision-describe",
@@ -82,8 +120,17 @@ def main():
         loaded = load_image_for_describe(path)
         if not loaded.get("ok"):
             return _cli_json_error(str(loaded.get("error") or "无法读取图片"))
-        prompt = " ".join(args.prompt) or ""
-        result = describe_image(loaded["data"], prompt=prompt or None)
+        # CLI 路径必须与 GUI 路径（ui_features 的识图入口）行为一致：
+        # 1. 用 build_vision_prompt 构造「逐字转录」指令，绝不把 None 传下去
+        #    （prompt=None 会覆盖签名默认值，请求体里出现 "text": null）；
+        # 2. 传 load_image_for_describe 探测到的真实 MIME，别把 JPEG/WebP
+        #    一律标成 image/png。
+        prompt = " ".join(args.prompt).strip()
+        result = describe_image(
+            loaded["data"],
+            loaded.get("mime") or "image/png",
+            prompt=build_vision_prompt(prompt),
+        )
         if result.get("ok"):
             desc = result.get("description") or ""
             try:
@@ -121,6 +168,8 @@ def main():
         if extra:
             return _cli_json_error("request file is required")
         result = mutate_file(args.request_file)
+        # 请求文件是一次性凭据载体，用完即焚（P2-11）。
+        _shred_request_file(args.request_file)
         encoded = json.dumps(result, ensure_ascii=False)
         if args.output:
             try:

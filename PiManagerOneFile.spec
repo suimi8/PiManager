@@ -31,7 +31,10 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[str(project_root / "scripts" / "pyi_rth_pimanager.py")],
+    # 无自定义 runtime hook：官方 pyi_rth_pyside6.py 在自定义 rthook 之后执行，
+    # 并无条件覆盖 QT_PLUGIN_PATH，见 PiManager.spec 同处注释
+    # （docs/review/r2-build.md B-3 / B-14）。
+    runtime_hooks=[],
     excludes=pyi_common.EXCLUDES,
     noarchive=False,
     optimize=0,

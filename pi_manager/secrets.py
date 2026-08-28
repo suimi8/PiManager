@@ -102,16 +102,12 @@ def _get_keyring():
             backend = keyring.get_keyring()
             if backend is None or _keyring_backend_is_unsafe(backend):
                 return
-            probe_user = "__pi_manager_probe__"
-            keyring.set_password(SERVICE, probe_user, "_")
-            try:
-                if keyring.get_password(SERVICE, probe_user) != "_":
-                    return
-            finally:
-                try:
-                    keyring.delete_password(SERVICE, probe_user)
-                except Exception:
-                    pass
+            # 只读探测：历史实现会向 keyring 写入并删除一条
+            # __pi_manager_probe__ 记录，在 macOS 上可能弹出授权框、并在系统
+            # 钥匙串审计日志留痕（R2 审计 P3-7）。读取一个不存在的条目已足以
+            # 判断后端能否正常应答；「写不报错但读回是空」这类骗人后端由
+            # set_secret 的写后回读校验兜住，不需要在探测阶段留下副作用。
+            keyring.get_password(SERVICE, "__pi_manager_probe__")
             outcome["backend"] = keyring
         except Exception as exc:
             outcome["error"] = exc
@@ -184,20 +180,6 @@ def _dpapi_unprotect(data: bytes) -> bytes:
         kernel32.LocalFree(blob_out.pbData)
 
 
-def _validate_master_key(path: Path) -> bytes:
-    if platform_util.is_reparse_point(path):
-        raise VaultCorruptError(f"主密钥不能是 reparse point: {path}")
-    info = path.stat(follow_symlinks=False)
-    if not stat.S_ISREG(info.st_mode):
-        raise VaultCorruptError(f"主密钥不是普通文件: {path}")
-    if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o077:
-        raise VaultCorruptError(f"主密钥权限过宽，应为 0600: {path}")
-    key = path.read_bytes()
-    if len(key) != 32:
-        raise VaultCorruptError(f"主密钥长度无效: {path}")
-    return key
-
-
 def _ensure_regular_file(path: Path, *, what: str) -> None:
     """校验路径是普通文件而非 reparse point / 符号链接，防止符号链接劫持。"""
     try:
@@ -220,7 +202,7 @@ def _load_or_create_master_key() -> bytes:
     _ensure_dir()
     path = _master_key_path()
     if path.exists():
-        return _validate_master_key(path)
+        return _validate_master_key_salt(path)
     raw_salt = os.urandom(32)
     temp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -232,10 +214,10 @@ def _load_or_create_master_key() -> bytes:
         try:
             os.link(temp, path)
         except FileExistsError:
-            return _validate_master_key(path)
+            return _validate_master_key_salt(path)
         except OSError:
             if path.exists():
-                return _validate_master_key(path)
+                return _validate_master_key_salt(path)
             os.replace(temp, path)
     finally:
         temp.unlink(missing_ok=True)
@@ -250,10 +232,26 @@ KDF_ITERATIONS = 600_000
 # 向后兼容：本模块内部历史名称。
 _KDF_ITERATIONS = KDF_ITERATIONS
 
-# 旧的无认证加密格式（filekey: XOR 流 / local: 固定硬编码 key）仅在迁移时
-# 读取，保留向后兼容。默认开启解密能力，但每次读取都会记录 WARNING 审计
-# 日志，提示旧条目将在下次写入时升级为 AES-GCM。
-_LEGACY_DECRYPT_ALLOWED = True
+# 旧的无认证加密格式（filekey: XOR 流）与明文 JSON vault 默认一律拒绝：
+# 它们既无完整性保护、也无法与「本地攻击者注入的凭据」区分，而读取成功后还会
+# 被立刻重写成 DPAPI/AES-GCM，等于替攻击者「洗白」（R2 审计 P0-3，Windows 已
+# 实证）。确属本机旧数据时，用户可显式打开一次性迁移开关启动一次完成升级；
+# 开关默认关闭，且每次读取都记 WARNING 审计日志。
+# local:（固定硬编码 key）不提供任何开关，已永久移除。
+_LEGACY_DECRYPT_ALLOWED = False
+_LEGACY_MIGRATION_ENV = "PI_MANAGER_ALLOW_LEGACY_VAULT"
+
+
+def _legacy_migration_enabled() -> bool:
+    """True 时允许一次性读取无认证旧格式 / 明文 JSON vault。"""
+    if _LEGACY_DECRYPT_ALLOWED:
+        return True
+    return os.environ.get(_LEGACY_MIGRATION_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _derive_key_from_salt(salt: bytes) -> bytes:
@@ -262,7 +260,13 @@ def _derive_key_from_salt(salt: bytes) -> bytes:
 
 
 def _validate_master_key_salt(path: Path) -> bytes:
-    """Read and validate the salt file (32 bytes, regular, 0600)."""
+    """Read and validate the salt file (32 bytes, regular, 0600).
+
+    历史上本模块有两份语义完全相同的实现（``_validate_master_key`` 与本函数），
+    且 ``_load_or_create_master_key`` 在不同返回路径上分别调用其中一个——命名
+    （"master key" vs "salt"）与实际语义（都是盐）矛盾，后续重构极易只改一份
+    而引入回退（R2 审计 P3-5）。现在只保留这一份实现。
+    """
     if platform_util.is_reparse_point(path):
         raise VaultCorruptError(f"主密钥盐文件不能是 reparse point: {path}")
     info = path.stat(follow_symlinks=False)
@@ -316,8 +320,12 @@ def decrypt_blob(raw: bytes) -> bytes:
         )
     if raw.startswith(b"filekey:"):
         # Legacy unauthenticated fallback; successful reads are upgraded on next write.
-        if not _LEGACY_DECRYPT_ALLOWED:
-            raise VaultCorruptError("旧的无认证加密格式（filekey:）已被禁用")
+        if not _legacy_migration_enabled():
+            raise VaultCorruptError(
+                "旧的无认证加密格式（filekey:）默认已禁用（XOR 无完整性保护，"
+                "无法与凭据注入区分）；确属本机旧数据请设置环境变量 "
+                f"{_LEGACY_MIGRATION_ENV}=1 后启动一次完成迁移"
+            )
         key = _get_master_key()
         plaintext = _xor_stream(base64.b64decode(raw[8:]), key)
         logging.getLogger(__name__).warning(
@@ -325,15 +333,14 @@ def decrypt_blob(raw: bytes) -> bytes:
         )
         return plaintext
     if raw.startswith(b"local:"):
-        # old fixed key — still decrypt for migration only
-        if not _LEGACY_DECRYPT_ALLOWED:
-            raise VaultCorruptError("旧的无认证加密格式（local:）已被禁用")
-        legacy = b"PiManagerLocalFallbackKey!v1"
-        plaintext = _xor_stream(base64.b64decode(raw[6:]), legacy)
-        logging.getLogger(__name__).warning(
-            "读取了无认证的旧格式 vault 条目（local:），将在下次写入时升级为 AES-GCM"
+        # 该格式的 XOR key 硬编码并随二进制分发，任何本地写入者都能零知识伪造
+        # 出合法密文，注入后还会被重写成 DPAPI 格式「洗白」（R2 审计 P0-3，已
+        # 实证）。因此无条件移除、不提供迁移开关——保留开关等于保留一条对所有
+        # 平台都成立的凭据注入通道。
+        raise VaultCorruptError(
+            "旧的固定密钥加密格式（local:）已永久移除：其加密密钥硬编码在程序内，"
+            "任何本地进程都能伪造，无法与凭据注入区分。请重新填写 API Key"
         )
-        return plaintext
     # raw dpapi blob (old whole-file format)
     if sys.platform == "win32":
         try:
@@ -423,19 +430,34 @@ def _read_vault_file(path: Path, *, rewrite_legacy_format: bool = False) -> dict
     except Exception as exc:
         if raw.startswith((b"dpapi:", b"aesgcm:", b"filekey:", b"local:")):
             raise VaultCorruptError(f"vault 解密失败: {exc}") from exc
-        # Attempt legacy plaintext migration as a last resort, but never
-        # silently accept untrusted plaintext — require it to parse as valid
-        # JSON dict; otherwise the vault is corrupt. 为了防止本地攻击者用明文
-        # JSON 替换已初始化的加密 vault 实现凭据注入，仅在尚未初始化主密钥
-        # （首次迁移场景）时才接受明文 JSON；主密钥已存在时一律拒绝。
+        # 明文 JSON vault 只可能来自极早期版本。历史守卫用「.vault_master_key
+        # 是否存在」判断 vault 是否已初始化为加密格式，但 Windows 上
+        # encrypt_blob 优先走 DPAPI，_get_master_key() 从不被调用 → 该盐文件
+        # 永不存在 → 守卫恒为假，任意可写 vault 的本地主体都能用明文 JSON 覆盖
+        # 并完成凭据注入（R2 审计 P0-3，Windows 已实证）。现在不再依赖该文件：
+        # 能走到这里说明 vault 文件已存在，默认一律拒绝明文，只有显式打开一次性
+        # 迁移开关时才接受。
         if _master_key_path().exists():
+            # 盐文件存在 = vault 确定已初始化为加密格式，明文只能是注入，
+            # 连一次性迁移开关都不该放行。
             raise VaultCorruptError(
-                "vault 已初始化为加密格式，拒绝接受明文 JSON（疑似凭据注入）"
+                "vault 已初始化为加密格式（主密钥盐文件已存在），"
+                "拒绝接受明文 JSON（疑似凭据注入）"
+            ) from exc
+        if not _legacy_migration_enabled():
+            raise VaultCorruptError(
+                "vault 不是受认证保护的加密格式，拒绝作为明文 JSON 读取"
+                "（疑似凭据注入）；确属旧版本遗留请设置环境变量 "
+                f"{_LEGACY_MIGRATION_ENV}=1 后启动一次完成迁移"
             ) from exc
         try:
             text = raw.decode("utf-8", errors="strict")
         except Exception as text_exc:
             raise VaultCorruptError(f"vault 解密失败且无法作为文本解析: {exc}") from text_exc
+        logging.getLogger(__name__).warning(
+            "以一次性迁移模式读取了明文 JSON vault %s，将立即重写为认证加密格式",
+            path,
+        )
     data = json.loads(text or "{}")
     if not isinstance(data, dict):
         raise ValueError("Vault 顶层必须是 JSON 对象")
@@ -532,7 +554,10 @@ def set_secret(name: str, value: str) -> None:
             try:
                 if value:
                     kr.set_password(SERVICE, name, value)
-                    keyring_saved = True
+                    # 写后立刻回读：keyring 探测改为只读后（P3-7），必须在这里
+                    # 确认后端真的持久化了，才敢删掉 vault 里的副本——否则一个
+                    # 「写不报错但读回是空」的后端会让密钥在两端同时丢失。
+                    keyring_saved = kr.get_password(SERVICE, name) == value
                 else:
                     try:
                         kr.delete_password(SERVICE, name)
@@ -768,18 +793,31 @@ def replace_provider_api_keys(provider: str, values: list[str]) -> dict[str, Any
         return _write_provider_key_pool(provider, pool)
 
 
+# 掩码固定用 8 个星号：既不暴露密钥长度，也把可见明文压到前 2 + 后 2。旧实现
+# 暴露前 3 + 后 4，对 `sk-` 这类已知前缀的 provider 有效熵损失可观（R2 审计
+# P3-2）。需要区分同一 provider 的多把 Key 时请用 key_id。
+_MASK_BODY = "*" * 8
+
+
 def _masked_provider_key(value: str) -> str:
     value = str(value or "")
     if len(value) <= 8:
-        return "*" * len(value)
-    return f"{value[:3]}{'*' * min(8, max(4, len(value) - 7))}{value[-4:]}"
+        return _MASK_BODY
+    return f"{value[:2]}{_MASK_BODY}{value[-2:]}"
 
 
-def list_provider_keys(provider: str) -> list[dict[str, Any]]:
+def list_provider_keys(provider: str, *, reveal: bool = False) -> list[dict[str, Any]]:
+    """列出 provider 的密钥池元数据。
+
+    默认只返回掩码（``masked``），与既有调用方约定一致；``reveal=True``
+    仅限 GUI 密钥管理对话框的「显示明文」显式请求，附带 ``value`` 字段。
+    调用方不得把 ``value`` 写入 models.json / 日志 / 导出包。
+    """
     pool = load_provider_key_pool(provider)
     active_id = str(pool.get("active_id") or "")
-    return [
-        {
+    rows: list[dict[str, Any]] = []
+    for item in pool["keys"]:
+        row = {
             "id": item["id"],
             "masked": _masked_provider_key(item["value"]),
             "status": item["status"],
@@ -790,8 +828,10 @@ def list_provider_keys(provider: str) -> list[dict[str, Any]]:
             "failure_count": item.get("failure_count", 0),
             "failure_reason": item.get("failure_reason", ""),
         }
-        for item in pool["keys"]
-    ]
+        if reveal:
+            row["value"] = item["value"]
+        rows.append(row)
+    return rows
 
 
 def add_provider_api_key(provider: str, value: str) -> dict[str, Any]:
@@ -846,20 +886,33 @@ def remove_provider_api_key(provider: str, key_id: str) -> bool:
         return True
 
 
-def _sanitize_reason(text: str) -> str:
-    """Strip NUL and control characters (newlines kept) from external input."""
+def _clean_control_chars(text: str) -> str:
+    """去掉 NUL 与控制字符（保留换行），**不截断**。"""
     cleaned = []
     for ch in str(text or ""):
         code = ord(ch)
         if ch == "\n" or (code >= 0x20 and code != 0x7F and not 0x80 <= code <= 0x9F):
             cleaned.append(ch)
-    return "".join(cleaned)[:400]
+    return "".join(cleaned)
+
+
+def _sanitize_reason(text: str) -> str:
+    """清洗 + 截断，用于**落库/展示**。
+
+    分类不能用截断后的串：`classify_provider_key_failure` 靠 401/429/quota 这类
+    标志判断是鉴权、限流还是额度问题，而这些标志往往出现在上游错误串的**尾部**，
+    在 400 字符处截断可能正好把它切掉，于是同一个错误在桌面端与扩展端会被分成
+    不同类别（R2 扩展审计 D1）。所以分类走 `_clean_control_chars`（不截断），
+    只有写进 vault / 展示给用户时才截断。
+    """
+    return _clean_control_chars(text)[:400]
 
 
 def mark_provider_key_failed(provider: str, key_id: str, reason: str = "") -> bool:
     provider = (provider or "").strip()
     key_id = (key_id or "").strip()
-    reason = _sanitize_reason(reason)
+    # 分类用完整串（标志常在尾部），落库时才截断——见 _sanitize_reason 的说明。
+    reason = _clean_control_chars(reason)
     from .core import classify_provider_key_failure, redact_secret_values
 
     classification = classify_provider_key_failure(1, "", reason)
@@ -976,7 +1029,14 @@ def provider_header_env_name(provider: str, header: str) -> str:
     return f"{provider_part}_HEADER_{digest}"
 
 
-def store_provider_headers(provider: str, headers: dict[str, Any]) -> dict[str, str]:
+def store_provider_headers(
+    provider: str, headers: dict[str, Any], *, trusted: bool = True
+) -> dict[str, str]:
+    """把敏感 Header 值迁入安全存储并换成引用。
+
+    ``trusted=False``（外部输入）时不承认裸变量名，否则一个导入的配置包可以写
+    `Authorization: SOME_ENV_NAME` 把用户环境里的凭据解析出来（同 P1-2）。
+    """
     result: dict[str, str] = {}
     for name, value in headers.items():
         header = str(name)
@@ -984,7 +1044,7 @@ def store_provider_headers(provider: str, headers: dict[str, Any]) -> dict[str, 
         if not is_sensitive_header_name(header):
             result[header] = raw
             continue
-        env_name = referenced_env_name(raw)
+        env_name = _env_reference_name(raw, trusted=trusted)
         managed_env = provider_header_env_name(provider, header)
         if env_name and env_name != managed_env:
             result[header] = f"${{{env_name}}}"
@@ -1002,7 +1062,9 @@ def store_provider_headers(provider: str, headers: dict[str, Any]) -> dict[str, 
 
 
 def resolve_provider_header_value(provider: str, header: str, value: str) -> str:
-    env_name = referenced_env_name(str(value or ""))
+    # 运行时读的是本机 models.json（受信任），沿用裸变量名兼容以免旧配置的
+    # Header 引用突然被当成字面值发出去。
+    env_name = _env_reference_name(str(value or ""))
     if not env_name:
         return str(value or "")
     if env_name == provider_header_env_name(provider, header):
@@ -1013,7 +1075,7 @@ def resolve_provider_header_value(provider: str, header: str, value: str) -> str
 def provider_header_runtime_env(provider: str, headers: dict[str, Any]) -> dict[str, str]:
     result: dict[str, str] = {}
     for name, value in headers.items():
-        env_name = referenced_env_name(str(value or ""))
+        env_name = _env_reference_name(str(value or ""))
         if not env_name:
             continue
         secret = resolve_provider_header_value(
@@ -1030,17 +1092,83 @@ def delete_provider_header_secrets(provider: str, headers: dict[str, Any]) -> No
             delete_secret(provider_header_secret_name(provider, str(name)))
 
 
+# 旧版环境变量名必须形如 FOO_BAR（至少一个下划线分段）才有资格走兼容迁移；
+# 上界 64 字符。真实凭据（`AKIAIOSFODNN7EXAMPLE`、大写十六进制 token）几乎
+# 不会同时满足「含下划线分段」与「该名字确实存在于当前进程环境」两个条件。
+_LEGACY_BARE_ENV_NAME_RE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+")
+
+
 def referenced_env_name(value: str) -> str:
+    """解析显式环境变量引用名（`$NAME` / `${NAME}`），否则返回空串。
+
+    历史实现还把「任意 ≥3 字符的全大写串」当成环境变量名，导致 AWS 风格的
+    真实 Access Key ID（`AKIAIOSFODNN7EXAMPLE`）被判为引用：安全存储里的记录
+    被删除，**密钥本身**被包成 `${AKIAIOSFODNN7EXAMPLE}` 明文写进 models.json
+    并原样进入未加密导出 ZIP，同时 provider 因变量不存在而静默失效
+    （R2 审计 P1-2，已实证）。这条启发式已删除——`help_docs.py` 早已声明外部
+    环境变量必须显式写成 `$NAME` / `${NAME}`。裸变量名的向后兼容迁移见
+    :func:`_legacy_bare_env_name`，只在受信任的本机配置迁移路径上生效。
+    """
     val = (value or "").strip()
     match = re.fullmatch(r"\$(?:\{([A-Z][A-Z0-9_]*)\}|([A-Z][A-Z0-9_]*))", val)
     if match:
         return match.group(1) or match.group(2) or ""
-    if re.fullmatch(r"[A-Z][A-Z0-9_]{2,}", val):
-        return val
     return ""
 
 
-def store_provider_api_key(provider: str, api_key: str) -> str:
+def _legacy_bare_env_name(value: str) -> str:
+    """把旧配置里的裸变量名迁移成显式引用，无法确认时视为真实密钥。
+
+    只有同时满足「形如 FOO_BAR 的常规变量名」「长度 ≤ 64」「该变量确实存在于
+    当前进程环境且非空」时才承认，其余一律返回空串——交由调用方当成真实密钥
+    存入安全存储。这个方向是安全的：最坏情况是用户真填了一个当前未设置的变量
+    名，它会被当作字面密钥保管、provider 报鉴权失败（可恢复、无泄露），而不是
+    像旧行为那样把真实密钥明文写进 models.json（不可恢复、直接泄露）。
+    """
+    val = (value or "").strip()
+    if len(val) > 64 or not _LEGACY_BARE_ENV_NAME_RE.fullmatch(val):
+        return ""
+    if not os.environ.get(val, "").strip():
+        return ""
+    logging.getLogger(__name__).warning(
+        "provider 凭据字段使用了旧式裸环境变量名 %s，已按 ${%s} 迁移；"
+        "请在 Provider 编辑页改为显式 ${%s} 形式",
+        val,
+        val,
+        val,
+    )
+    return val
+
+
+def _env_reference_name(value: str, *, trusted: bool = True) -> str:
+    """显式引用优先，其次（仅受信任输入）旧式裸变量名兼容迁移。
+
+    ``trusted=False`` 用于外部输入（配置包导入）：此时不承认裸变量名，避免恶意
+    配置包用 `OPENAI_API_KEY` 之类的名字把用户环境里的真实密钥解析出来、发往
+    攻击者控制的 baseUrl。
+    """
+    name = referenced_env_name(value)
+    if name or not trusted:
+        return name
+    return _legacy_bare_env_name(value)
+
+
+_UNTRUSTED_DPAPI_MARKER_ERROR = (
+    "拒绝处理 __DPAPI__: 历史标记：该标记只服务于本机旧配置的一次性迁移，"
+    "不接受来自配置包等外部输入——它可以声明「我的 Key 存在另一个 Provider "
+    "名下」，被用来把已有 Provider 的真实密钥复制给攻击者控制 baseUrl 的新 "
+    "Provider。请在 Provider 编辑页重新填写 API Key"
+)
+
+
+def store_provider_api_key(provider: str, api_key: str, *, trusted: bool = True) -> str:
+    """把 apiKey 字段落到安全存储，返回写回 models.json 的引用字符串。
+
+    ``trusted=False`` 表示 ``api_key`` 直接来自外部输入（配置包导入）：此时
+    ``__DPAPI__:`` 历史标记一律拒绝、裸变量名不做兼容迁移（R2 审计 P0-2、
+    P1-2）。受信任路径（本机 models.json 迁移、Provider 编辑页保存）保持原有
+    行为，避免升级用户丢失重命名 Provider 的密钥关联。
+    """
     provider = (provider or "").strip()
     if not provider:
         return api_key
@@ -1048,15 +1176,25 @@ def store_provider_api_key(provider: str, api_key: str) -> str:
         delete_provider_api_keys(provider)
         return ""
     if api_key.startswith("__DPAPI__:"):
+        if not trusted:
+            raise ValueError(_UNTRUSTED_DPAPI_MARKER_ERROR)
         legacy_provider = api_key.split(":", 1)[1].strip() or provider
         credential = get_active_provider_credential(legacy_provider)
         if credential and legacy_provider != provider:
+            # 留审计痕迹：跨 provider 复制是 P0-2 的核心动作，即使在受信任的
+            # 本机迁移路径上也应该可追溯。
+            logging.getLogger(__name__).warning(
+                "按 __DPAPI__ 历史标记把 Provider %s 的密钥关联迁移到 %s"
+                "（本机旧配置迁移）",
+                legacy_provider,
+                provider,
+            )
             replace_provider_api_keys(provider, [credential["value"]])
         return provider_api_key_reference(provider)
     if api_key.startswith("!"):
         delete_provider_api_keys(provider)
         return api_key
-    env_name = referenced_env_name(api_key)
+    env_name = _env_reference_name(api_key, trusted=trusted)
     if env_name:
         if env_name != provider_env_name(provider):
             delete_provider_api_keys(provider)
@@ -1065,13 +1203,17 @@ def store_provider_api_key(provider: str, api_key: str) -> str:
     return provider_api_key_reference(provider)
 
 
-def resolve_provider_api_key(api_key_field: str, provider: str = "") -> str:
+def resolve_provider_api_key(
+    api_key_field: str, provider: str = "", *, trusted: bool = True
+) -> str:
     val = (api_key_field or "").strip()
     if val.startswith("__DPAPI__:"):
+        if not trusted:
+            raise ValueError(_UNTRUSTED_DPAPI_MARKER_ERROR)
         prov = val.split(":", 1)[1] or provider
         credential = get_active_provider_credential(prov)
         return credential["value"] if credential else ""
-    env_name = referenced_env_name(val)
+    env_name = _env_reference_name(val, trusted=trusted)
     if env_name:
         if provider and env_name == provider_env_name(provider):
             credential = get_active_provider_credential(provider)
@@ -1084,7 +1226,14 @@ def resolve_provider_api_key(api_key_field: str, provider: str = "") -> str:
     return val
 
 
-def migrate_plaintext_keys(providers: dict[str, Any]) -> dict[str, Any]:
+def migrate_plaintext_keys(
+    providers: dict[str, Any], *, trusted: bool = True
+) -> dict[str, Any]:
+    """把 providers 里的明文凭据迁入安全存储并换成引用。
+
+    ``trusted=False`` 用于配置包导入这类外部输入：拒绝 ``__DPAPI__:`` 标记、
+    不做裸变量名兼容迁移（R2 审计 P0-2、P1-2）。
+    """
     out = {}
     for name, entry in (providers or {}).items():
         if not isinstance(entry, dict):
@@ -1095,16 +1244,16 @@ def migrate_plaintext_keys(providers: dict[str, Any]) -> dict[str, Any]:
         if key.startswith("__DPAPI__:"):
             # Older configurations encoded the vault lookup name in the
             # marker. Preserve that association when a provider was renamed.
-            e["apiKey"] = store_provider_api_key(name, key)
+            e["apiKey"] = store_provider_api_key(name, key, trusted=trusted)
         elif key and not key.startswith("!"):
-            env_name = referenced_env_name(key)
+            env_name = _env_reference_name(key, trusted=trusted)
             if env_name:
                 e["apiKey"] = f"${{{env_name}}}"
             else:
-                e["apiKey"] = store_provider_api_key(name, key)
+                e["apiKey"] = store_provider_api_key(name, key, trusted=trusted)
         headers = e.get("headers")
         if isinstance(headers, dict):
-            e["headers"] = store_provider_headers(name, headers)
+            e["headers"] = store_provider_headers(name, headers, trusted=trusted)
         out[name] = e
     return out
 

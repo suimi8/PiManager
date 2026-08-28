@@ -1,6 +1,7 @@
 """Main window UI for Pi Manager."""
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -53,7 +55,83 @@ SINGLE_INSTANCE_SERVER_NAME = "PiManager"
 logger = logging.getLogger(__name__)
 
 
+def _accepts_is_cancelled(fn) -> bool:
+    """判断 job 是否声明了 ``is_cancelled`` 形参（协作式取消契约的入口）。
+
+    只做静态签名检查：内置/C 扩展等取不到签名的可调用体一律视为不可取消。
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if "is_cancelled" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+# 关闭预算耗尽后仍在运行的 Worker 会被移到这里：脱离 parent、保持强引用，
+# 直到进程结束。宁可泄漏一个线程，也不要让 QThread 析构于运行态触发
+# qFatal("QThread: Destroyed while thread is still running") 导致崩溃退出。
+_ORPHANED_WORKERS: list[QThread] = []
+
+
+def detach_running_worker(worker) -> bool:
+    """把仍在运行的 worker 从 Qt 对象树与登记表中摘出并延寿到进程结束。"""
+    if worker is None:
+        return False
+    try:
+        if not worker.isRunning():
+            return False
+    except RuntimeError:
+        # C++ 侧已销毁：无需处理
+        return False
+    try:
+        worker.setParent(None)
+    except (RuntimeError, TypeError) as e:
+        logger.warning("detach worker parent failed: %s", e)
+    if worker not in _ORPHANED_WORKERS:
+        _ORPHANED_WORKERS.append(worker)
+    logger.warning(
+        "background worker %s did not finish within the shutdown budget; "
+        "detached to avoid destroying a running QThread",
+        type(worker).__name__,
+    )
+    return True
+
+
+def drain_pending_connections(server) -> int:
+    """取走并关闭 QLocalServer 的全部挂起连接，返回处理数量。
+
+    ``QLocalServer`` 在 ``newConnection`` 发出后把已建立的 ``QLocalSocket`` 放进
+    内部 pending 队列，**必须**由使用者 ``nextPendingConnection()`` 取走并负责
+    销毁。以前的唤醒槽从不取走：每次双击图标唤醒都泄漏一个 socket / 命名管道
+    句柄，默认 ``maxPendingConnections()=30``，队列满后 ``newConnection`` 不再
+    发出 —— 双击图标彻底不再唤醒窗口，且第二实例连不上后静默退出。
+    """
+    drained = 0
+    while True:
+        conn = server.nextPendingConnection()
+        if conn is None:
+            break
+        conn.disconnected.connect(conn.deleteLater)
+        conn.close()
+        drained += 1
+    return drained
+
+
 class Worker(QThread):
+    """后台任务线程，带显式的协作式取消契约。
+
+    ``requestInterruption()`` 本身只是给 QThread 置一个标志位；只有 job 主动
+    查询才有效果。因此：
+
+    * 若 ``fn`` 声明了 ``is_cancelled`` 形参（或接受 ``**kwargs``），``run()``
+      会自动注入 ``self.isInterruptionRequested``，job 可在分段点自行退出；
+      此时 ``cancellable`` 为 True。
+    * 否则 ``cancellable`` 为 False —— 关闭流程据此知道该任务无法被打断，
+      不再假装 2.5s 预算能把它收走（见 ``detach_running_worker``）。
+    """
+
     done = Signal(object)
     failed = Signal(str)
 
@@ -62,13 +140,26 @@ class Worker(QThread):
         self.fn = fn
         self.args = args
         self.kwargs = kwargs
+        self._inject_cancel = "is_cancelled" not in kwargs and _accepts_is_cancelled(fn)
+        self.cancellable = bool(self._inject_cancel or "is_cancelled" in kwargs)
 
     def run(self):
+        kwargs = dict(self.kwargs)
+        if self._inject_cancel:
+            kwargs["is_cancelled"] = self.isInterruptionRequested
         try:
-            self.done.emit(self.fn(*self.args, **self.kwargs))
+            result = self.fn(*self.args, **kwargs)
         except Exception as e:
+            if self.isInterruptionRequested():
+                # 取消导致的异常不再上报：接收槽可能已随窗口关闭而失效。
+                logger.info("Worker task aborted after interruption request")
+                return
             logger.exception("Worker task failed")
             self.failed.emit(str(e)[:500])
+            return
+        if self.isInterruptionRequested():
+            return
+        self.done.emit(result)
 
 
 class WorkerTrackerMixin:
@@ -99,6 +190,42 @@ class WorkerTrackerMixin:
         except ValueError:
             pass
 
+    def _reap_workers(self, budget: float = 5.0) -> list[Worker]:
+        """关闭前收割本对象的 Worker；返回预算耗尽后仍在运行者（已脱钩）。
+
+        默认 ``_adopt_worker`` 会把 worker 的 parent 设为 self，对话框销毁时
+        Qt 会连带销毁子对象 —— 包括仍在运行的 QThread，触发
+        qFatal("QThread: Destroyed while thread is still running")。
+        以前这里 ``wait()`` 的返回值被忽略、无论是否等到都放行；现在超时的
+        worker 一律脱离 parent 并延寿到进程结束（``detach_running_worker``），
+        既不阻塞用户关闭窗口，也不会崩溃。
+        """
+        running = [w for w in self._workers if w.isRunning()]
+        if not running:
+            return []
+        for w in running:
+            w.requestInterruption()
+        deadline = time.monotonic() + budget
+        for w in running:
+            remaining = max(0, int((deadline - time.monotonic()) * 1000))
+            if w.isRunning() and remaining:
+                w.wait(remaining)
+        stuck = []
+        for w in running:
+            if detach_running_worker(w):
+                self._untrack(w)
+                stuck.append(w)
+        return stuck
+
+    def _note_detached_workers(self) -> None:
+        """把「请求仍在后台收尾」写到对话框自己的状态标签（可被子类覆写）。"""
+        for attr in ("fetch_status", "status", "log"):
+            label = getattr(self, attr, None)
+            setter = getattr(label, "setText", None) if label is not None else None
+            if callable(setter):
+                setter("网络请求未能在 5 秒内取消，已转入后台收尾；窗口可安全关闭。")
+                return
+
 
 class BatchTestWorker(QThread):
     """Run concurrent model tests and emit each result as it completes."""
@@ -126,6 +253,9 @@ class BatchTestWorker(QThread):
         self.kind = kind
         self.health_scope = health_scope
         self.health_selected = health_selected or []
+        # 模型批测走 test_models_batch_concurrent，一直支持 is_cancelled；
+        # 健康检查取决于 extras.run_health_check 是否已声明该形参（见下）。
+        self.cancellable = kind != "health" or _accepts_is_cancelled(extras.run_health_check)
 
     def run(self):
         try:
@@ -133,13 +263,21 @@ class BatchTestWorker(QThread):
                 def on_one(res):
                     self.progress.emit(res)
 
+                health_kwargs = {}
+                if self.cancellable:
+                    # extras.run_health_check 目前尚未声明 is_cancelled；一旦补上
+                    # 该形参，这里会自动把中断信号透传下去，无需再改 UI 层。
+                    health_kwargs["is_cancelled"] = self.isInterruptionRequested
                 result = extras.run_health_check(
                     pairs=self.pairs or None,
                     mode=self.mode,
                     scope=self.health_scope,
                     selected=self.health_selected,
                     on_one=on_one,
+                    **health_kwargs,
                 )
+                if self.isInterruptionRequested():
+                    return
                 self.done.emit(result)
                 return
 
@@ -160,6 +298,8 @@ class BatchTestWorker(QThread):
                 append_history_each=True,
                 is_cancelled=self.isInterruptionRequested,
             )
+            if self.isInterruptionRequested():
+                return
             self.done.emit(results)
         except Exception as e:
             logger.exception("BatchTestWorker failed")
@@ -280,6 +420,8 @@ class ProviderEditorDialog(WorkerTrackerMixin, QDialog):
         self._fetched_models: list[dict[str, Any]] = []
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        # 显式默认按钮：不依赖各平台 QDialogButtonBox 的隐式行为，回车即保存。
+        buttons.button(QDialogButtonBox.Save).setDefault(True)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -313,15 +455,10 @@ class ProviderEditorDialog(WorkerTrackerMixin, QDialog):
         self.fetch_status.setText(text)
 
     def closeEvent(self, event):
-        running = [w for w in self._workers if w.isRunning()]
-        if running:
-            for w in running:
-                w.requestInterruption()
-            deadline = time.monotonic() + 5.0
-            for w in running:
-                remaining = max(0, int((deadline - time.monotonic()) * 1000))
-                if w.isRunning() and remaining:
-                    w.wait(remaining)
+        if self._reap_workers():
+            # 网络请求卡住（防火墙丢包时 socket 超时可远超预算）：worker 已脱钩，
+            # 关闭窗口不再连带销毁运行中的 QThread。
+            self._note_detached_workers()
         super().closeEvent(event)
 
     def fetch_models(self):
@@ -434,6 +571,7 @@ class ProviderKeysDialog(QDialog):
     def __init__(self, provider: str, parent=None):
         super().__init__(parent)
         self.provider = provider
+        self._reveal = False
         self.setWindowTitle(f"API Keys · {provider}")
         self.resize(760, 460)
 
@@ -442,7 +580,10 @@ class ProviderKeysDialog(QDialog):
         title.setObjectName("sectionTitle")
         layout.addWidget(title)
 
-        hint = QLabel("请求遇到鉴权、限流或额度错误时，会将当前 Key 暂时标记为失效并切换下一把。")
+        hint = QLabel(
+            "请求遇到鉴权、限流或额度错误时，会将当前 Key 暂时标记为失效并切换下一把。"
+            "Key 默认掩码显示，可切换明文或直接复制。"
+        )
         hint.setObjectName("subtitle")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -461,9 +602,21 @@ class ProviderKeysDialog(QDialog):
         header.setSectionResizeMode(4, QHeaderView.Stretch)
         layout.addWidget(self.table, 1)
 
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("subtitle")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
         row = QHBoxLayout()
         add_btn = QPushButton("添加 Key")
         add_btn.clicked.connect(self.add_key)
+        self.reveal_btn = QPushButton("显示明文")
+        self.reveal_btn.setProperty("secondary", True)
+        self.reveal_btn.setCheckable(True)
+        self.reveal_btn.clicked.connect(self.on_reveal_toggled)
+        copy_btn = QPushButton("复制选中")
+        copy_btn.setProperty("secondary", True)
+        copy_btn.clicked.connect(self.copy_key)
         delete_btn = QPushButton("删除")
         delete_btn.setProperty("danger", True)
         delete_btn.clicked.connect(self.delete_key)
@@ -476,6 +629,8 @@ class ProviderKeysDialog(QDialog):
         close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self.accept)
         row.addWidget(add_btn)
+        row.addWidget(self.reveal_btn)
+        row.addWidget(copy_btn)
         row.addWidget(delete_btn)
         row.addWidget(restore_btn)
         row.addWidget(restore_all_btn)
@@ -484,11 +639,40 @@ class ProviderKeysDialog(QDialog):
         layout.addLayout(row)
         self.refresh()
 
+    def on_reveal_toggled(self, checked: bool) -> None:
+        self._reveal = bool(checked)
+        self.reveal_btn.setText("隐藏明文" if self._reveal else "显示明文")
+        if self._reveal:
+            self.status_label.setText("已切换为明文显示，请注意周围环境与屏幕共享风险。")
+        else:
+            self.status_label.setText("已恢复掩码显示。")
+        current = self.table.currentRow()
+        self.refresh()
+        if 0 <= current < self.table.rowCount():
+            self.table.selectRow(current)
+
+    def copy_key(self) -> None:
+        """复制选中 Key 的明文到剪贴板（掩码模式下同样可用）。"""
+        key_id = self.selected_key_id()
+        if not key_id:
+            self.status_label.setText("请先选择一把 Key。")
+            return
+        rows = core.list_provider_api_keys(self.provider, reveal=True)
+        value = next(
+            (str(row.get("value") or "") for row in rows if row.get("id") == key_id), ""
+        )
+        if not value:
+            self.status_label.setText("未找到选中的 Key，可能已被删除。")
+            return
+        QApplication.clipboard().setText(value)
+        self.status_label.setText("已复制选中 Key 的明文到剪贴板，请注意保管。")
+
     def refresh(self):
-        rows = core.list_provider_api_keys(self.provider)
+        rows = core.list_provider_api_keys(self.provider, reveal=self._reveal)
         self.table.setRowCount(len(rows))
         for index, meta in enumerate(rows):
-            key_item = QTableWidgetItem(str(meta.get("masked") or ""))
+            display = str(meta.get("value") or "") if self._reveal else str(meta.get("masked") or "")
+            key_item = QTableWidgetItem(display)
             key_item.setData(Qt.UserRole, str(meta.get("id") or ""))
             self.table.setItem(index, 0, key_item)
             status = "可用" if meta.get("status") == "available" else "失效"
@@ -614,15 +798,10 @@ class FetchModelsDialog(WorkerTrackerMixin, QDialog):
         self._init_workers()
 
     def closeEvent(self, event):
-        running = [w for w in self._workers if w.isRunning()]
-        if running:
-            for w in running:
-                w.requestInterruption()
-            deadline = time.monotonic() + 5.0
-            for w in running:
-                remaining = max(0, int((deadline - time.monotonic()) * 1000))
-                if w.isRunning() and remaining:
-                    w.wait(remaining)
+        if self._reap_workers():
+            # 网络请求卡住（防火墙丢包时 socket 超时可远超预算）：worker 已脱钩，
+            # 关闭窗口不再连带销毁运行中的 QThread。
+            self._note_detached_workers()
         super().closeEvent(event)
 
     def _fetch(self):
@@ -764,6 +943,14 @@ class InstallPiDialog(WorkerTrackerMixin, QDialog):
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         layout.addWidget(self.log, 1)
+        # 不确定态进度条：npm install -g 可跑数分钟，此前界面只有一行文本，
+        # 两个按钮同时置灰、closeEvent 拒绝关闭，用户无法判断是否还在动。
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
+        self.progress.setVisible(False)
+        self.progress.setAccessibleName("安装进度")
+        layout.addWidget(self.progress)
         row = QHBoxLayout()
         self.btn_install = QPushButton("\u5f00\u59cb\u5b89\u88c5/\u5347\u7ea7")
         self.btn_install.setProperty("success", True)
@@ -771,6 +958,10 @@ class InstallPiDialog(WorkerTrackerMixin, QDialog):
         self.btn_close = QPushButton("\u5173\u95ed")
         self.btn_close.setProperty("secondary", True)
         self.btn_close.clicked.connect(self.accept)
+        # \u952e\u76d8\u53ef\u8fbe\u6027\uff1a\u6b64\u524d\u672c\u5bf9\u8bdd\u6846\u7528\u88f8 QPushButton\uff0c\u6ca1\u6709\u9ed8\u8ba4\u6309\u94ae\uff0c\u56de\u8f66\u952e\u65e0\u54cd\u5e94\u3002
+        self.btn_install.setAutoDefault(True)
+        self.btn_install.setDefault(True)
+        self.btn_close.setAutoDefault(False)
         row.addWidget(self.btn_install)
         row.addStretch(1)
         row.addWidget(self.btn_close)
@@ -784,7 +975,12 @@ class InstallPiDialog(WorkerTrackerMixin, QDialog):
             )
 
     def closeEvent(self, event):
-        if self._worker is not None and self._worker.isRunning():
+        # \u67e5\u8be2\u767b\u8bb0\u8868\u800c\u975e self._worker\uff1a_track \u8fde\u63a5\u4e86 finished \u2192 deleteLater\uff0c
+        # \u5b89\u88c5\u5b8c\u6210\u540e self._worker \u4f1a\u53d8\u6210\u60ac\u5782\u7684 Python \u5305\u88c5\u5668\uff0c\u518d\u6b21\u89e6\u53d1
+        # closeEvent\uff08X / Alt+F4 / \u7236\u7a97\u53e3\u9500\u6bc1\u94fe\uff09\u65f6 isRunning() \u4f1a\u629b
+        # RuntimeError: Internal C++ object (Worker) already deleted\u3002
+        # _untrack \u5728 deleteLater \u4e4b\u524d\u89e6\u53d1\uff0c\u6545 self._workers \u5929\u7136\u5b89\u5168\u3002
+        if any(w.isRunning() for w in self._workers):
             event.ignore()
             self.log.appendPlainText("\u5b89\u88c5\u4e2d\uff0c\u8bf7\u8010\u5fc3\u7b49\u5f85\u5b89\u88c5\u5b8c\u6210\u6216\u5931\u8d25\u3002")
             return
@@ -796,6 +992,7 @@ class InstallPiDialog(WorkerTrackerMixin, QDialog):
         self.btn_close.setEnabled(False)
         command_text = f"npm install -g {self.package_spec}" if self.package_spec else "npm install -g"
         self.log.appendPlainText(f"\u6b63\u5728\u6267\u884c {command_text} ...")
+        self.progress.setVisible(True)
         self._worker = self._track(Worker(core.install_or_update_pi))
         self._worker.done.connect(self._done)
         self._worker.failed.connect(self._fail)
@@ -809,6 +1006,7 @@ class InstallPiDialog(WorkerTrackerMixin, QDialog):
             self.log.appendPlainText(err)
         self.btn_install.setEnabled(True)
         self.btn_close.setEnabled(True)
+        self.progress.setVisible(False)
         if code == 0:
             self.install_succeeded = True
             self.log.appendPlainText("\n\u5b8c\u6210\uff1a\u5b89\u88c5/\u5347\u7ea7\u5df2\u9a8c\u8bc1\uff0c\u6b63\u5728\u8fd4\u56de\u7ba1\u7406\u5668\u9762\u677f\u3002")
@@ -825,6 +1023,7 @@ class InstallPiDialog(WorkerTrackerMixin, QDialog):
     def _fail(self, err: str):
         self.btn_install.setEnabled(True)
         self.btn_close.setEnabled(True)
+        self.progress.setVisible(False)
         self.log.appendPlainText(f"\u5931\u8d25\uff1a{err}")
         QMessageBox.warning(self, "\u5931\u8d25", err)
 
@@ -895,6 +1094,7 @@ class SetupWizardDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Save).setText("保存并开始")
         buttons.button(QDialogButtonBox.Cancel).setText("稍后")
+        buttons.button(QDialogButtonBox.Save).setDefault(True)
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -906,10 +1106,17 @@ class SetupWizardDialog(QDialog):
             mode=self.ui_mode.currentData() or "night",
             accent=self.ui_accent.currentData() or "blue",
         )
-        cfg = core.load_manager_config()
-        cfg["secure_keys"] = self.secure.isChecked()
-        cfg["auto_check_update"] = self.auto_update.isChecked()
-        core.save_manager_config(cfg)
+        # 持锁读改写：裸的 load → 改 → save 会覆盖掉 load 与 save 之间
+        # 其它写者（测试线程池、健康检查、helper 进程）对 pi-manager.json 的写入。
+        secure_keys = self.secure.isChecked()
+        auto_check = self.auto_update.isChecked()
+
+        def _apply_setup(cfg: dict) -> dict:
+            cfg["secure_keys"] = secure_keys
+            cfg["auto_check_update"] = auto_check
+            return cfg
+
+        core.update_manager_config(_apply_setup)
         core.mark_setup_done(True)
         try:
             core.run_first_time_bootstrap()
@@ -934,7 +1141,11 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
         except Exception:
             pass
         self.resize(1320, 880)
-        self.setMinimumSize(1080, 720)
+        # 1080×720 的最小尺寸在常见笔记本上不可用：1366×768 @125% 的可用逻辑
+        # 高度约 614 px（PassThrough 舍入策略下逻辑尺寸直接受缩放影响），窗口
+        # 无法缩到屏幕内，底部状态栏与页面底部按钮会被推到屏幕外且无法找回。
+        # 多数页面已用 QScrollArea 承担内容溢出，故下调下限。
+        self.setMinimumSize(960, 600)
         self.models: list[core.ModelInfo] = []
         self._init_workers()
         self.workers = self._workers  # 公共别名，兼容现有测试与外部引用
@@ -945,15 +1156,24 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
         self._prompted_manager_versions: set[str] = set()
         self.setAcceptDrops(True)
         self.init_feature_state()
-        self._build_ui()
+        # 必须在 _build_ui() 之前赋值：页面构建器（如插件页）需要据此判断
+        # 是否允许在构造期起后台线程，否则 start_background=False 契约失效。
         self._background_enabled = bool(start_background)
+        self._build_ui()
         self._refresh_update_indicators()
+        self._restore_window_geometry()
         if self._background_enabled:
             self.refresh_all()
             self.setup_system_tray()
             # Defer first-run / update checks so the shell paints first.
+            # 用有 parent 的 QTimer 而非裸 singleShot：窗口若在 400 ms 内被销毁
+            # （嵌入场景 / 快速退出），无 parent 的 singleShot 会在已删除对象上
+            # 触发槽；parented timer 随窗口一并销毁。
             from PySide6.QtCore import QTimer
-            QTimer.singleShot(400, self._startup_checks)
+            self._startup_timer = QTimer(self)
+            self._startup_timer.setSingleShot(True)
+            self._startup_timer.timeout.connect(self._startup_checks)
+            self._startup_timer.start(400)
             if bool(self.mgr.get("start_minimized")) and self.tray:
                 QTimer.singleShot(0, self.hide)
 
@@ -961,6 +1181,57 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
         raise NotImplementedError(
             "MainWindow 仅作为行为基类使用；请实例化 presentation.ModernMainWindow"
         )
+
+    # ---- 窗口几何持久化 -----------------------------------------------------
+    def _restore_window_geometry(self) -> None:
+        """恢复上次的窗口大小/位置。
+
+        以前完全没有几何持久化（全仓库无 saveGeometry/restoreGeometry），每次
+        启动都回到 1320×880 居中；而侧边栏折叠状态倒是持久化了，对比之下突兀。
+        恢复后校验窗口是否落在某块可用屏幕内（显示器拔掉/分辨率变化时可能落到
+        屏幕外），不可见则回退默认几何。
+        """
+        raw = str((self.mgr or {}).get("ui_geometry") or "")
+        if not raw:
+            return
+        try:
+            from PySide6.QtCore import QByteArray
+
+            if not self.restoreGeometry(QByteArray.fromHex(raw.encode("ascii"))):
+                return
+        except Exception as e:
+            logger.warning("restore window geometry failed: %s", e)
+            return
+        try:
+            from PySide6.QtGui import QGuiApplication
+
+            center = self.frameGeometry().center()
+            if QGuiApplication.screenAt(center) is None:
+                logger.info("saved window geometry is off-screen; falling back to default")
+                self.resize(1320, 880)
+                primary = QGuiApplication.primaryScreen()
+                if primary is not None:
+                    available = primary.availableGeometry()
+                    frame = self.frameGeometry()
+                    frame.moveCenter(available.center())
+                    self.move(frame.topLeft())
+        except Exception as e:
+            logger.warning("validate restored geometry failed: %s", e)
+
+    def _save_window_geometry(self) -> None:
+        # 只在窗口真的显示过时落盘：offscreen 测试与嵌入场景的几何值没有意义，
+        # 写进去只会用默认尺寸污染用户配置。closeEvent 与 quit_app 都发生在
+        # hide() 之前，正常路径上窗口仍是可见的。
+        if not self.isVisible():
+            return
+        try:
+            geometry = bytes(self.saveGeometry().toHex()).decode("ascii")
+            if geometry == str((self.mgr or {}).get("ui_geometry") or ""):
+                return  # 未变化：不必重写配置
+            self.mgr["ui_geometry"] = geometry
+            core.save_manager_config(self.mgr)
+        except Exception as e:
+            logger.warning("save window geometry failed: %s", e)
 
     def _polish_table(self, table: QTableWidget) -> None:
         """统一表格观感（跨平台）。"""
@@ -1097,14 +1368,44 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
             parts.append(f"图:{m.images}")
         return " ".join(parts) if parts else "—"
 
-    def _model_status_cells(
-        self, m: core.ModelInfo
-    ) -> tuple[str, str, QColor, QColor, str, str]:
-        """状态 / 延迟：返回 (状态文本, 延迟文本, 状态色, 延迟色, 状态提示, 延迟提示)。"""
+    #: ``_table_colors`` 缓存的兜底存活时间（秒）。主题变更都会走
+    #: ``apply_ui_theme`` 显式失效，TTL 只是防御「有人绕过该入口改主题」。
+    THEME_CACHE_TTL = 2.0
+
+    def invalidate_theme_cache(self) -> None:
+        self._table_colors_cache = None
+
+    def _table_colors(self):
+        """当前主题的 token（带缓存）。
+
+        ``core.get_ui_theme()`` 会读配置（os.stat + deepcopy），实测量级从
+        数十 µs 到 2 ms 不等。以前模型表每行调 2 次（本类一次、presentation
+        覆写再一次），200 模型的批量测试仅此一项就烧掉数秒主线程。
+
+        现在：一次重建只求一次并逐行注入；跨调用再由本缓存兜住（批量测试逐项
+        增量刷新会连续命中）。缓存在 ``apply_ui_theme`` 中显式失效。
+        """
         from .presentation.design import tokens_for
 
+        cached = getattr(self, "_table_colors_cache", None)
+        if cached is not None:
+            colors, stamp = cached
+            if time.monotonic() - stamp < self.THEME_CACHE_TTL:
+                return colors
         theme = core.get_ui_theme()
         colors = tokens_for(theme.get("mode"), theme.get("accent"))
+        self._table_colors_cache = (colors, time.monotonic())
+        return colors
+
+    def _model_status_cells(
+        self, m: core.ModelInfo, colors=None
+    ) -> tuple[str, str, QColor, QColor, str, str]:
+        """状态 / 延迟：返回 (状态文本, 延迟文本, 状态色, 延迟色, 状态提示, 延迟提示)。
+
+        ``colors`` 由调用方注入（每次重建只求一次）；省略时回退到自行查询。
+        """
+        if colors is None:
+            colors = self._table_colors()
         res = self.test_results.get(m.key)
         muted = QColor(colors.text_muted)
         if not res:
@@ -1366,7 +1667,30 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
         w.progress.connect(self._on_model_test_progress, Qt.QueuedConnection)
         w.done.connect(self._on_model_tests_done, Qt.QueuedConnection)
         w.failed.connect(self._on_model_tests_fail, Qt.QueuedConnection)
+        self._test_worker = w
+        self._set_test_cancel_enabled(True)
         w.start()
+
+    def _set_test_cancel_enabled(self, enabled: bool) -> None:
+        button = getattr(self, "model_test_cancel_btn", None)
+        if button is not None:
+            button.setEnabled(bool(enabled))
+
+    def model_test_cancel(self) -> None:
+        """停止批量测试。
+
+        ``BatchTestWorker`` 一直支持 ``isInterruptionRequested``，但此前 UI 上
+        没有任何入口 —— 已实现的取消能力没人能用到。
+        """
+        worker = getattr(self, "_test_worker", None)
+        if worker is None or not worker.isRunning():
+            self._set_test_cancel_enabled(False)
+            return
+        worker.requestInterruption()
+        self._set_test_cancel_enabled(False)
+        self.status.showMessage("已请求停止测试，正在收尾已发起的请求…")
+        if hasattr(self, "test_status"):
+            self.test_status.setText("已请求停止测试；未开始的项不再执行。")
 
     def _on_model_test_progress(self, r: dict):
         if not isinstance(r, dict):
@@ -1385,12 +1709,13 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
         line = f"{key}: {summary}"
         self._test_lines = list(getattr(self, "_test_lines", []) or [])
         self._test_lines.append(line)
-        # live UI update
-        self.fill_models_table()
+        # 增量刷新命中行；未命中才回退整树重建（见 update_model_row_status）
+        if not self.update_model_row_status(str(r.get("provider") or ""), str(r.get("model") or "")):
+            self.fill_models_table()
         try:
             self.history_refresh()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("history refresh during model test failed: %s", e)
         self.status.showMessage(f"测试中 {done}/{total} · 可用 {ok_n} · 刚完成 {key}")
         if hasattr(self, "test_status"):
             recent = " | ".join(self._test_lines[-4:])
@@ -1398,6 +1723,7 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
 
     def _on_model_tests_done(self, results: list):
         self._test_running = False
+        self._set_test_cancel_enabled(False)
         if isinstance(results, dict):
             # safety if health payload ever routed here
             results = results.get("results") or []
@@ -1413,8 +1739,8 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
         self.fill_models_table()
         try:
             self.history_refresh()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("history refresh after model tests failed: %s", e)
         summary = f"测试完成：{ok_n}/{len(results)} 可用（已实时写入列表与历史）"
         self.status.showMessage(summary)
         if hasattr(self, "test_status"):
@@ -1426,6 +1752,7 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
 
     def _on_model_tests_fail(self, err: str):
         self._test_running = False
+        self._set_test_cancel_enabled(False)
         # clear pending markers
         for k, v in list(self.test_results.items()):
             if isinstance(v, dict) and v.get("pending"):
@@ -1575,12 +1902,13 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
         # 健康监控 / 测试历史：默认加载本地缓存，无需手动点刷新
         try:
             self.health_refresh_table()
-        except Exception:
-            pass
+        except Exception as e:
+            # 以前静默：表格保持旧数据，用户会以为看到的是最新结果。
+            logger.warning("health table refresh failed: %s", e)
         try:
             self.history_refresh()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("history refresh failed: %s", e)
         self.status.showMessage("已刷新（含健康监控与测试历史）")
 
     def refresh_dashboard(self):
@@ -1690,12 +2018,25 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
         if not expanded and ordered_providers:
             expanded = set(ordered_providers)
 
-        from .presentation.design import tokens_for
-
-        theme = core.get_ui_theme()
-        colors = tokens_for(theme.get("mode"), theme.get("accent"))
+        # 每次重建只求一次主题色，逐行注入（详见 _table_colors 注释）。
+        colors = self._table_colors()
         tree = self.models_table
+        # tree.clear() 会销毁全部 QTreeWidgetItem：选中集合与滚动位置必须自行
+        # 保存/恢复，否则批量测试期间每完成一项就把用户的多选清空、列表跳回
+        # 顶部，「重测选中 / 设为默认」随即报「请先选择模型」。
+        prev_selected = {
+            f"{p}/{m}"
+            for p, m in (
+                self._model_item_key(item) or ("", "")
+                for item in tree.selectedItems()
+            )
+            if p and m
+        }
+        prev_current = self._model_item_key(tree.currentItem())
+        scrollbar = tree.verticalScrollBar()
+        prev_scroll = scrollbar.value() if scrollbar is not None else 0
         tree.clear()
+        row_index: dict[str, QTreeWidgetItem] = {}
         # Provider 列由树状分组体现，隐藏重复列
         try:
             tree.setColumnHidden(1, True)
@@ -1738,8 +2079,11 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
                 if is_fav:
                     tip_bits.append("已收藏")
                 child.setToolTip(0, " · ".join(tip_bits))
-                if is_default:
-                    child.setForeground(0, QColor(colors.accent_text))
+                # 第 0 列显式着色（默认模型用强调色，其余用正文色），使
+                # presentation 层不必再整树走一遍 setForeground 覆写。
+                child.setForeground(
+                    0, QColor(colors.accent_text if is_default else colors.text)
+                )
                 child.setText(1, m.provider)
                 child.setForeground(1, QColor(colors.text_muted))
                 cap = self._model_capability_text(m)
@@ -1748,13 +2092,37 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
                     2,
                     f"context={m.context or '-'}  thinking={m.thinking or '-'}  images={m.images or '-'}",
                 )
-                status_text, latency_text, sc, lc, status_tip, _lt = self._model_status_cells(m)
+                status_text, latency_text, sc, lc, status_tip, _lt = self._model_status_cells(
+                    m, colors
+                )
                 child.setText(3, status_text)
                 child.setText(4, latency_text)
                 child.setForeground(3, sc)
                 child.setForeground(4, lc)
                 if status_tip:
                     child.setToolTip(3, status_tip)
+                row_index[m.key] = child
+
+        # 增量刷新用的行索引（tree.clear() 后一并重建，天然与树同寿）
+        self._model_row_index = row_index
+        # 恢复顺序很关键：setCurrentItem 在 ExtendedSelection 下按
+        # ClearAndSelect 处理，必须先设 current 再补选中集合。
+        # blockSignals 避免 N 次 itemSelectionChanged 风暴；调用方（
+        # ModernMainWindow.fill_models_table）随后会显式刷新一次详情面板。
+        tree.blockSignals(True)
+        try:
+            if prev_current:
+                restored = row_index.get(f"{prev_current[0]}/{prev_current[1]}")
+                if restored is not None:
+                    tree.setCurrentItem(restored)
+            for key in prev_selected:
+                item = row_index.get(key)
+                if item is not None:
+                    item.setSelected(True)
+        finally:
+            tree.blockSignals(False)
+        if scrollbar is not None and prev_scroll:
+            scrollbar.setValue(min(prev_scroll, scrollbar.maximum()))
 
         if hasattr(self, "models_count_lbl"):
             total = len(self.models)
@@ -1766,6 +2134,41 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
             if prov:
                 extra += f" · {prov}"
             self.models_count_lbl.setText(f"显示 {shown} / 共 {total}{extra}")
+
+    def update_model_row_status(self, provider: str, model: str) -> bool:
+        """增量刷新单行的状态/延迟列；命中返回 True，未命中返回 False。
+
+        批量测试 / 健康检查每完成一项原本调 ``fill_models_table()`` 整树重建，
+        代价是 O(N²)（N 行 × 每行主题查询）并且抹掉选中与滚动位置。命中索引时
+        只改 3/4 两列，未命中（新模型、过滤条件变化）才由调用方回退全量重建。
+        """
+        index = getattr(self, "_model_row_index", None)
+        if not index:
+            return False
+        item = index.get(f"{provider}/{model}")
+        if item is None:
+            return False
+        info = None
+        for m in self.models:
+            if m.provider == provider and m.model == model:
+                info = m
+                break
+        if info is None:
+            info = core.ModelInfo(provider, model)
+        try:
+            status_text, latency_text, sc, lc, status_tip, _ = self._model_status_cells(
+                info, self._table_colors()
+            )
+            item.setText(3, status_text)
+            item.setText(4, latency_text)
+            item.setForeground(3, sc)
+            item.setForeground(4, lc)
+            item.setToolTip(3, status_tip or "")
+        except RuntimeError:
+            # 树已在别处重建，索引失效：让调用方走全量重建
+            self._model_row_index = {}
+            return False
+        return True
 
     def _remember_tree_expanded(self, item, expanded: bool) -> None:
         """记录用户手动展开 / 收起的 Provider 分组，刷新时保持状态。"""
@@ -1813,10 +2216,38 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
         self.provider_detail.setPlainText(json.dumps(preview, ensure_ascii=False, indent=2))
 
     def refresh_sessions(self):
+        # 唯一的磁盘遍历入口：会话目录遍历 + 会话文件解析只在这里发生，
+        # 结果缓存供 sessions_apply_filter 做内存过滤（见其 docstring）。
+        self._sessions_cache = list(core.list_sessions(limit=200))
         if hasattr(self, "session_filter_wd"):
             self.sessions_apply_filter()
             return
-        self._fill_sessions_table(core.list_sessions())
+        self._fill_sessions_table(self._sessions_cache)
+
+    def _filter_sessions_cache(
+        self, workdir_substr: str = "", name_substr: str = "", *, limit: int = 100
+    ) -> list[dict[str, str]]:
+        """对 refresh_sessions() 的缓存做内存过滤（语义同 extras.list_sessions_filtered）。"""
+        rows = getattr(self, "_sessions_cache", None)
+        if rows is None:
+            rows = self._sessions_cache = list(core.list_sessions(limit=200))
+        wd = (workdir_substr or "").lower().strip()
+        nm = (name_substr or "").lower().strip()
+        out: list[dict[str, str]] = []
+        for r in rows:
+            if wd or nm:
+                blob = " ".join(
+                    str(r.get(k) or "")
+                    for k in ("path", "folder", "name", "cwd", "project", "model", "preview")
+                ).lower()
+                if wd and wd not in blob:
+                    continue
+                if nm and nm not in blob:
+                    continue
+            out.append(r)
+            if len(out) >= limit:
+                break
+        return out
 
     def _session_path_at(self, row: int) -> str | None:
         item = self.sessions_table.item(row, 0)
@@ -2455,8 +2886,9 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
             # Manager 自身：静默检查，有新版本再弹窗
             try:
                 self.check_manager_update(silent=True)
-            except Exception:
-                pass
+            except Exception as e:
+                # silent 只是「无更新时不打扰用户」，不该连失败都无痕。
+                logger.warning("startup manager update check failed: %s", e)
 
     def _on_update_status(self, st: dict):
         self._pi_update_status = dict(st or {})
@@ -2590,10 +3022,12 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
             else current_theme.get("accent")
         ) or "blue"
         core.set_ui_theme(mode=mode, accent=accent)
-        settings = core.load_settings()
-        settings["defaultProvider"] = self.set_provider.text().strip()
-        settings["defaultModel"] = self.set_model.text().strip()
-        settings["defaultThinkingLevel"] = self.set_thinking.currentText()
+        # 先把界面上的值全部取出来，再在锁内一次性套用：updater 可能被
+        # _update_config 重试调用，闭包里不能再去读 widget（那是主线程状态，
+        # 且重试期间用户可能已经改动）。
+        new_provider = self.set_provider.text().strip()
+        new_model = self.set_model.text().strip()
+        new_thinking = self.set_thinking.currentText()
         # Keep the model-page Thinking dropdown in sync with the global default
         # so chat/test/launch use the configured level instead of a stale value.
         if hasattr(self, "thinking_combo"):
@@ -2601,15 +3035,25 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, QMainWindow):
             current_index = self.thinking_combo.findText(saved_thinking)
             if current_index >= 0:
                 self.thinking_combo.setCurrentIndex(current_index)
-        settings["theme"] = core.cli_theme_for_ui_mode(mode)
+        new_theme = core.cli_theme_for_ui_mode(mode)
         if hasattr(self, "set_language"):
             core.set_language(self.set_language.currentData() or "zh-CN")
         lines = [x.strip() for x in self.set_enabled.toPlainText().splitlines() if x.strip()]
-        if lines:
-            settings["enabledModels"] = lines
-        elif "enabledModels" in settings:
-            del settings["enabledModels"]
-        core.save_settings(settings)
+
+        def _apply_settings(settings: dict) -> dict:
+            settings["defaultProvider"] = new_provider
+            settings["defaultModel"] = new_model
+            settings["defaultThinkingLevel"] = new_thinking
+            settings["theme"] = new_theme
+            if lines:
+                settings["enabledModels"] = lines
+            elif "enabledModels" in settings:
+                del settings["enabledModels"]
+            return settings
+
+        # 持锁读改写：settings.json 同时被 Pi CLI 与本应用读写，裸的
+        # load → 改 → save 会丢掉并发写入（审查 P1-2）。
+        core.update_settings(_apply_settings)
         if hasattr(self, "zhipu_key_edit"):
             core.set_zhipu_api_key(self.zhipu_key_edit.text())
         if hasattr(self, "vision_model_combo"):
@@ -2639,9 +3083,13 @@ def run_app():
     except Exception:
         pass
     try:
+        # 关闭原生文件对话框：Windows 上的 IFileDialog 在部分带 shell 扩展
+        # （云盘/杀软右键菜单注入）的机器上会在 QFileDialog 返回后崩溃整个
+        # 进程，且崩在 Qt 之外无法捕获。代价是失去「最近位置」「快速访问」侧栏
+        # 与系统搜索；若将来能确认目标平台无此问题，可按平台放开此开关。
         QApplication.setAttribute(Qt.AA_DontUseNativeDialogs, True)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("disable native dialogs failed: %s", e)
     app = QApplication(sys.argv)
     app.setApplicationName("Pi Manager")
     app.setOrganizationName("PiManager")
@@ -2672,7 +3120,15 @@ def run_app():
             # Windows 的命名管道上是 no-op，故跨平台安全。
             QLocalServer.removeServer(SINGLE_INSTANCE_SERVER_NAME)
             if not server.listen(SINGLE_INSTANCE_SERVER_NAME):
-                return 0
+                # 既连不上已有实例，也拿不到监听名：不能静默 return 0（用户双击
+                # 图标毫无反应且无提示）。放弃单实例保护继续启动，并留下日志。
+                logger.warning(
+                    "single-instance server '%s' unavailable (%s); "
+                    "starting without single-instance protection",
+                    SINGLE_INSTANCE_SERVER_NAME,
+                    server.errorString(),
+                )
+                server = None
     try:
         app.setStyle("Fusion")
     except Exception:
@@ -2695,6 +3151,7 @@ def run_app():
     if server is not None:
 
         def _wake_primary():
+            drain_pending_connections(server)
             win.showNormal()
             win.raise_()
             win.activateWindow()

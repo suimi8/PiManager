@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
@@ -127,8 +128,9 @@ class FeatureMixin:
         try:
             self.refresh_dashboard()
             self.settings_load()
-        except Exception:
-            pass
+        except Exception as e:
+            # 以前静默：托盘提示「已切换」但界面没变，用户无从判断哪个是真的。
+            logger.warning("refresh after tray model switch failed: %s", e)
         if self.tray:
             self.tray.showMessage("Pi Manager", f"已切换默认：{key}", QSystemTrayIcon.Information, 2500)
         self.status.showMessage(f"托盘切换默认模型：{key}")
@@ -143,6 +145,9 @@ class FeatureMixin:
         self.activateWindow()
 
     def quit_app(self):
+        saver = getattr(self, "_save_window_geometry", None)
+        if callable(saver):
+            saver()
         if self.tray:
             self.tray.hide()
         self._shutdown_background_tasks()
@@ -152,6 +157,15 @@ class FeatureMixin:
         QApplication.instance().quit()
 
     def _shutdown_background_tasks(self):
+        """收割全部后台 Worker：请求中断 → 等待预算 → 对赖着不走的脱钩延寿。
+
+        单一登记表（``self._workers`` / 别名 ``self.workers``）覆盖包括插件页
+        在内的所有 Worker。``Worker.requestInterruption()`` 只对声明了
+        ``is_cancelled`` 的 job 真正有效（见 ``ui.Worker`` 的取消契约）；对不可
+        中断的任务（npm install、子进程、网络请求）预算必然超时，此时不能让
+        QThread 析构于运行态——统一交给 ``detach_running_worker`` 脱离 parent
+        并保持强引用到进程结束，避免 qFatal 崩溃退出。
+        """
         if getattr(self, "_background_shutdown", False):
             return
         self._background_shutdown = True
@@ -166,10 +180,19 @@ class FeatureMixin:
             remaining = max(0, int((deadline - time.monotonic()) * 1000))
             if worker.isRunning() and remaining:
                 worker.wait(remaining)
-        # Do not terminate Python threads: running calls finish cooperatively.
-        # QThreads are parented/tracked and their finished signals remove them.
+        from .ui import detach_running_worker
+
+        for worker in workers:
+            if detach_running_worker(worker):
+                # 已脱钩的 worker 不再属于本窗口的登记表：它的 finished →
+                # _untrack 连接仍会在完成时触发，但窗口可能已销毁，故先移除。
+                self._untrack(worker)
 
     def closeEvent(self, event):
+        # 先落盘窗口几何：最小化到托盘也算「用户当前想要的窗口位置」。
+        saver = getattr(self, "_save_window_geometry", None)
+        if callable(saver):
+            saver()
         # minimize to tray if enabled
         if bool((self.mgr or {}).get("minimize_to_tray", True)) and self.tray and self.tray.isVisible():
             event.ignore()
@@ -225,8 +248,8 @@ class FeatureMixin:
         for browser, md in zip(self.help_browsers, mds):
             try:
                 browser.setHtml(help_docs.help_section_html(md, mode=mode))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("render help section failed: %s", e)
 
     def help_copy_md(self):
         from PySide6.QtWidgets import QApplication
@@ -305,17 +328,22 @@ class FeatureMixin:
         if hasattr(self, "test_results"):
             self.test_results[key] = r
             try:
-                self.fill_models_table()
-            except Exception:
-                pass
+                # 增量刷新命中行；未命中才回退整树重建（避免 O(N²)）
+                updater = getattr(self, "update_model_row_status", None)
+                if updater is None or not updater(
+                    str(r.get("provider") or ""), str(r.get("model") or "")
+                ):
+                    self.fill_models_table()
+            except Exception as e:
+                logger.warning("model table refresh during health check failed: %s", e)
         try:
             self.health_refresh_table()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("health table refresh failed: %s", e)
         try:
             self.history_refresh()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("history refresh during health check failed: %s", e)
         done = self._health_done
         ok_n = self._health_ok
         self.status.showMessage(f"健康检查 {done} 完成 · 可用 {ok_n} · 刚完成 {key}")
@@ -350,8 +378,8 @@ class FeatureMixin:
         try:
             self.fill_models_table()
             self.history_refresh()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("table refresh after health check failed: %s", e)
         if show_dialog:
             hint = ""
             if ok_n == 0 and scope == "favorites":
@@ -404,8 +432,10 @@ class FeatureMixin:
         self.persist_mgr()
         try:
             self.fill_favorites()
-        except Exception:
-            pass
+        except Exception as e:
+            # 吞掉这里等于「提示已收藏、界面没变」，与 R2 UI P3-16 点名的
+            # 托盘切换模型同一类误导。
+            logger.warning("refresh favorites after health import failed: %s", e)
         QMessageBox.information(self, "收藏", f"新增 {n} 个可用模型到收藏（共 {len(favs)}）")
 
     def health_retest_selected(self):
@@ -429,6 +459,24 @@ class FeatureMixin:
         self._run_model_tests(pairs)
 
     # ---- history ----
+    @contextmanager
+    def _busy(self, message: str):
+        """长任务的忙碌反馈：等待光标 + 状态栏文案。
+
+        ZIP 打包/解包、PBKDF/AES、逐 provider 写系统密钥库都在主线程同步执行，
+        窗口会白屏数秒。这些都是用户主动点击的一次性动作，搬进 Worker 的收益
+        不抵引入跨线程状态的风险；先把「还在动」这件事说清楚。
+        """
+        from PySide6.QtWidgets import QApplication
+
+        if hasattr(self, "status"):
+            self.status.showMessage(message)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            yield
+        finally:
+            QApplication.restoreOverrideCursor()
+
     def history_refresh(self):
         if not hasattr(self, "history_table"):
             return
@@ -474,8 +522,8 @@ class FeatureMixin:
         QMessageBox.information(self, "清理完成", f"已清理 {n} 个孤儿密钥池。")
         try:
             self.refresh_providers()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("refresh providers after orphan key cleanup failed: %s", e)
 
     # ---- config backup restore ----
     def backup_refresh(self):
@@ -635,18 +683,19 @@ class FeatureMixin:
             return
         ok_n = 0
         errors = []
-        for provider in providers:
-            try:
-                if core.delete_provider_auth(provider) is not None:
-                    ok_n += 1
-            except Exception as e:
-                errors.append(f"{provider}: {e}")
+        with self._busy(f"正在登出 {len(providers)} 个 Provider…"):
+            for provider in providers:
+                try:
+                    if core.delete_provider_auth(provider) is not None:
+                        ok_n += 1
+                except Exception as e:
+                    errors.append(f"{provider}: {e}")
         self.refresh_dashboard()
         # 内置 Provider 登出后 Pi 不再认为其已认证，模型列表随之收敛
         try:
             self.refresh_models()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("refresh models after logout failed: %s", e)
         msg = f"已登出 {ok_n} 个 Provider。"
         if errors:
             msg += f"\n失败：{'；'.join(errors)}"
@@ -682,7 +731,8 @@ class FeatureMixin:
         if not path:
             return
         try:
-            out = extras.export_config_bundle(path, include_secrets=False)
+            with self._busy("正在打包配置…"):
+                out = extras.export_config_bundle(path, include_secrets=False)
             QMessageBox.information(self, "已导出", f"已导出到：\n{out}\n（密钥已脱敏/占位）")
         except Exception as e:
             QMessageBox.critical(self, "导出失败", str(e))
@@ -714,10 +764,54 @@ class FeatureMixin:
             QMessageBox.warning(self, "导出失败", "两次密码不一致")
             return
         try:
-            out = extras.export_config_bundle(path, include_secrets=True, password=password)
+            with self._busy("正在打包配置并加密密钥…"):
+                out = extras.export_config_bundle(path, include_secrets=True, password=password)
             QMessageBox.information(self, "已导出", f"已导出到：\n{out}")
         except Exception as e:
             QMessageBox.critical(self, "导出失败", str(e))
+
+    # 高风险变更逐条确认（R1）。`${NAME}` 是官方 Pi 支持的合法 apiKey 写法，
+    # 后端无法一律拒绝；但「引用本机环境变量的凭据 + 配置包自带的 baseUrl」等价于
+    # 把用户环境里的真实 Key 以 Bearer 发给包的作者。唯一能既不误伤合法用法、又不
+    # 静默放行的办法，就是在写盘前把差异摆出来让用户自己看。
+    _RISK_KIND_TITLES = {
+        "new_provider": "新增 Provider",
+        "base_url_change": "Base URL 变更",
+        "api_key_env_ref": "API Key 引用本机环境变量",
+        "header_env_ref": "请求头引用本机环境变量",
+    }
+
+    def _confirm_import_risks(self, risks: list[dict]) -> bool:
+        """展示高风险差异清单，返回用户是否同意写盘。默认按钮是「取消」。"""
+        groups: dict[str, list[dict]] = {}
+        for item in risks:
+            groups.setdefault(str(item.get("kind") or "other"), []).append(item)
+        lines: list[str] = []
+        for kind, items in groups.items():
+            lines.append(f"【{self._RISK_KIND_TITLES.get(kind, kind)}】")
+            lines += [f"  · {item.get('detail') or ''}" for item in items]
+            lines.append("")
+        live = [item for item in risks if item.get("env_present")]
+        if live:
+            names = sorted({str(item.get("env_name") or "") for item in live})
+            lines += [
+                "注意：以下环境变量在本机**当前就有值**，导入后它们的真实内容会被"
+                "发往上面列出的地址：",
+                *(f"  · ${{{name}}}" for name in names),
+                "",
+            ]
+        lines.append("确认全部应用？取消则整包不写入，本机配置保持原样。")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("确认高风险配置变更")
+        box.setText(f"配置包含 {len(risks)} 项高风险变更，请逐条核对：")
+        box.setInformativeText("\n".join(lines))
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        box.button(QMessageBox.Yes).setText("我已核对，全部应用")
+        box.button(QMessageBox.Cancel).setText("取消导入")
+        # 默认落在「取消」：一路回车不该等于同意把凭据交出去。
+        box.setDefaultButton(QMessageBox.Cancel)
+        return box.exec() == QMessageBox.Yes
 
     def import_config(self):
         path, _ = QFileDialog.getOpenFileName(self, "导入配置包", str(Path.home()), "ZIP (*.zip)")
@@ -736,12 +830,31 @@ class FeatureMixin:
             )
             if not ok:
                 return
-        res = extras.import_config_bundle(
-            path,
-            restore_secrets=restore_secrets,
-            password=password,
-        )
+        # confirm_risks 会在**写盘之前**被回调（校验已过、事务未开始）；此时必须
+        # 把等待光标收掉再弹窗，否则确认框顶着沙漏，用户会以为界面卡死。
+        # 注意：import_config_bundle 刻意留在主线程同步执行（见 `_busy` 的说明），
+        # 所以这个回调也在主线程，不存在 R2 UI P2-13 那种「Worker 槽里开模态框」的
+        # 重入问题；一旦把导入搬进 Worker，这个回调必须改走 QMetaObject 投递。
+        def confirm_risks(risks: list[dict]) -> bool:
+            from PySide6.QtWidgets import QApplication
+
+            QApplication.restoreOverrideCursor()
+            try:
+                return self._confirm_import_risks(risks)
+            finally:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+
+        with self._busy("正在解包并恢复配置…"):
+            res = extras.import_config_bundle(
+                path,
+                restore_secrets=restore_secrets,
+                password=password,
+                confirm_risks=confirm_risks,
+            )
         if not res.get("ok"):
+            if res.get("cancelled"):
+                self.status.showMessage("已取消导入，配置未做任何修改", 5000)
+                return
             QMessageBox.critical(self, "导入失败", str(res.get("error")))
             return
         # Validate imported models.json structure to prevent config poisoning
@@ -765,10 +878,38 @@ class FeatureMixin:
         self.mgr = core.load_manager_config()
         self.refresh_all()
         self.settings_load()
-        QMessageBox.information(self, "导入成功", "已恢复：\n" + "\n".join(res.get("restored") or []))
+        # import_config_bundle 现在会主动跳过/拒绝一部分内容（R2 审计 P1-4）：
+        # AGENTS.md 默认不导入（覆盖它等于让下一次 Pi 运行遵循配置包作者的指令），
+        # 含可执行语义键的 settings.json 会被拒。这些必须让用户看见，否则用户会以为
+        # 整包都恢复了，直到某项设置没生效才发现——静默跳过比直接失败更难排查。
+        lines = ["已恢复：", *(f"  · {item}" for item in (res.get("restored") or ["（无）"]))]
+        skipped = res.get("skipped") or []
+        if skipped:
+            lines += [
+                "",
+                "已跳过（出于安全，未从配置包写入）：",
+                *(f"  · {item}" for item in skipped),
+                "",
+                "AGENTS.md 是全局 agent 指令文件；如确需恢复，请手工核对内容后复制。",
+            ]
+        risks = res.get("risks") or []
+        if risks:
+            lines += [
+                "",
+                "已按你的确认应用以下高风险变更：",
+                *(f"  · {item.get('detail') or item.get('kind')}" for item in risks),
+            ]
+        purged = res.get("purged_backups") or []
+        if purged:
+            lines += ["", f"已清理含明文密钥的旧备份：{len(purged)} 个"]
+        warns = res.get("warnings") or []
+        if warns:
+            lines += ["", "警告：", *(f"  · {item}" for item in warns)]
+        QMessageBox.information(self, "导入成功", "\n".join(lines))
 
     def secure_keys_now(self):
-        res = extras.secure_existing_keys()
+        with self._busy("正在把明文 API Key 写入系统密钥库…"):
+            res = extras.secure_existing_keys()
         QMessageBox.information(
             self,
             "加密完成",
@@ -897,9 +1038,16 @@ class FeatureMixin:
             QMessageBox.warning(self, "重命名失败", str(e))
 
     def sessions_apply_filter(self):
+        """按筛选词重建会话表，只对缓存做内存过滤。
+
+        ``extras.list_sessions_filtered`` 的 ``limit`` 只裁剪结果，内部的
+        ``core.list_sessions(limit=200)`` 目录遍历 + 会话文件解析与筛选词无关，
+        因此原来每次击键都完整重跑一次磁盘 IO（数百会话时每字符数十~数百 ms
+        阻塞主线程）。现在磁盘遍历只发生在 ``refresh_sessions()``。
+        """
         wd = self.session_filter_wd.text().strip() if hasattr(self, "session_filter_wd") else ""
         nm = self.session_filter_name.text().strip() if hasattr(self, "session_filter_name") else ""
-        rows = extras.list_sessions_filtered(limit=100, workdir_substr=wd, name_substr=nm)
+        rows = self._filter_sessions_cache(wd, nm, limit=100)
         if hasattr(self, "_fill_sessions_table"):
             self._fill_sessions_table(rows)
             return
@@ -1161,8 +1309,9 @@ class FeatureMixin:
                     self._set_chat_combo_text(self.chat_model, str(m))
                 self.refresh_dashboard()
                 self.settings_load()
-            except Exception:
-                pass
+            except Exception as e:
+                # 自动换模已经生效但界面没跟上：静默会让用户以为还在用原模型。
+                logger.warning("refresh after chat model failover failed: %s", e)
             notice = (result.get("notice") or "").strip()
             if notice:
                 self.chat_output.appendPlainText(f"[{notice}]")

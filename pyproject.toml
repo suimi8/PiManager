@@ -1,8 +1,24 @@
+[project]
+name = "pi-manager"
+description = "跨平台桌面 GUI，用于配置、切换、测试与启动官方 Pi Coding Agent。"
+# 支持的 Python 下界的**单一事实来源**。此前三处口径不一致：文档写 3.10+、
+# ruff target-version 是 py311、CI 矩阵只测 3.11/3.12（3.10 从未被验证过）。
+# 现统一为 3.11，README / BUILD.md / ruff / CI 矩阵都对齐到这里。
+requires-python = ">=3.11"
+# 版本单一来源是 pi_manager/extras.py 的 APP_VERSION（规范 R5），这里绝不重复
+# 硬编码，否则就多了一个会漂移的版本源。本项目不作为 wheel 分发（源码运行 +
+# PyInstaller 打包），因此不声明 [build-system]，也不需要构建后端来填这个字段。
+dynamic = ["version"]
+
 [tool.pytest.ini_options]
 # 默认排除 integration 用例（真实 Pi CLI / 外网），避免本地与 CI 行为不一致。
 # 需要运行时显式使用：pytest -m integration
-addopts = "-m 'not integration'"
+# --strict-markers：marker 名写错（如 integraton）不再静默变成「不被
+# -m 'not integration' 排除」的普通用例——那等于让它在 CI 上直接联网。
+addopts = "-m 'not integration' --strict-markers"
 testpaths = ["tests"]
+# @pytest.mark.xfail 的用例真的通过时视为失败，避免"修好了但没人发现"。
+xfail_strict = true
 
 [tool.ruff]
 line-length = 100

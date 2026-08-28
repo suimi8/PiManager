@@ -63,28 +63,46 @@ function failureCounts(manager) {
   return counts;
 }
 
-// NOTE: read-modify-write race – readManager() and writeManager() are not
-// guarded by the same lock as the Python-side Config Broker (storage.locked).
-// The retry loop below re-reads the latest counts before writing to narrow the
-// window, but it cannot eliminate a concurrent update that lands between the
-// final read and the write.
-async function updateFailureCount(readManager, writeManager, provider, model, succeeded) {
-  const maxAttempts = 3;
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const manager = (await readManager()) || {};
-    const counts = failureCounts(manager);
-    const pair = normalizeModelPair(provider, model, { allowEmpty: false });
-    const key = `${pair[0]}/${pair[1]}`;
-    if (succeeded) {
-      if (!Object.prototype.hasOwnProperty.call(counts, key)) return 0;
-      counts[key] = 0;
-    } else {
-      counts[key] = Number(counts[key] || 0) + 1;
+// G3：失败计数的「读 → 改 → 写」下推给 Config Broker
+// （config_broker.py:increment_failure_count），整段跑在 storage.locked 的
+// **跨进程**锁里，因此对「桌面端 + 扩展同时在写 pi-manager.json」是真正原子的。
+//
+// 由此删掉了扩展侧的「写后回读校验重试」：那段代码只能在**自己的**增量被吞掉
+// 时补写一次，既不是原子性，也无法阻止两侧交错时的丢失更新（R2 扩展审计
+// C-1 / D2）。原子操作到位后重试不再有意义，反而会在 broker 已经成功递增的
+// 情况下再加一次。
+//
+// `incrementFailureCount` 缺席（旧版桌面端不认识这个 operation，或调用失败）
+// 时退回一次性的读-改-写：功能可用性优先，但**不再重试** —— 退化路径只求尽力，
+// 不再假装自己提供了原子性。
+async function updateFailureCount(
+  readManager,
+  writeManager,
+  provider,
+  model,
+  succeeded,
+  incrementFailureCount
+) {
+  const pair = normalizeModelPair(provider, model, { allowEmpty: false });
+  const key = `${pair[0]}/${pair[1]}`;
+  if (typeof incrementFailureCount === "function") {
+    try {
+      const count = Number(await incrementFailureCount(pair[0], pair[1], Boolean(succeeded)));
+      if (Number.isFinite(count)) return count;
+    } catch {
+      // 落到下面的兼容路径（例如 helper 返回 operation_not_allowed）。
     }
-    await writeManager({ ...manager, failover_fail_counts: counts });
-    return counts[key];
   }
-  return 0;
+  const manager = (await readManager()) || {};
+  const counts = failureCounts(manager);
+  if (succeeded) {
+    if (!Object.prototype.hasOwnProperty.call(counts, key)) return 0;
+    counts[key] = 0;
+  } else {
+    counts[key] = Number(counts[key] || 0) + 1;
+  }
+  await writeManager({ ...manager, failover_fail_counts: counts });
+  return counts[key];
 }
 
 async function currentFailureCount(readManager, provider, model) {
@@ -103,6 +121,7 @@ async function chatWithFailover({
   setDefaultModel,
   runAttempt,
   onAttempt,
+  incrementFailureCount,
 }) {
   const manager = (await readManager()) || {};
   const settings = (await readSettings()) || {};
@@ -197,7 +216,8 @@ async function chatWithFailover({
         writeManager,
         attemptProvider,
         attemptModel,
-        true
+        true,
+        incrementFailureCount
       );
       const switched =
         Boolean(switchedFrom) || attemptProvider !== provider || attemptModel !== model;
@@ -228,7 +248,8 @@ async function chatWithFailover({
       writeManager,
       attemptProvider,
       attemptModel,
-      false
+      false,
+      incrementFailureCount
     );
     attempt.fail_count = count;
     if (onAttempt) await onAttempt(attempt);
@@ -268,4 +289,5 @@ module.exports = {
   failureCounts,
   normalizeModelPair,
   parseModelKey,
+  updateFailureCount,
 };

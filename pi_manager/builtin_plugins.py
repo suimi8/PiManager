@@ -93,10 +93,22 @@ def _builtin_assets_dir() -> Path:
 def _assert_safe_relative_target(label: str, target_dir: str) -> Path:
     """fail-fast 校验相对目标目录，返回解析后的绝对路径。
 
-    规则：非绝对路径、无 ``..`` 段、解析后仍在 ``pi_agent_dir()`` 内。供清单插件
-    校验（``_assert_safe_target_dir``）与已下架插件清理（``cleanup_retired_builtins``）
-    共用，保证「写」与「删」两条路径的安全判定完全一致。
+    规则：非绝对路径、无 ``..`` 段、解析后**严格位于** ``pi_agent_dir()`` 之下
+    （不得等于 agent 目录本身）。供清单插件校验（``_assert_safe_target_dir``）与
+    已下架插件清理（``cleanup_retired_builtins``）共用，保证「写」与「删」两条
+    路径的安全判定完全一致。
     """
+    # 0) 拒绝空 / 纯 "." 形态：这类值 resolve 后正好等于 agent 目录本身，
+    #    relative_to 判定「在 agent 目录内」会通过，而 install_builtin(force=True)
+    #    与 cleanup_retired_builtins 的 rmtree 就会删掉整个 ~/.pi/agent
+    #    （models.json / settings.json / 用户自建 skills 全部丢失）。
+    #    与 plugin_manager._remove_owned_tree 拒绝 target == root 的口径对齐。
+    if not target_dir.strip() or not [
+        seg for seg in target_dir.replace("\\", "/").split("/") if seg not in ("", ".")
+    ]:
+        raise BuiltinPluginError(
+            f"内置插件 {label} 目标路径非法（不得为空或指向 agent 目录本身）: {target_dir!r}"
+        )
     # 1) 拒绝绝对路径：POSIX 前导 ``/`` 由 ``is_absolute`` 覆盖；Windows 盘符
     #    （``C:/x``、``C:foo``）在 POSIX 上不被识别为绝对路径，需显式正则拒绝；
     #    反斜杠开头（Windows 根路径 ``\evil``）在 POSIX 上同样不被识别，一并拒绝。
@@ -123,6 +135,12 @@ def _assert_safe_relative_target(label: str, target_dir: str) -> Path:
         raise BuiltinPluginError(
             f"内置插件 {label} 目标路径越界: {target_dir}"
         ) from None
+    # relative_to 对「完全相等」也返回成功（Path(".")），必须单独拒绝：
+    # 否则 target 就是 agent 目录本身，force 分支的 rmtree 会清空用户全部配置。
+    if resolved == agent_dir:
+        raise BuiltinPluginError(
+            f"内置插件 {label} 目标路径不得等于 agent 目录本身: {target_dir!r}"
+        )
     return resolved
 
 

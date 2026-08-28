@@ -5,13 +5,24 @@ const os = require("os");
 const https = require("https");
 const crypto = require("crypto");
 const { execFile } = require("child_process");
-const { chatWithFailover, normalizeModelPair } = require("./failover");
-const { commandParts, resolveCommand } = require("./invocation");
-const { registeredHelperCommand, withHelperMode } = require("./helper-discovery");
+const { chatWithFailover, normalizeModelPair, parseModelKey } = require("./failover");
+const { commandParts, resolveCommand, resolveExecutablePath } = require("./invocation");
+const {
+  pathIntegrityAllows,
+  registeredHelperCommand,
+  withHelperMode,
+} = require("./helper-discovery");
 const { proxyEnvFromManagerConfig } = require("./proxy-env");
-const { runWithProviderKeyFailover } = require("./provider-keys");
+const {
+  REASON_MAX_BYTES,
+  runWithProviderKeyFailover,
+  truncateReasonBytes,
+} = require("./provider-keys");
 const { RpcChatManager } = require("./rpc-chat");
+const { SecretRegistry } = require("./redaction");
 const { vsixUpdateInfo } = require("./release");
+const { RpcRuntimeGate } = require("./rpc-runtime");
+const { isHelperTempName, staleTempFiles } = require("./temp-files");
 const {
   requireTrustedExecution,
   trustedConfigurationValue,
@@ -31,8 +42,47 @@ let viewProvider;
 /** @type {import("vscode").OutputChannel | undefined} */
 let askOutput;
 let askRunning = false;
+/** @type {number | undefined} 由 activate() 记录，用于区分开发/打包模式 */
+let extensionMode;
 
 const ownedTempFiles = new Set();
+// 明文密钥只在一条命令的生命周期内驻留，用于输出与 --reason 脱敏，
+// 命令结束即 clear()。
+const secretRegistry = new SecretRegistry();
+// 读路径遇到损坏的配置文件时记录，状态栏据此显示告警而不是整个扩展失活。
+const corruptConfigFiles = new Set();
+
+// helper 的临时文件里躺着明文 API Key、broker token 与可能夹了密钥片段的
+// 错误串。单纯 unlink 只摘掉目录项，内容仍留在未分配块里；与 Python 侧
+// main.py:_shred_request_file / provider_env._shred_file 对齐，先零覆盖再删。
+// 只处理普通文件（lstat + isFile）：不跟随符号链接，避免被诱导去覆盖别的文件。
+function shredTempFile(file) {
+  try {
+    const info = fs.lstatSync(file);
+    if (!info.isFile()) return;
+    if (info.size > 0) {
+      const fd = fs.openSync(file, "r+");
+      try {
+        fs.writeSync(fd, Buffer.alloc(info.size, 0), 0, info.size, 0);
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
+  } catch {
+    // 文件可能已被 helper 擦除删除（Python 侧也会 shred），忽略。
+  }
+  try {
+    fs.unlinkSync(file);
+  } catch {}
+}
+
+// 一次性临时文件的统一回收：从 ownedTempFiles 摘除并零覆盖删除。
+function releaseTempFile(file) {
+  if (!file) return;
+  ownedTempFiles.delete(file);
+  shredTempFile(file);
+}
 
 function agentDir() {
   return path.join(os.homedir(), ".pi", "agent");
@@ -50,12 +100,31 @@ function managerConfigPath() {
   return path.join(agentDir(), "pi-manager.json");
 }
 
+// 写路径专用：损坏即抛，防止用默认值覆盖掉用户配置。
 function readJson(file, fallback) {
   if (!fs.existsSync(file)) return fallback;
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
+    const data = JSON.parse(fs.readFileSync(file, "utf8"));
+    corruptConfigFiles.delete(file);
+    return data;
   } catch (error) {
+    corruptConfigFiles.add(file);
     throw new Error(`配置文件损坏，已禁止覆盖：${file}: ${error.message}`);
+  }
+}
+
+// 读路径专用：损坏时退回空对象。
+// "损坏即抛"对写路径是对的，但它同样作用于所有读路径，后果是
+// activate() → refreshStatusBar() → readSettings() 抛 → **整个扩展激活失败**，
+// 文件监听 debounce 回调抛 → setTimeout 回调内的同步抛出 = 未捕获异常，
+// webview 的 postCatalog() 抛 → 侧栏白屏（审查报告 P2-8）。
+// managerProxyEnvSafe() 早已为 pi-manager.json 做过这种保护，这里把同样的
+// 容错推广到状态栏、监听器与 webview 路径。
+function readJsonSafe(file, fallback) {
+  try {
+    return readJson(file, fallback);
+  } catch {
+    return fallback;
   }
 }
 
@@ -64,14 +133,38 @@ function readSettings() {
   return data && typeof data === "object" ? data : {};
 }
 
+function readSettingsSafe() {
+  const data = readJsonSafe(settingsPath(), {});
+  return data && typeof data === "object" ? data : {};
+}
+
 function readModelsConfig() {
   const data = readJson(modelsPath(), {});
+  return data && typeof data === "object" ? data : {};
+}
+
+function readModelsConfigSafe() {
+  const data = readJsonSafe(modelsPath(), {});
   return data && typeof data === "object" ? data : {};
 }
 
 function readManagerConfig() {
   const data = readJson(managerConfigPath(), {});
   return data && typeof data === "object" ? data : {};
+}
+
+function readManagerConfigSafe() {
+  const data = readJsonSafe(managerConfigPath(), {});
+  return data && typeof data === "object" ? data : {};
+}
+
+// 统一错误文案提取（避免与 runPiPrompt 内的局部 errorText 变量混淆）。
+function messageOf(error) {
+  return error && error.message ? error.message : String(error);
+}
+
+function corruptConfigSummary() {
+  return [...corruptConfigFiles].map((file) => path.basename(file)).sort();
 }
 
 // The proxy is a launch enhancement, never a prerequisite: a corrupt
@@ -114,9 +207,9 @@ function readProviderConfig(provider) {
  * @returns {{providers: string[], modelsByProvider: Record<string, string[]>, favorites: string[], defaultProvider: string, defaultModel: string}}
  */
 function collectModelCatalog() {
-  const settings = readSettings();
-  const modelsCfg = readModelsConfig();
-  const mgr = readManagerConfig();
+  const settings = readSettingsSafe();
+  const modelsCfg = readModelsConfigSafe();
+  const mgr = readManagerConfigSafe();
   const providersSet = new Set();
   /** @type {Record<string, Set<string>>} */
   const map = {};
@@ -131,20 +224,23 @@ function collectModelCatalog() {
   }
 
   // favorites: "Provider/model"
+  // 必须用 parseModelKey（indexOf + slice）而不是 split("/", 2)：JS 的
+  // split limit 是"最多返回几个元素"，多余部分**直接丢弃**，与 Python
+  // core.py:770 的 split("/", 1)（保留剩余）语义完全不同。带斜杠的模型 ID
+  // （OpenRouter / LiteLLM / Ollama 普遍如此）会被截断成
+  // provider=OpenRouter, model=anthropic，而 failover.js 里的同一条目却是
+  // 完整的——同一份配置在同一个进程内被解析成两个值（审查报告 P2-9）。
   const favorites = Array.isArray(mgr.favorites) ? mgr.favorites.map(String) : [];
   for (const key of favorites) {
-    if (!key.includes("/")) continue;
-    const [p, m] = key.split("/", 2);
-    add(p, m);
+    const parsed = parseModelKey(key);
+    if (parsed) add(parsed[0], parsed[1]);
   }
 
   // enabledModels
   const enabled = Array.isArray(settings.enabledModels) ? settings.enabledModels : [];
   for (const key of enabled) {
-    const s = String(key || "");
-    if (!s.includes("/")) continue;
-    const [p, m] = s.split("/", 2);
-    add(p, m);
+    const parsed = parseModelKey(key);
+    if (parsed) add(parsed[0], parsed[1]);
   }
 
   // models.json providers
@@ -204,6 +300,39 @@ function executableConfiguration(key, fallback = "") {
   return trustedConfigurationValue(cfg, key, fallback);
 }
 
+// 打包安装后 __dirname = ~/.cursor/extensions/pi-manager.pi-cursor-x.y.z/，
+// 于是 ../../main.py 解析到 ~/.cursor/main.py、../pi-manager/main.py 解析到
+// ~/.cursor/extensions/pi-manager/main.py —— 两条路径都在用户可写目录下。
+// 旧实现只做 fs.existsSync，任何同用户进程（另一个恶意扩展、一个 npm
+// postinstall 脚本）写入该文件就会被扩展以用户身份执行，并收到扩展递给它的
+// 输出文件路径，可伪造 env 把 pi 的请求导向攻击者 endpoint（审查报告 P1-2）。
+// 三重收紧：
+//  1) 只在开发模式启用（打包版彻底禁用这条发现分支）；
+//  2) 必须与真实仓库布局吻合——同目录下要有 pi_manager 包，`~/.cursor/main.py`
+//     这类孤立文件不满足；
+//  3) main.py 与解释器都要过 helper-discovery 的同一套完整性校验。
+const REPO_MARKERS = Object.freeze([
+  path.join("pi_manager", "__init__.py"),
+  path.join("pi_manager", "provider_env.py"),
+]);
+
+function isDevelopmentMode() {
+  // extensionMode 由 activate() 记录；vscode.ExtensionMode.Development === 2。
+  const development =
+    (vscode.ExtensionMode && vscode.ExtensionMode.Development) !== undefined
+      ? vscode.ExtensionMode.Development
+      : 2;
+  return extensionMode === development;
+}
+
+function developmentHelperMain(candidate) {
+  if (!fs.existsSync(candidate)) return null;
+  const root = path.dirname(candidate);
+  if (!REPO_MARKERS.every((marker) => fs.existsSync(path.join(root, marker)))) return null;
+  if (!pathIntegrityAllows(candidate, {})) return null;
+  return candidate;
+}
+
 function managerHelperCommand(mode) {
   requireTrustedExecution(vscode.workspace);
   const configured = String(
@@ -216,13 +345,15 @@ function managerHelperCommand(mode) {
   const registered = registeredHelperCommand();
   if (registered) return withHelperMode(registered, mode);
 
-  const repoMain = path.resolve(__dirname, "..", "..", "main.py");
-  if (fs.existsSync(repoMain)) {
-    return [process.env.PI_MANAGER_PYTHON || "python", repoMain, mode];
-  }
-  const siblingMain = path.resolve(__dirname, "..", "pi-manager", "main.py");
-  if (fs.existsSync(siblingMain)) {
-    return [process.env.PI_MANAGER_PYTHON || "python", siblingMain, mode];
+  if (!isDevelopmentMode()) return null;
+  const python = resolveExecutablePath(process.env.PI_MANAGER_PYTHON || "python");
+  if (!pathIntegrityAllows(python, { allowRoot: true })) return null;
+  for (const candidate of [
+    path.resolve(__dirname, "..", "..", "main.py"),
+    path.resolve(__dirname, "..", "pi-manager", "main.py"),
+  ]) {
+    const main = developmentHelperMain(candidate);
+    if (main) return [python, main, mode];
   }
   return null;
 }
@@ -277,7 +408,7 @@ function invokeConfigBroker(operation, args) {
         fs.closeSync(fd);
         ownedTempFiles.add(responsePath);
       } catch (error) {
-        ownedTempFiles.delete(requestPath); try { fs.unlinkSync(requestPath); } catch {}
+        releaseTempFile(requestPath);
         reject(new Error(`无法创建 Config Broker 响应文件：${error.message}`));
         return;
       }
@@ -286,24 +417,44 @@ function invokeConfigBroker(operation, args) {
         [...baseArgs, requestPath, "--output", responsePath],
         { windowsHide: true, timeout: 20000 },
         (error, stdout) => {
+          let payload;
+          let parseError = null;
           try {
             const text = fs.readFileSync(responsePath, "utf8") || String(stdout || "{}");
-            const payload = JSON.parse(text);
-            if (!payload.ok) {
-              if (!retried && /token/i.test(payload.error || "")) {
-                retried = true;
-                resolve(runOnce(brokerToken()));
-                return;
-              }
-              throw new Error(payload.error || "Config Broker mutation failed");
-            }
-            resolve(payload);
-          } catch (parseError) {
-            reject(new Error(error ? `Config Broker 启动失败：${error.message}` : parseError.message));
+            payload = JSON.parse(text);
+          } catch (err) {
+            parseError = err;
           } finally {
-            ownedTempFiles.delete(requestPath); try { fs.unlinkSync(requestPath); } catch {}
-            ownedTempFiles.delete(responsePath); try { fs.unlinkSync(responsePath); } catch {}
+            // 请求文件带 broker token，响应文件带业务结果：都零覆盖再删。
+            // Python 侧 main.py:_shred_request_file 也会擦请求文件，这里是
+            // 「helper 根本没跑起来」时的兜底。
+            releaseTempFile(requestPath);
+            releaseTempFile(responsePath);
           }
+          // 协议错误（payload.ok === false）必须与解析/启动错误分开。旧实现用
+          // throw 让协议错误落进同一个 catch(parseError)，而 broker 拒绝请求时
+          // helper 往往同时以非零码退出，于是真正的业务原因（如「broker token
+          // 校验失败」）被替换成泛化的「启动失败」，用户会去排查 Python 环境、
+          // PATH 和权限，也让上面那段 token 重试逻辑失去可观测性
+          //（审查报告 C-5）。
+          if (parseError || !payload || typeof payload !== "object") {
+            const detail = parseError ? parseError.message : "Config Broker 返回了无效响应";
+            reject(
+              new Error(error ? `Config Broker 启动失败：${error.message}（${detail}）` : detail)
+            );
+            return;
+          }
+          if (!payload.ok) {
+            if (!retried && /token/i.test(String(payload.error || ""))) {
+              retried = true;
+              resolve(runOnce(brokerToken()));
+              return;
+            }
+            const detail = String(payload.error || "Config Broker mutation failed");
+            reject(new Error(error ? `${detail}（helper 退出：${error.message}）` : detail));
+            return;
+          }
+          resolve(payload);
         }
       );
     });
@@ -316,7 +467,7 @@ function providerNeedsManagerEnv(provider) {
   return /^\$\{PI_MANAGER_PROVIDER_[A-Z0-9_]+_API_KEY\}$/.test(key) || key.startsWith("__DPAPI__:");
 }
 
-function invokeProviderHelper(provider, helperArgs = []) {
+function invokeProviderHelper(provider, helperArgs = [], { reason = null } = {}) {
   const command = providerHelperCommand();
   if (!command) {
     return Promise.reject(
@@ -324,11 +475,19 @@ function invokeProviderHelper(provider, helperArgs = []) {
     );
   }
   const [bin, ...baseArgs] = command;
-  return new Promise((resolve, reject) => {
-    const output = path.join(
-      os.tmpdir(),
-      `pi-manager-env-${process.pid}-${Date.now()}-${crypto.randomUUID()}.json`
-    );
+  // provider-env 支路此前**不出示 broker token**，而 --config-mutate 一直要求
+  // 出示——授权模型是倒置的：只读地拿到明文 API Key 反而比写白名单字段更宽松。
+  // Python 侧 provider_env.py:75-99 已把两者统一到 config_broker 的同一套校验，
+  // 这里必须同步按值出示 token，否则 helper 会以 exit 2 拒绝请求。
+  // token 轮换（config_broker 默认 180 天）会让缓存值失效，因此沿用
+  // --config-mutate 那条路径已验证过的「失败后重读一次再试」策略。
+  let retried = false;
+  // reason 文件在**每次尝试内部**新建：helper 用完即零覆盖删除，而 token 轮换
+  // 会触发一次重试，复用同一个文件的话第二次必然读不到（-> Key 不被标记）。
+  // 这与 invokeConfigBroker 里请求文件的处理方式一致。
+  const runOnce = (token) => new Promise((resolve, reject) => {
+    const suffix = `${process.pid}-${Date.now()}-${crypto.randomUUID()}.json`;
+    const output = path.join(os.tmpdir(), `pi-manager-env-${suffix}`);
     try {
       const fd = fs.openSync(output, "wx", 0o600);
       fs.closeSync(fd);
@@ -337,9 +496,38 @@ function invokeProviderHelper(provider, helperArgs = []) {
       reject(new Error(`无法创建 Pi Manager 临时响应文件：${err.message}`));
       return;
     }
+    // 文件名沿用 pi-manager-env- 前缀，好让 temp-files.js 的兜底扫描
+    // （前缀 + 时效 + 属主）连同它一起回收宿主崩溃时的残留。
+    let reasonPath = "";
+    if (typeof reason === "string" && reason) {
+      reasonPath = path.join(os.tmpdir(), `pi-manager-env-reason-${suffix}`);
+      try {
+        fs.writeFileSync(
+          reasonPath,
+          JSON.stringify({ reason: truncateReasonBytes(reason, REASON_MAX_BYTES) }),
+          { encoding: "utf8", mode: 0o600, flag: "wx" }
+        );
+        ownedTempFiles.add(reasonPath);
+      } catch (err) {
+        releaseTempFile(output);
+        // 刻意**不**回退到 --reason：那正是要根除的 argv 通道。临时目录写不了
+        // 时上面的 --output 也必然失败，本分支不构成可用性倒退。
+        reject(new Error(`无法创建 Pi Manager 失败原因文件：${err.message}`));
+        return;
+      }
+    }
     execFile(
       bin,
-      [...baseArgs, "--output", output, ...helperArgs, provider],
+      [
+        ...baseArgs,
+        "--output",
+        output,
+        "--token",
+        token,
+        ...(reasonPath ? ["--reason-file", reasonPath] : []),
+        ...helperArgs,
+        provider,
+      ],
       { windowsHide: true, timeout: 20000, cwd: path.dirname(command[1] || __dirname) },
       (err, stdout, stderr) => {
         let payload;
@@ -353,16 +541,23 @@ function invokeProviderHelper(provider, helperArgs = []) {
           }
           return;
         } finally {
-          try {
-            ownedTempFiles.delete(output);
-            fs.unlinkSync(output);
-          } catch {}
+          // 响应文件里是明文 API Key，reason 文件里是可能夹着密钥片段的错误串：
+          // 两者都零覆盖再删。helper 正常返回时 reason 文件已被 Python 侧
+          // _shred_file 擦掉，这里是 helper 未启动/中途崩溃时的兜底。
+          releaseTempFile(output);
+          if (reasonPath) releaseTempFile(reasonPath);
         }
         if (!payload || typeof payload !== "object") {
           reject(new Error("Pi Manager 环境 helper 返回了无效响应"));
           return;
         }
         if (!payload.ok) {
+          // token 轮换后缓存值失效：重读一次磁盘上的 token 再试，只重试一次。
+          if (!retried && /token/i.test(String(payload.error || ""))) {
+            retried = true;
+            resolve(runOnce(brokerToken()));
+            return;
+          }
           reject(new Error(payload.error || String(stderr || "无法解析 Provider 密钥")));
           return;
         }
@@ -370,20 +565,38 @@ function invokeProviderHelper(provider, helperArgs = []) {
       }
     );
   });
+  return runOnce(brokerToken());
 }
 
 function resolveProviderCredential(provider) {
   if (!provider || !providerNeedsManagerEnv(provider)) {
     return Promise.resolve({ env: {}, keyId: "" });
   }
-  return invokeProviderHelper(provider).then((payload) => ({
-    env: payload.env && typeof payload.env === "object" ? payload.env : {},
-    keyId: String(payload.key_id || ""),
-  }));
+  return invokeProviderHelper(provider).then((payload) => {
+    const env = payload.env && typeof payload.env === "object" ? payload.env : {};
+    // 记住本次命令用到的明文值，供输出通道与 --reason 脱敏；命令结束即清空。
+    secretRegistry.rememberEnv(env);
+    return { env, keyId: String(payload.key_id || "") };
+  });
 }
 
 function resolveProviderEnv(provider) {
   return resolveProviderCredential(provider).then((credential) => credential.env);
+}
+
+// --reason 会进入 helper 的进程命令行，而命令行在所有主流系统上都是**非特权
+// 可读**的（Linux /proc/<pid>/cmdline、Windows Win32_Process.CommandLine、
+// macOS ps -ww）。Python 侧 secrets.py:893-901 确实脱敏，但那发生在进程内、
+// 在参数已经暴露之后（审查报告 P2-2）。这里在进入 argv 之前先做一次与
+// Python core_http.py:redact_secret_values 同构的本地脱敏。
+// 长度上限改成与 provider-keys.js 的分类信号一致（400，即 Python
+// _sanitize_reason 的截断值），不再在 200 字符处把 401/429 标志切掉
+//（审查报告 P2-3 / D1）。彻底移出 argv 需要 helper 支持文件/stdin 通道。
+function sanitizeFailureReason(reason) {
+  const redacted = secretRegistry.redact(String(reason || ""));
+  return redacted.length > CLASSIFICATION_SIGNAL_LIMIT
+    ? redacted.slice(-CLASSIFICATION_SIGNAL_LIMIT)
+    : redacted;
 }
 
 function markProviderKeyFailed(provider, keyId, reason) {
@@ -393,7 +606,7 @@ function markProviderKeyFailed(provider, keyId, reason) {
     "--key-id",
     String(keyId),
     "--reason",
-    String(reason || "").slice(0, 200),
+    sanitizeFailureReason(reason),
   ]).then((payload) => ({
     marked: Boolean(payload.marked),
     status: String(payload.status || ""),
@@ -425,11 +638,12 @@ function findPiCommand() {
   for (const candidate of candidates) {
     if (candidate && fs.existsSync(candidate)) return candidate;
   }
-  return "pi";
+  // 兜底：把裸名 "pi" 解析成 PATH 上的绝对路径，不再依赖 libuv 的搜索顺序。
+  return resolveExecutablePath("pi");
 }
 
 function nodeExecutable() {
-  return String(process.env.PI_MANAGER_NODE || "node");
+  return resolveExecutablePath(String(process.env.PI_MANAGER_NODE || "node"));
 }
 
 function piInvocation(piCommand = findPiCommand()) {
@@ -439,19 +653,29 @@ function piInvocation(piCommand = findPiCommand()) {
   return resolveCommand(piCommand, (candidate) => fs.existsSync(candidate)) || { bin: "pi", args: [] };
 }
 
+// `%%` → `%` 的折叠只发生在**批处理文件**的解析阶段；`cmd /c <command>` 走的
+// 是命令行解析路径，不做这个折叠。旧实现在唯一的调用上下文（cmd /c）里把
+// "CPU 占用 100%" 送成 "100%%"，属于静默的内容损坏（审查报告 C-4）。
+// 保留 shim 形参以兼容调用点，但不再做任何 % 变换。
+// 已知残留限制：cmd /c 仍会展开命令行里的 %VAR%，双引号无法阻止；唯一可靠的
+// 规避是不经 cmd 包装（piInvocation 的 node-cli 分支已优先走这条路）。
 function shellQuote(s, shim = false) {
+  void shim;
+  const text = String(s);
   if (process.platform === "win32") {
-    if (shim) s = String(s).replace(/%/g, "%%");
-    if (!/[ \t"&<>|^]/.test(s) && !s.includes("@")) return s;
-    return `"${String(s).replace(/"/g, '""')}"`;
+    if (!/[ \t"&<>|^]/.test(text) && !text.includes("@")) return text;
+    // 闭合引号前的连续反斜杠必须加倍，否则 CommandLineToArgvW 会把 \" 当成
+    // 转义引号，参数边界被破坏（以反斜杠结尾的路径/模型名会触发）。
+    return `"${text.replace(/"/g, '""').replace(/(\\+)$/, "$1$1")}"`;
   }
-  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+  return `'${text.replace(/'/g, `'\\''`)}'`;
 }
 
 function buildLaunchSpec({ withDefaults = true, prompt = null, provider = null, model = null } = {}) {
   requireTrustedExecution(vscode.workspace);
   const cfg = vscode.workspace.getConfiguration("pi");
-  const settings = readSettings();
+  // 与 managerProxyEnvSafe() 同理：损坏的 settings.json 不得阻塞打开终端。
+  const settings = readSettingsSafe();
   const invocation = piInvocation(findPiCommand());
   const args = [...invocation.args];
   const extra = commandParts(executableConfiguration("extraArgs", ""));
@@ -505,7 +729,7 @@ function openPiTerminal(title, spec, cwd, env = {}) {
 
 function refreshStatusBar() {
   if (!statusItem) return;
-  const s = readSettings();
+  const s = readSettingsSafe();
   const p = providerFromSettings(s);
   const m = modelFromSettings(s);
   if (p && m) {
@@ -516,29 +740,39 @@ function refreshStatusBar() {
     statusItem.text = "$(terminal) Pi";
     statusItem.tooltip = "启动 Pi / 切换模型";
   }
+  // 配置损坏时用告警图标显式告知，而不是静默退回空配置。
+  const corrupt = corruptConfigSummary();
+  if (corrupt.length) {
+    statusItem.text = "$(warning) Pi";
+    statusItem.tooltip = `配置文件损坏：${corrupt.join("、")}\n请在 Pi Manager 中修复，扩展已退回空配置继续运行`;
+  }
 }
 
 async function cmdOpenTerminal(folderUri) {
   const cwd = resolveCwd(folderUri);
-  const settings = readSettings();
+  const settings = readSettingsSafe();
   try {
     const env = await resolveProviderEnv(providerFromSettings(settings));
     const spec = buildLaunchSpec({ withDefaults: false });
     openPiTerminal("Pi", spec, cwd, { ...managerProxyEnvSafe(), ...env });
   } catch (err) {
-    vscode.window.showErrorMessage(err.message);
+    vscode.window.showErrorMessage(secretRegistry.redact(messageOf(err)));
+  } finally {
+    secretRegistry.clear();
   }
 }
 
 async function cmdOpenWithDefault(folderUri) {
   const cwd = resolveCwd(folderUri);
-  const settings = readSettings();
+  const settings = readSettingsSafe();
   try {
     const env = await resolveProviderEnv(providerFromSettings(settings));
     const spec = buildLaunchSpec({ withDefaults: true });
     openPiTerminal("Pi (default)", spec, cwd, { ...managerProxyEnvSafe(), ...env });
   } catch (err) {
-    vscode.window.showErrorMessage(err.message);
+    vscode.window.showErrorMessage(secretRegistry.redact(messageOf(err)));
+  } finally {
+    secretRegistry.clear();
   }
 }
 
@@ -555,13 +789,19 @@ async function cmdAskPrompt() {
   });
   if (!prompt) return;
   const cwd = resolveCwd();
-  const settings = readSettings();
+  const settings = readSettingsSafe();
   const provider = providerFromSettings(settings);
   const model = modelFromSettings(settings);
   askRunning = true;
   askOutput = askOutput || vscode.window.createOutputChannel("Pi Ask");
-  askOutput.appendLine(`\n>>> ${prompt}`);
-  askOutput.appendLine(`[工作目录] ${cwd}`);
+  // Output Channel 的内容会被复制进 issue、被 Developer: Open Extension Logs
+  // Folder 落盘、被远程开发场景转发。attempt.error 直接来自 pi 子进程的
+  // stderr，只要 pi 或某个 provider SDK 回显了 Authorization 头或 key 前缀
+  // 就会明文留在这些位置。Python 侧 core_remote.py:767、secrets.py:874 都调用
+  // redact_secret_values，扩展侧此前一处都没有（审查报告 P2-4 / D4）。
+  const say = (line) => askOutput.appendLine(secretRegistry.redact(String(line)));
+  say(`\n>>> ${prompt}`);
+  say(`[工作目录] ${cwd}`);
   askOutput.show(true);
   try {
     const result = await vscode.window.withProgress(
@@ -575,24 +815,25 @@ async function cmdAskPrompt() {
           prompt,
           provider,
           model,
-          readManager: async () => readManagerConfig(),
+          readManager: async () => readManagerConfigSafe(),
           writeManager: async (manager) => writeManagerConfig(manager),
-          readSettings: async () => readSettings(),
+          readSettings: async () => readSettingsSafe(),
           setDefaultModel: async (nextProvider, nextModel) => {
             await setDefaultModel(nextProvider, nextModel);
           },
           runAttempt: async (text, attemptProvider, attemptModel) => {
             if (rpcSessionEnabled()) {
               const rpcResult = await runPiPromptRpc(text, attemptProvider, attemptModel, cwd);
-              if (rpcResult.ok || !rpcRuntimeDisabled) return rpcResult;
-              askOutput.appendLine("[会话] 持久 RPC 会话不可用，回退到一次性模式");
+              if (rpcResult.ok || !rpcRuntimeGate.isDisabled()) return rpcResult;
+              const seconds = Math.ceil(rpcRuntimeGate.cooldownRemainingMs() / 1000);
+              say(`[会话] 持久 RPC 会话不可用，回退到一次性模式（${seconds}s 后自动重试）`);
             }
             return runPiPrompt(text, attemptProvider, attemptModel, cwd);
           },
           onAttempt: async (attempt) => {
             const key = `${attempt.provider}/${attempt.model}`;
             if (attempt.skipped) {
-              askOutput.appendLine(`[跳过] ${key}: ${attempt.reason}`);
+              say(`[跳过] ${key}: ${attempt.reason}`);
               return;
             }
             if (attempt.ok) {
@@ -600,7 +841,7 @@ async function cmdAskPrompt() {
               return;
             }
             const count = attempt.fail_count == null ? "?" : attempt.fail_count;
-            askOutput.appendLine(`[失败 ${count}] ${key}: ${attempt.error || `exit ${attempt.returncode}`}`);
+            say(`[失败 ${count}] ${key}: ${attempt.error || `exit ${attempt.returncode}`}`);
             progress.report({ message: `${key} 失败，计数 ${count}` });
           },
         });
@@ -610,41 +851,47 @@ async function cmdAskPrompt() {
     const key = `${result.provider || "?"}/${result.model || "?"}`;
     if (result.ok) {
       if (result.switched) {
-        askOutput.appendLine(`[自动换模] ${result.switched_from || `${provider}/${model}`} -> ${key}`);
+        say(`[自动换模] ${result.switched_from || `${provider}/${model}`} -> ${key}`);
         refreshStatusBar();
         if (viewProvider) viewProvider.refresh();
         vscode.window.setStatusBarMessage(`Pi 已自动切换模型 -> ${key}`, 5000);
       }
       const text = String(result.stdout || result.stderr || "").trim();
-      askOutput.appendLine(text || "[Pi 未返回文本]");
-      askOutput.appendLine(`[完成] ${key} · ${result.latency_ms || 0} ms`);
+      say(text || "[Pi 未返回文本]");
+      say(`[完成] ${key} · ${result.latency_ms || 0} ms`);
     } else {
-      const error = String(result.error || result.stderr || `退出码 ${result.returncode}`).trim();
-      askOutput.appendLine(`[最终失败] ${key}: ${error}`);
+      const error = secretRegistry
+        .redact(String(result.error || result.stderr || `退出码 ${result.returncode}`))
+        .trim();
+      say(`[最终失败] ${key}: ${error}`);
       vscode.window.showErrorMessage(`Pi 快速提问失败：${error.split(/\r?\n/, 1)[0]}`);
     }
   } catch (err) {
-    const message = err && err.message ? err.message : String(err);
-    askOutput.appendLine(`[错误] ${message}`);
+    const message = secretRegistry.redact(messageOf(err));
+    say(`[错误] ${message}`);
     vscode.window.showErrorMessage(message);
   } finally {
     askRunning = false;
+    // 明文密钥用完即弃，绝不跨命令驻留。
+    secretRegistry.clear();
   }
 }
 
 const rpcChatManager = new RpcChatManager({
   idleTimeoutMs: () => vscode.workspace.getConfiguration("pi").get("rpcSessionIdleTimeoutMs"),
 });
-let rpcRuntimeDisabled = false;
+// 「RPC 运行时不可用」是暂时状态：冷却期满自动重试、一次成功立即恢复，与桌面端
+// rpc_session.py 的 _RUNTIME_RETRY_COOLDOWN 语义一致（审查报告 C-2 / D3）。
+const rpcRuntimeGate = new RpcRuntimeGate();
 
 function rpcSessionEnabled() {
   const cfg = vscode.workspace.getConfiguration("pi");
-  return cfg.get("persistentRpcSession") !== false && !rpcRuntimeDisabled;
+  return cfg.get("persistentRpcSession") !== false && !rpcRuntimeGate.isDisabled();
 }
 
 function buildRpcSpawnSpec({ env, provider, model, sessionId, cwd }) {
   const cfg = vscode.workspace.getConfiguration("pi");
-  const settings = readSettings();
+  const settings = readSettingsSafe();
   const invocation = piInvocation(findPiCommand());
   let bin = invocation.bin;
   let args = [...invocation.args, "--mode", "rpc"];
@@ -695,12 +942,13 @@ function runPiPromptRpc(prompt, provider, model, cwd) {
         const timeoutMs = Number(cfg.get("rpcPromptTimeoutMs")) || 180000;
         const result = await entry.session.prompt(String(prompt), { timeoutMs });
         rpcChatManager.touch(cwd);
+        // 一次成功即解除运行时禁用，与桌面端 rpc_session.py:546-548 一致。
+        if (result && result.ok) rpcRuntimeGate.recover();
         return result;
       } catch (error) {
         rpcChatManager.disposeFor(cwd);
-        if (error && error.rpcUnavailable) {
-          rpcRuntimeDisabled = true;
-        }
+        const localFailure = Boolean(error && error.rpcUnavailable);
+        if (localFailure) rpcRuntimeGate.disable();
         return {
           ok: false,
           returncode: -1,
@@ -708,6 +956,10 @@ function runPiPromptRpc(prompt, provider, model, cwd) {
           stderr: "",
           latency_ms: Date.now() - started,
           error: (error && error.message) || String(error),
+          // 本地原因（spawn ENOENT、pi 未安装）与 Key 无关：打上标记让
+          // runWithProviderKeyFailover 跳过 markFailed，既省一次 helper 进程，
+          // 也避免启动信息里的 authentication/401 误停用一把好 Key（C-3）。
+          localFailure,
         };
       }
     },
@@ -717,7 +969,7 @@ function runPiPromptRpc(prompt, provider, model, cwd) {
 function runPiPrompt(prompt, provider, model, cwd) {
   requireTrustedExecution(vscode.workspace);
   const cfg = vscode.workspace.getConfiguration("pi");
-  const settings = readSettings();
+  const settings = readSettingsSafe();
   const piCmd = findPiCommand();
   const extra = commandParts(executableConfiguration("extraArgs", ""));
   const invocation = piInvocation(piCmd);
@@ -738,7 +990,7 @@ function runPiPrompt(prompt, provider, model, cwd) {
     markFailed: (keyId, reason) => markProviderKeyFailed(attemptProvider, keyId, reason),
     run: (providerEnv) =>
       new Promise((resolve) => {
-        const proxyEnv = proxyEnvFromManagerConfig(readManagerConfig());
+        const proxyEnv = managerProxyEnvSafe();
         const started = Date.now();
         const options = {
           cwd,
@@ -772,6 +1024,8 @@ function runPiPrompt(prompt, provider, model, cwd) {
             stderr: stderr || "",
             latency_ms: Date.now() - started,
             error: ok ? "" : errorText || text || (error && error.message) || `退出码 ${returncode}`,
+            // pi 根本没装 / 路径失效属于本地失败，与 Key 无关（C-3）。
+            localFailure: Boolean(error && (error.code === "ENOENT" || error.code === "EACCES")),
           });
         });
       }),
@@ -833,6 +1087,16 @@ function getJson(url, redirects = 0, origin = "") {
   });
 }
 
+function httpsReleaseUrl(candidate) {
+  try {
+    const parsed = new URL(String(candidate || ""));
+    if (parsed.protocol === "https:") return parsed.toString();
+  } catch {
+    // 非法 URL 一律退回官方 Release 页
+  }
+  return RELEASE_PAGE;
+}
+
 async function checkExtensionUpdate(context, silent = false) {
   const localVersion = String(context.extension.packageJSON.version || "0.0.0");
   try {
@@ -849,7 +1113,10 @@ async function checkExtensionUpdate(context, silent = false) {
       "稍后"
     );
     if (choice === "打开 Release") {
-      await vscode.env.openExternal(vscode.Uri.parse(info.releaseUrl || RELEASE_PAGE));
+      // info.releaseUrl 来自 GitHub API 的 release.html_url。getJson 已强制
+      // HTTPS + 同源重定向，但仍要白名单 scheme：openExternal 会把自定义协议
+      // 交给操作系统处理程序（审查报告 P3-1b）。
+      await vscode.env.openExternal(vscode.Uri.parse(httpsReleaseUrl(info.releaseUrl)));
     }
     return info;
   } catch (error) {
@@ -865,7 +1132,13 @@ function scheduleExtensionUpdateCheck(context) {
   if (cfg.get("autoCheckExtensionUpdate") === false) return;
   const last = Number(context.globalState.get("pi.lastVsixUpdateCheck", 0));
   if (Date.now() - last < VSIX_CHECK_INTERVAL_MS) return;
-  setTimeout(() => checkExtensionUpdate(context, true), 3000);
+  // 句柄纳入 subscriptions：否则 deactivate 之后 3 秒内仍可能发起网络请求并
+  // 访问已释放的 context.globalState（审查报告 4.6）。
+  const timer = setTimeout(() => {
+    checkExtensionUpdate(context, true).catch(() => {});
+  }, 3000);
+  if (timer.unref) timer.unref();
+  context.subscriptions.push({ dispose: () => clearTimeout(timer) });
 }
 
 async function cmdOpenConfig() {
@@ -949,9 +1222,15 @@ async function cmdSwitchModel() {
       placeHolder: "选择收藏项设为默认",
     });
     if (!pickedF) return;
-    const [p, m] = String(pickedF.key).split("/", 2);
-    provider = p;
-    model = m;
+    // 同 collectModelCatalog：必须用 parseModelKey，split("/", 2) 会把带斜杠的
+    // 模型 ID 截断成一个不存在的模型名写进 defaultModel（审查报告 P2-9）。
+    const parsed = parseModelKey(String(pickedF.key));
+    if (!parsed) {
+      vscode.window.showWarningMessage(`收藏项格式无效：${pickedF.key}`);
+      return;
+    }
+    provider = parsed[0];
+    model = parsed[1];
   } else {
     const models = catalog.modelsByProvider[provider] || [];
     if (!models.length) {
@@ -1039,15 +1318,23 @@ class PiManagerViewProvider {
 
   postCatalog() {
     if (!this.view) return;
-    const catalog = collectModelCatalog();
-    this.view.webview.postMessage({ type: "catalog", catalog });
+    try {
+      const catalog = collectModelCatalog();
+      this.view.webview.postMessage({ type: "catalog", catalog });
+    } catch (error) {
+      // 配置损坏不得让侧栏白屏（审查报告 P2-8）。
+      vscode.window.showWarningMessage(`Pi 面板读取配置失败：${error.message || String(error)}`);
+    }
   }
 
   getHtml(webview) {
+    // nonce 替代 'unsafe-inline'：当前没有可利用的注入点（内容全部经
+    // postMessage + textContent 写入），属加固（审查报告清单 #17）。
+    const nonce = crypto.randomBytes(16).toString("base64");
     const csp = [
       "default-src 'none'",
-      `style-src ${webview.cspSource} 'unsafe-inline'`,
-      `script-src ${webview.cspSource} 'unsafe-inline'`,
+      `style-src ${webview.cspSource} 'nonce-${nonce}'`,
+      `script-src ${webview.cspSource} 'nonce-${nonce}'`,
     ].join("; ");
     return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1055,7 +1342,7 @@ class PiManagerViewProvider {
 <meta charset="UTF-8"/>
 <meta http-equiv="Content-Security-Policy" content="${csp}">
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<style>
+<style nonce="${nonce}">
   :root {
     color-scheme: light dark;
     --bg: var(--vscode-sideBar-background, #1e1e1e);
@@ -1111,6 +1398,12 @@ class PiManagerViewProvider {
   }
   .fav button.active { border-color: var(--accent); }
   .hint { color: var(--muted); font-size: 11px; line-height: 1.4; margin-top: 8px; }
+  /* 原先写在 style="" 属性里：nonce 对内联 style **属性**无效（那受
+     style-src-attr 管辖，只能靠 'unsafe-inline'/'unsafe-hashes'），
+     所以搬进这里，CSP 才能彻底去掉 'unsafe-inline'。 */
+  .hidden { display: none; }
+  .card-title { margin-bottom: 6px; }
+  .full-width { width: 100%; }
 </style>
 </head>
 <body>
@@ -1140,16 +1433,16 @@ class PiManagerViewProvider {
     <div class="hint">快捷键：Ctrl+Alt+M（Mac: Cmd+Alt+M）打开选择器；Ctrl+Alt+P 用默认模型启动。</div>
   </div>
 
-  <div class="card" id="favCard" style="display:none">
-    <div style="margin-bottom:6px">收藏（一键设默认）</div>
+  <div class="card hidden" id="favCard">
+    <div class="card-title">收藏（一键设默认）</div>
     <div class="fav" id="favs"></div>
   </div>
 
   <div class="card">
-    <button class="secondary" id="btnConfig" style="width:100%">打开配置目录</button>
+    <button class="secondary full-width" id="btnConfig">打开配置目录</button>
   </div>
 
-<script>
+<script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
   let catalog = null;
 
@@ -1237,19 +1530,57 @@ class PiManagerViewProvider {
   }
 }
 
+// 兜底清理必须真正扫描目录。旧实现遍历 ownedTempFiles，而 activate() 是本
+// 进程第一次运行代码的地方，此刻集合必然为空——整个函数是空转，上一次宿主
+// 崩溃/被强杀遗留的**含明文 API Key 与 broker token** 的临时文件永远不会被
+// 清理（审查报告 P2-1）。筛选条件见 temp-files.js：前缀 + 时效 + POSIX 属主，
+// 三者同时满足才删，不会重蹈 15e3901 修复过的越权删除。
 function cleanupStaleTempFiles() {
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  for (const file of ownedTempFiles) {
-    try {
-      if (fs.statSync(file).mtimeMs < cutoff) {
-        fs.unlinkSync(file);
-        ownedTempFiles.delete(file);
+  const dir = os.tmpdir();
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return 0;
+  }
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  const stale = staleTempFiles({
+    names,
+    statFile: (name) => {
+      try {
+        return fs.statSync(path.join(dir, name));
+      } catch {
+        return undefined;
       }
+    },
+    uid,
+    skip: new Set([...ownedTempFiles].map((file) => path.basename(file))),
+  });
+  let removed = 0;
+  for (const name of stale) {
+    try {
+      fs.unlinkSync(path.join(dir, name));
+      removed += 1;
+    } catch {
+      // 文件可能刚被别的宿主删掉，忽略
+    }
+  }
+  return removed;
+}
+
+// 本进程自有的临时文件在退出时立即销毁，不等 24 小时兜底窗口。
+function purgeOwnedTempFiles() {
+  for (const file of [...ownedTempFiles]) {
+    ownedTempFiles.delete(file);
+    if (!isHelperTempName(path.basename(file))) continue;
+    try {
+      fs.unlinkSync(file);
     } catch {}
   }
 }
 
 function activate(context) {
+  extensionMode = context.extensionMode;
   cleanupStaleTempFiles();
   askOutput = vscode.window.createOutputChannel("Pi Ask");
   context.subscriptions.push(askOutput);
@@ -1288,8 +1619,14 @@ function activate(context) {
       if (bumpTimer) clearTimeout(bumpTimer);
       bumpTimer = setTimeout(() => {
         bumpTimer = null;
-        refreshStatusBar();
-        if (viewProvider) viewProvider.refresh();
+        // setTimeout 回调里的同步抛出就是未捕获异常，必须自己兜住
+        //（审查报告 P2-8 / 4.6）。
+        try {
+          refreshStatusBar();
+          if (viewProvider) viewProvider.refresh();
+        } catch {
+          // 配置损坏已由 readJsonSafe 与状态栏告警覆盖
+        }
       }, 200);
       if (bumpTimer.unref) bumpTimer.unref();
     };
@@ -1297,6 +1634,13 @@ function activate(context) {
     watcher.onDidCreate(bump);
     watcher.onDidDelete(bump);
     context.subscriptions.push(watcher);
+    // debounce 句柄同样纳入 subscriptions，避免 dispose 后仍触发一次刷新。
+    context.subscriptions.push({
+      dispose: () => {
+        if (bumpTimer) clearTimeout(bumpTimer);
+        bumpTimer = null;
+      },
+    });
   } catch {
     // ignore if agent dir missing
   }
@@ -1305,6 +1649,8 @@ function activate(context) {
 
 function deactivate() {
   rpcChatManager.disposeAll();
+  secretRegistry.clear();
+  purgeOwnedTempFiles();
 }
 
 module.exports = {
@@ -1320,4 +1666,8 @@ module.exports = {
   setDefaultModel,
   runPiPrompt,
   checkExtensionUpdate,
+  // 以下仅为可测试性导出（引用/URL 规则是纯函数，无需 vscode 宿主）。
+  cleanupStaleTempFiles,
+  httpsReleaseUrl,
+  shellQuote,
 };

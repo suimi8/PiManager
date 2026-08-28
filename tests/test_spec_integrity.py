@@ -59,6 +59,83 @@ def test_specs_share_common_config() -> None:
         assert "build_hiddenimports" in text, f"{name} does not share hiddenimports"
 
 
+def _runtime_hook_literals(text: str) -> list[str]:
+    """String literals appearing inside the spec's ``runtime_hooks=[...]``."""
+    match = re.search(r"runtime_hooks\s*=\s*\[(.*?)\]", text, flags=re.S)
+    assert match, "spec has no runtime_hooks= argument"
+    return re.findall(r'"([^"]+)"', match.group(1))
+
+
+def test_specs_reference_no_missing_runtime_hook() -> None:
+    """Every runtime hook a spec names must exist under scripts/.
+
+    B-3: ``scripts/pyi_rth_pimanager.py`` was dead code — PyInstaller runs
+    custom rthooks first and the bundled ``pyi_rth_pyside6.py`` then assigns
+    ``QT_PLUGIN_PATH`` unconditionally, wiping it out. It was removed; this
+    guard keeps a spec from pointing at a hook file that is not there.
+    """
+    for name in SPEC_NAMES:
+        text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        literals = _runtime_hook_literals(text)
+        assert "pyi_rth_pimanager.py" not in literals, (
+            f"{name} re-added the dead PySide6 QT_PLUGIN_PATH hook"
+        )
+        for literal in literals:
+            if not literal.endswith(".py"):
+                continue
+            assert (REPO_ROOT / "scripts" / literal).is_file(), (
+                f"{name} references a missing runtime hook: {literal}"
+            )
+    assert not (REPO_ROOT / "scripts" / "pyi_rth_pimanager.py").exists()
+
+
+def test_qt_trim_drops_the_dangling_pdf_image_plugin() -> None:
+    """B-11: plugins/imageformats/qpdf.* has no Qt6Pdf tag in its basename."""
+    assert "qpdf" in pyi_common.QT_TRIM_TAGS
+    toc = [
+        ("PySide6/plugins/imageformats/qpdf.dll", "/abs/qpdf.dll", "BINARY"),
+        ("PySide6/plugins/imageformats/libqpdf.so", "/abs/libqpdf.so", "BINARY"),
+        ("PySide6/Qt6Pdf.dll", "/abs/Qt6Pdf.dll", "BINARY"),
+        ("PySide6/plugins/imageformats/qpng.dll", "/abs/qpng.dll", "BINARY"),
+        ("PySide6/plugins/imageformats/qsvg.dll", "/abs/qsvg.dll", "BINARY"),
+        ("PySide6/Qt6Svg.dll", "/abs/Qt6Svg.dll", "BINARY"),
+        ("PySide6/translations/qtbase_zh_CN.qm", "/abs/qtbase_zh_CN.qm", "DATA"),
+        ("PySide6/translations/qtbase_de.qm", "/abs/qtbase_de.qm", "DATA"),
+    ]
+    kept = {entry[0] for entry in pyi_common.trim_qt(toc)}
+    assert "PySide6/plugins/imageformats/qpdf.dll" not in kept
+    assert "PySide6/plugins/imageformats/libqpdf.so" not in kept
+    assert "PySide6/Qt6Pdf.dll" not in kept
+    assert "PySide6/translations/qtbase_de.qm" not in kept
+    # Icon rendering must survive the trim (self_check now renders an SVG).
+    assert "PySide6/plugins/imageformats/qpng.dll" in kept
+    assert "PySide6/plugins/imageformats/qsvg.dll" in kept
+    assert "PySide6/Qt6Svg.dll" in kept
+    assert "PySide6/translations/qtbase_zh_CN.qm" in kept
+
+
+def test_asset_datas_skip_dev_files_but_keep_plugin_payloads() -> None:
+    """B-12: assets/README.md and assets/_gen_logo.py must not ship."""
+    entries = pyi_common.collect_asset_datas(REPO_ROOT)
+    assert entries, "no asset datas collected"
+    sources = {Path(src).name for src, _dest in entries}
+    assert "README.md" not in sources
+    assert "_gen_logo.py" not in sources
+    # Real payloads and their destination mapping stay intact.
+    by_rel = {
+        (Path(src).relative_to(REPO_ROOT / "assets").as_posix(), dest)
+        for src, dest in entries
+    }
+    assert ("icon.png", "assets") in by_rel
+    assert ("icons/home.svg", "assets/icons") in by_rel
+    assert ("builtin/manifest.json", "assets/builtin") in by_rel
+    assert any(
+        rel.startswith("builtin/skills/document-processing/scripts/") and rel.endswith(".py")
+        for rel, _dest in by_rel
+    ), "builtin skill scripts were filtered out"
+    assert not any("__pycache__" in rel for rel, _dest in by_rel)
+
+
 def test_hiddenimports_cover_current_presentation_pages() -> None:
     hidden = set(pyi_common.build_hiddenimports())
     for mod in _page_modules():

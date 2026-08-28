@@ -5,7 +5,9 @@
 检测两类泄漏：
 
 1. 文件名黑名单：``secrets.vault``、``auth.json``、``*.pem``、``*.key``、
-   ``id_rsa*``、``*.pfx``、``*.p12``、``.env``、``*.keystore`` 等。
+   ``id_rsa*``、``*.pfx``、``*.p12``、``.env``、``*.keystore``，以及与 vault 同等
+   敏感的盐文件 ``.vault_master_key`` 、``secrets.index.json`` 与 broker token
+   ``.broker-token`` 等。
 2. 文件内容模式：真实 API Key / 私钥 / Bearer 形态（``sk-``、``ghp_``、
    ``AKIA``、``xoxb-``、``AIza``、PEM 私钥块、``bearer <token>`` 等）。
 
@@ -48,6 +50,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 _BAD_FILE_NAMES = {
     "secrets.vault",
     "secrets.dpapi",
+    # vault 盐文件与 secrets.vault **同等敏感**：pepper 随二进制公开，盐是剩余的
+    # 全部保护（SECURITY.md「回退 vault 的威胁模型」第 2 条明确写了「盐文件与
+    # vault 不可被同一本地攻击者同时读取」）。它此前既不在 .gitignore 也不在本
+    # 黑名单，开发者为复现问题把它拷进仓库时两道防线都会放行（审查 H1）。
+    ".vault_master_key",
+    "secrets.index.json",
+    # config_broker 的 64 字节 broker token 是凭据等价物（扩展进程凭它调用
+    # --config-mutate），泄漏等于把配置写权限交出去。
+    ".broker-token",
     "auth.json",
     ".env",
     ".npmrc",
@@ -82,6 +93,10 @@ _INNOCENT_TOKEN_PARTS = (
     "sk-process", "sk-zhipu", "dummy", "example", "placeholder", "redacted",
     "custom-secret", "custom-header-secret", "test-secret", "fake", "sample",
     "secret-value", "sk-1234567890",
+    # 改用 finditer 后才够得着的假值（此前每文件只报第一处命中，它被前面的
+    # sk-first-secret 挡住了）：tests/test_provider_auth.py:809 的 integration
+    # 用例断言 `Bearer real-integration-secret`，是断言用的固定字符串。
+    "integration-secret",
 )
 
 # 跳过内容检查的文件（构建产物、文档截图占位等）
@@ -141,15 +156,19 @@ def _check_file(path: Path) -> list[tuple[str, str]]:
         text = data.decode("utf-8", errors="replace")
     except Exception:
         return findings
+    # 必须 finditer 而不是 search：一个文件里可能藏多把不同的 Key，只报第一处
+    # 会让后面的漏检（审查 P2）。同一 (pattern, snippet) 去重，避免同一个假值
+    # 重复出现几十次把输出冲爆。
     for pattern in _SECRET_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            snippet = match.group(0)
-            lowered_snippet = snippet.lower()
-            if any(part in lowered_snippet for part in _INNOCENT_TOKEN_PARTS):
+        seen: set[str] = set()
+        for match in pattern.finditer(text):
+            raw = match.group(0)
+            if any(part in raw.lower() for part in _INNOCENT_TOKEN_PARTS):
                 continue  # 测试/示例模拟密钥
-            if len(snippet) > 24:
-                snippet = snippet[:12] + "…" + snippet[-8:]
+            if raw in seen:
+                continue
+            seen.add(raw)
+            snippet = raw if len(raw) <= 24 else raw[:12] + "…" + raw[-8:]
             findings.append((pattern.pattern, f"疑似密钥内容: {pattern.pattern}（{snippet}）"))
     return findings
 

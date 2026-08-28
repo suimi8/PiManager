@@ -61,10 +61,23 @@ def test_desktop_release_defaults_are_resolved_from_repository_root(
 
     monkeypatch.setattr(package_release, "REPO_ROOT", repository)
     monkeypatch.chdir(external_cwd)
+    # package_release 现在有版本闸门：打包前会**实际执行** dist 里的二进制跑
+    # --self-check 并比对 version=，防止打出「文件名 1.8.6 / 内容 1.8.4」的包
+    # （R2 构建审计 B-5，当时实测 dist/PiManager.exe 的 PE 版本确实落后两个版本）。
+    # 本用例造的是 b"desktop-package" 这样的假 exe，执行必然失败（WinError 216），
+    # 而本用例要测的是「默认路径从仓库根解析」，与版本校验无关，所以显式跳过。
+    # 闸门自身的正反用例在 tests/test_resource_resolution.py 里。
     monkeypatch.setattr(
         sys,
         "argv",
-        ["package_release.py", "--platform", "windows", "--version", "9.8.7"],
+        [
+            "package_release.py",
+            "--platform",
+            "windows",
+            "--version",
+            "9.8.7",
+            "--skip-version-check",
+        ],
     )
 
     assert package_release.main() == 0

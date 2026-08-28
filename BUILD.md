@@ -13,7 +13,7 @@ python main.py --self-check
 ```
 
 依赖：
-- Python 3.10+
+- Python 3.11+（CI 测试矩阵为 3.11 / 3.12；`pyproject.toml` 的 `requires-python` 与 ruff `target-version` 同为 3.11）
 - 可选：`npm install -g @earendil-works/pi-coding-agent`
 
 ## 本地打包（当前 OS）
@@ -21,19 +21,50 @@ python main.py --self-check
 发布前依次执行（与 AGENTS.md 维护约束一致）：
 
 ```bash
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt -r requirements-dev.txt
+ruff check .
 python -m pytest tests -q
+python scripts/check_secrets.py --scan-tests
+python scripts/check_versions.py
 python main.py --self-check
-# 本地打包（当前 OS）
-python -m pip install -r requirements.txt pyinstaller
+# 本地打包（当前 OS；PyInstaller 由 requirements-dev.txt 提供）
 # macOS 额外：
 # bash scripts/make_icns.sh
 # Windows 产物为单文件版（dist/PiManager.exe）；macOS / Linux 用目录版 / .app：
 #   Windows:    python -m PyInstaller --noconfirm --clean PiManagerOneFile.spec
 #   macOS/Linux: python -m PyInstaller --noconfirm --clean PiManager.spec
 python scripts/smoke_test_dist.py
-python scripts/package_release.py --version 1.8.1
+python scripts/package_release.py --version 1.8.6
 ```
+
+### 冒烟测试与打包脚本的门禁
+
+两个脚本各自带**默认开启**的版本闸门，正常发布流程不需要手工传版本号：
+
+`python scripts/smoke_test_dist.py`
+- **版本闸门默认开启**：不传 `--expected-version` 时，期望值直接从
+  `pi_manager/extras.py` 的 `APP_VERSION`（单一来源）读取，并与产物自己
+  `--self-check` 输出的 `version=` 比对。过期的 `dist/` 再也无法悄悄通过。
+  `--no-version-check` 可显式关闭（仅调试用）。
+- 默认还会校验 `--print-provider-env` / `--config-mutate` 的 JSON 契约；
+  `--skip-cli-contract` 可跳过。
+- `--deep`：在 `--self-check` 内额外实例化主窗口（置
+  `PIMANAGER_SELFCHECK_DEEP=1`）。它**会写用户配置目录**，所以只适合一次性的
+  CI runner，不要在开发机上跑。当前 workflow 尚未启用，是留给加深冒烟覆盖的开关。
+- `--dist` 相对路径以**项目根目录**为基准，不是当前工作目录。
+
+`python scripts/package_release.py`
+- `--version` 缺省即 `APP_VERSION`，一般不需要传。
+- **打包前的二进制版本闸门**：实际执行产物的 `--self-check` 并比对版本，
+  确保过期的 `dist/` 不会被套上新版本的文件名发出去。`--skip-version-check`
+  可绕过（仅调试；发布路径绝不使用），`--self-check-timeout` 调整超时。
+- **为每个产物落 `<产物名>.sha256`**（`<hash>  <name>` 格式），并把主产物摘要
+  写进 `RUN-*.txt`，附带各平台的校验命令。`--no-checksums` 可关闭。
+- macOS `--strict-sign`：把 `codesign` 与 `codesign --verify` 失败视为致命错误
+  （**CI 已启用**）。归档保留符号链接，否则 `.app` 的
+  Frameworks↔Resources 交叉链接被压平会让 ad-hoc 签名失效，用户看到「已损坏，
+  无法打开」——比未签名更糟，因为「右键打开」也绕不过去。
+- `--out` 中其他版本的 PiManager 归档默认会被清理，`--no-prune-stale` 可保留。
 
 Cursor 扩展统一从项目根目录打包：
 
@@ -77,19 +108,19 @@ python scripts/package_extension.py
 [`.github/workflows/build.yml`](.github/workflows/build.yml) 会：
 
 1. 在 Windows / macOS / Linux 各自构建
-2. 运行 `scripts/smoke_test_dist.py`（`--self-check` + 资源/可执行位检查）
-3. 打包 zip/tar.gz 与 `RUN-*.txt`
+2. 运行 `scripts/smoke_test_dist.py`（`--self-check` + 版本闸门 + CLI 契约 + 资源/可执行位检查；CI 显式传 `--expected-version`，与缺省值同源）
+3. 打包 zip/tar.gz、每个产物的 `.sha256` 与含摘要的 `RUN-*.txt`（macOS 带 `--strict-sign`）
 4. 可选上传到 GitHub Release
 
 手动触发：Actions → **Build** → **Run workflow**  
-- `version`：`1.8.1`
-- `upload_to_release`：`v1.8.1`（可选）
+- `version`：`1.8.6`
+- `upload_to_release`：`v1.8.6`（可选）
 
 打 tag 也会触发：
 
 ```bash
-git tag v1.8.1
-git push origin v1.8.1
+git tag v1.8.6
+git push origin v1.8.6
 ```
 
 ## 平台能力表
@@ -98,14 +129,23 @@ git push origin v1.8.1
 |----|----------|----------|
 | Windows | Windows Terminal / PowerShell / cmd | OS keyring + 文件库回退 |
 | macOS | Terminal.app / iTerm2 | Keychain + 文件库 |
-| Linux | gnome-terminal / konsole / xterm 等 | Secret Service + 文件库 |
+| Linux | gnome-terminal / konsole / xterm 等 | Secret Service + 文件库回退（见下方注意） |
+
+> **Linux headless / 无 D-Bus 环境注意**：无可用 Secret Service 后端（服务器、
+> 容器、纯 SSH 会话）时，密钥会**静默回退**到当前用户 AES-GCM 文件库
+> `~/.pi/agent/secrets.vault`。该回退路径的机密性弱于 OS keyring——它依赖文件
+> 0600 权限与随机盐，`SECURITY.md`「回退 vault 的威胁模型」有完整说明。在这类
+> 环境部署前请先读该节。
 
 ## 打包实现要点
 
 - `PiManagerOneFile.spec`：Windows 主产物（单文件版，`dist/PiManager.exe`）
 - `PiManager.spec`：macOS / Linux 产物（目录版 / `.app`）；按平台收集 keyring 后端、certifi、assets；禁用 UPX
-- `scripts/pyi_rth_pimanager.py`：冻结环境下设置 `QT_PLUGIN_PATH`
-- `pi_manager/resources.py`：兼容 onedir / onefile / macOS `.app` 资源路径
+- Qt 插件路径由 PySide6 官方 runtime hook（`pyi_rth_pyside6.py`）处理，本项目不再自带
+  runtime hook：自定义 rthook 排在官方 hook **之前**执行，而官方 hook 无条件覆写
+  `QT_PLUGIN_PATH`，故原 `scripts/pyi_rth_pimanager.py` 在任何场景都不可能生效，已删除
+- `pi_manager/resources.py`：兼容 onedir / onefile / macOS `.app` 资源路径；冻结态
+  **只信任 `sys._MEIPASS`**，不再回退 exe 同级目录（否则便携版旁放 `assets/` 可劫持内置资源）
 - `main.py --self-check`：验证 PySide6 / cryptography / keyring / assets / 离屏 Qt
 
 ## 注意

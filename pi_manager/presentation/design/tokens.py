@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 
 ACCENTS: dict[str, tuple[str, str, str]] = {
@@ -34,6 +35,7 @@ class DesignTokens:
     accent_soft: str
     accent_text: str
     success: str
+    success_hover: str
     success_soft: str
     warning: str
     warning_soft: str
@@ -65,6 +67,9 @@ def normalize_accent(accent: str | None) -> str:
     return value if value in ACCENTS else "blue"
 
 
+# 主题 token 是纯函数（入参两个字符串、返回 frozen dataclass），但被模型表
+# 每行调用；实测每次 ~4 µs 且无缓存。取值组合最多 2×5=10 种，直接缓存。
+@lru_cache(maxsize=32)
 def tokens_for(mode: str | None = None, accent: str | None = None) -> DesignTokens:
     mode_name = normalize_mode(mode)
     accent_name = normalize_accent(accent)
@@ -90,6 +95,7 @@ def tokens_for(mode: str | None = None, accent: str | None = None) -> DesignToke
             accent_soft="#EAF1FF" if accent_name == "blue" else "#F1F5F9",
             accent_text=pressed,
             success="#16A34A",
+            success_hover="#22C55E",
             success_soft="#EAF8EF",
             warning="#D97706",
             warning_soft="#FFF6E5",
@@ -120,6 +126,7 @@ def tokens_for(mode: str | None = None, accent: str | None = None) -> DesignToke
         accent_soft="#17243B" if accent_name == "blue" else "#192128",
         accent_text="#9FC0FF" if accent_name == "blue" else hover,
         success="#35C56F",
+        success_hover="#5BD98D",
         success_soft="#102A1B",
         warning="#F5B942",
         warning_soft="#2D2310",

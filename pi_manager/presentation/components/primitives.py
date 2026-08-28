@@ -106,7 +106,11 @@ class AppButton(QPushButton):
         if icon_name:
             self.setIcon(icon(icon_name, icon_color, 17))
         if callback is not None:
-            self.clicked.connect(callback)
+            # 吞掉 QPushButton.clicked 携带的 bool checked：否则 PySide6 会把它
+            # 填给接受参数的槽（open_install_dialog(status)/check_manager_update(
+            # silent)/open_setup_wizard(force) 三处今天只是"碰巧对"），点按钮与
+            # 直接调用的行为不一致，改默认值就会引入极难定位的缺陷。
+            self.clicked.connect(lambda *_ignored: callback())
 
     def refresh_theme(self, mode: str, accent: str) -> None:
         icon_name = str(self.property("iconName") or "")

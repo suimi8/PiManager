@@ -7,6 +7,7 @@ separate presentation package. Pages can therefore migrate independently.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from PySide6.QtCore import QSize, Qt, QUrl
@@ -23,7 +24,6 @@ from PySide6.QtWidgets import (
 )
 
 from .. import core, extras
-from ..ui import LATENCY_OK_MS, LATENCY_WARN_MS
 from ..ui import MainWindow as LegacyMainWindow
 from ..ui import NAV_PAGES, Worker
 from .components import AppButton, CollapsibleSection, NavigationRail, PageHeader
@@ -64,6 +64,15 @@ _PAGE_META = {
     "settings": ("settings", "系统"),
     "help": ("help", "系统"),
 }
+
+# 页头标题覆盖：侧边栏标签求短，页头求完整。以前插件页靠 _bind_page_title
+# 再挂一个 nav.pageChanged 槽来覆盖标题，正确性依赖两个槽的连接顺序（隐式
+# 契约）；改为在 _activate_page 内部一次查表，顺序依赖消失。
+_PAGE_HEADINGS = {
+    "plugins": ("插件管理", "内置 skills / extensions 与用户自定义插件的统一管理。"),
+}
+
+logger = logging.getLogger(__name__)
 
 
 class ModernMainWindow(LegacyMainWindow):
@@ -145,7 +154,9 @@ class ModernMainWindow(LegacyMainWindow):
         self.update_indicator.setIconSize(QSize(16, 16))
         self.update_indicator.clicked.connect(self.check_all_updates)
         self.status.addPermanentWidget(self.update_indicator)
+        self.update_indicator.setAccessibleName("更新状态")
         self.nav.set_current_key("simple")
+        self._install_navigation_shortcuts()
         # 所有 widget 已创建，现在应用主题（此前各 widget 已用 _theme_pair 取色构建，
         # 此处统一刷新图标/样式表/状态栏主题文案）。
         self.apply_ui_theme()
@@ -190,6 +201,36 @@ class ModernMainWindow(LegacyMainWindow):
         return build_help_page(self)
 
     # ---- shell/navigation --------------------------------------------------------
+    def _install_navigation_shortcuts(self) -> None:
+        """键盘可达性：11 个导航页此前只能鼠标点击切换。
+
+        Ctrl+1..9 直达前 9 页，Ctrl+Tab / Ctrl+Shift+Tab 循环切换。
+        """
+        from PySide6.QtGui import QKeySequence, QShortcut
+
+        self._nav_shortcuts = []
+        for position, key in enumerate(self._page_keys[:9], start=1):
+            shortcut = QShortcut(QKeySequence(f"Ctrl+{position}"), self)
+            shortcut.activated.connect(lambda k=key: self._goto_page(k))
+            self._nav_shortcuts.append(shortcut)
+        for sequence, step in (
+            (QKeySequence("Ctrl+Tab"), 1),
+            (QKeySequence("Ctrl+Shift+Tab"), -1),
+        ):
+            shortcut = QShortcut(sequence, self)
+            shortcut.activated.connect(lambda delta=step: self._cycle_page(delta))
+            self._nav_shortcuts.append(shortcut)
+
+    def _cycle_page(self, delta: int) -> None:
+        keys = getattr(self, "_page_keys", None) or []
+        if not keys:
+            return
+        try:
+            current = keys.index(self.nav.current_key())
+        except ValueError:
+            current = 0
+        self._goto_page(keys[(current + delta) % len(keys)])
+
     def _activate_page(self, key: str) -> None:
         if key not in self._page_index:
             return
@@ -198,17 +239,27 @@ class ModernMainWindow(LegacyMainWindow):
             ((title, desc) for page_key, title, desc in NAV_PAGES if page_key == key),
             ("", ""),
         )
+        # 页头标题可与侧边栏短标签不同（侧栏要短，页头要完整）。
+        title, description = _PAGE_HEADINGS.get(key, (title, description))
         self.page_header.set_page(title, description)
         if key == "health":
             try:
                 self.health_refresh_table()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("health table refresh on page switch failed: %s", e)
         elif key == "history":
             try:
                 self.history_refresh()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("history refresh on page switch failed: %s", e)
+        elif key == "plugins" and getattr(self, "_background_enabled", True):
+            # 构造期不再扫描插件（start_background 契约）；首次进入该页时补扫。
+            try:
+                from .pages.plugins import refresh_plugins_page
+
+                refresh_plugins_page(self, only_if_empty=True)
+            except Exception as e:
+                logger.warning("lazy plugin scan failed: %s", e)
 
     def _on_nav_changed(self, row: int) -> None:
         if 0 <= row < len(self._page_keys):
@@ -283,11 +334,10 @@ class ModernMainWindow(LegacyMainWindow):
 
     # ---- theme -------------------------------------------------------------------
     def _theme_pair(self) -> tuple[str, str]:
-        value = core.get_ui_theme()
-        return (
-            normalize_mode(value.get("mode")),
-            normalize_accent(value.get("accent")),
-        )
+        # 走基类的 token 缓存：_btn() 在构造期被调用数十次，_update_colors /
+        # _apply_model_table_colors 等也高频调用，不必每次都读配置。
+        colors = self._table_colors()
+        return normalize_mode(colors.mode), normalize_accent(colors.accent_name)
 
     def apply_ui_theme(self, mode: str | None = None, accent: str | None = None) -> None:
         stored = core.get_ui_theme()
@@ -298,6 +348,8 @@ class ModernMainWindow(LegacyMainWindow):
             mode_name = normalize_mode(persisted.get("mode"))
             accent_name = normalize_accent(persisted.get("accent"))
         clear_icon_cache()
+        # 主题已确定：让模型表的 token 缓存失效（见 MainWindow._table_colors）。
+        self.invalidate_theme_cache()
         app = QApplication.instance()
         if app is not None:
             apply_application_theme(app, mode_name, accent_name)
@@ -366,15 +418,34 @@ class ModernMainWindow(LegacyMainWindow):
         self.fill_favorites()
 
     def _refresh_key_health(self, provider_names: list[str]) -> None:
-        """Surface silently-disabled API keys so users know to restore them."""
+        """Surface silently-disabled API keys so users know to restore them.
+
+        逐 provider ``core.list_provider_api_keys()`` 可能落到系统密钥库读取，
+        而 ``refresh_dashboard()`` 至少有 8 个调用点（refresh_all、快速接入完成、
+        托盘切换模型、Provider 删除、聊天故障切换…）。节流到 5 秒一次：密钥失效
+        是低频事件，没有必要在每次仪表盘刷新时全量重查。
+        """
+        import time as _time
+
+        now = _time.monotonic()
+        last = getattr(self, "_key_health_checked_at", 0.0)
+        if now - last < 5.0 and getattr(self, "_key_health_invalid", None) is not None:
+            self._apply_key_health_label(self._key_health_invalid)
+            return
         invalid = 0
         for name in provider_names:
             try:
                 for row in core.list_provider_api_keys(name):
                     if str(row.get("status") or "available") != "available":
                         invalid += 1
-            except Exception:
+            except Exception as e:
+                logger.warning("list api keys for %s failed: %s", name, e)
                 continue
+        self._key_health_checked_at = now
+        self._key_health_invalid = invalid
+        self._apply_key_health_label(invalid)
+
+    def _apply_key_health_label(self, invalid: int) -> None:
         if not hasattr(self, "dashboard_provider_metric"):
             return
         label = self.dashboard_provider_metric.label_label
@@ -396,8 +467,9 @@ class ModernMainWindow(LegacyMainWindow):
             self.version_pill.setToolTip(text)
         try:
             self._refresh_update_indicators()
-        except Exception:
-            pass
+        except Exception as e:
+            # 以前静默：更新角标状态与真实状态脱节，且无任何痕迹可查。
+            logger.warning("refresh update indicators failed: %s", e)
 
     # ---- 更新可见性（Pi CLI / Pi Manager 共用） ---------------------------------
     def _update_colors(self):
@@ -586,8 +658,10 @@ class ModernMainWindow(LegacyMainWindow):
 
     # ---- model view model adapters -----------------------------------------------
     def fill_models_table(self) -> None:
+        # 基类现已在建行时直接写入第 0/1 列颜色（注入的 token 与本类一致），
+        # 因此不再需要重建后整树再走一遍 _apply_model_table_colors()；
+        # 该方法只保留给主题切换路径（apply_ui_theme）使用。
         super().fill_models_table()
-        self._apply_model_table_colors()
         self._on_model_selection_changed()
 
     def _apply_model_table_colors(self) -> None:
@@ -617,41 +691,16 @@ class ModernMainWindow(LegacyMainWindow):
                 child.setForeground(0, QColor(colors.accent_text if key == default_key else colors.text))
                 child.setForeground(1, QColor(colors.text_muted))
 
-    def _model_status_cells(self, m: core.ModelInfo):
-        status_text, latency_text, status_color, latency_color, status_tip, _latency_tip = (
-            super()._model_status_cells(m)
-        )
-        colors = tokens_for(*self._theme_pair())
-        result = self.test_results.get(m.key)
-        if not result:
-            return status_text, latency_text, QColor(colors.text_muted), QColor(colors.text_muted), status_tip, ""
-        if result.get("pending"):
-            return status_text, latency_text, QColor(colors.warning), QColor(colors.warning), status_tip, ""
-        available = result.get("available")
-        status_color = QColor(
-            colors.success
-            if available is True
-            else colors.danger
-            if available is False
-            else colors.text_muted
-        )
-        latency = result.get("latency_ms")
-        if isinstance(latency, (int, float)):
-            latency_color = QColor(
-                colors.success
-                if latency < LATENCY_OK_MS
-                else colors.warning
-                if latency < LATENCY_WARN_MS
-                else colors.danger
-            )
-        else:
-            latency_color = QColor(colors.text_muted)
-        return status_text, latency_text, status_color, latency_color, status_tip, ""
+    # NOTE: 这里曾覆写 _model_status_cells，先调 super() 拿文本、再用同一套
+    # token 把父类刚算出的 status_color / latency_color 重新算一遍并丢弃父类
+    # 结果 —— 两份逻辑逐分支等价，纯浪费 N 行 × 一次 core.get_ui_theme()。
+    # 覆写已删除，颜色决策由基类单点完成（token 可注入）。
 
     def _refresh_model_status_colors(self) -> None:
         if not hasattr(self, "models_table"):
             return
         by_key = {model.key: model for model in self.models}
+        colors = tokens_for(*self._theme_pair())
         tree = self.models_table
         for row in range(tree.topLevelItemCount()):
             group = tree.topLevelItem(row)
@@ -666,7 +715,7 @@ class ModernMainWindow(LegacyMainWindow):
                 if model is None:
                     continue
                 status_text, latency_text, status_color, latency_color, status_tip, _ = (
-                    self._model_status_cells(model)
+                    self._model_status_cells(model, colors)
                 )
                 child.setText(3, status_text)
                 child.setText(4, latency_text)

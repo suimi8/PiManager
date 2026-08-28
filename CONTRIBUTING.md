@@ -14,15 +14,19 @@
 | 构建 / 打包 / 发布 | `BUILD.md` |
 | 安全策略与漏洞报告 | `SECURITY.md` |
 | 插件开发者规范 | `docs/PLUGIN_FORMAT.md` |
-| 用户操作说明 | `docs/使用教程.md` |
+| 用户操作说明 | `docs/使用教程.md`（由 `pi_manager/help_docs.py` 生成，勿手改） |
+| 版本变更记录 | `docs/发布说明.md` |
+| 项目介绍与配置目录 | `README.md` |
+| 第三方许可与 LGPL 重新链接说明 | `NOTICE` |
 
 ## 开发环境
+
+工具版本以 `requirements-dev.txt` 为单一来源（CI 装的就是这一份），不要手写 `pip install ruff pytest` —— 否则本地与 CI 会各用一个版本。
 
 ```bash
 git clone https://github.com/suimi8/PiManager.git
 cd PiManager
-python -m pip install -r requirements.txt
-python -m pip install pytest pytest-cov ruff
+python -m pip install -r requirements.txt -r requirements-dev.txt
 python main.py
 python -m pytest tests -q
 ```
@@ -39,7 +43,9 @@ npm install -g @earendil-works/pi-coding-agent
 2. `python -m pytest tests -q` 通过（integration 用例默认排除，需要时 `-m integration`）
 3. `python scripts/check_secrets.py --scan-tests` 无密钥/敏感文件泄漏
 4. `python scripts/check_versions.py` 版本一致（改了版本号时）
-5. 变更尽量附带或更新对应测试（`tests/`）
+5. 变更尽量附带或更新对应测试（`tests/`）；写用户配置的用例**必须**声明 `isolated_home`
+   fixture（仓库根 `conftest.py` 的 autouse 守卫与 `tests/test_plugin_standards.py`
+   的静态门禁会拦住遗漏）
 6. 提交信息遵循 `@<type>: <中文标题>` 前缀约定（见开发规范第 3 节）
 7. 不要提交密钥、`secrets.vault`、本机配置或构建产物（`release-assets/`、`dist/`）
 
@@ -49,6 +55,10 @@ npm install -g @earendil-works/pi-coding-agent
 2. 描述包含：动机、改动点、验证方式
 3. 若影响密钥/导入导出/启动 Pi 路径，请说明兼容性与回归结果
 4. CI 全部 job 通过（test / lint / secret-scan / consistency / extension-test）
+5. PR 描述按 `.github/PULL_REQUEST_TEMPLATE.md` 填写（模板会自动带出）
+
+> 发布路径（tag 推送 / 手动 **Build**）由 `build.yml` 的 `gate` job 强制同一组
+> 门禁（ruff / check_secrets / check_versions），门禁不过不出包。
 
 ## 行为准则
 

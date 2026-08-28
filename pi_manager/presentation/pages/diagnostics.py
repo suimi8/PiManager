@@ -1,7 +1,7 @@
 """Health monitoring, test history, and system tools pages."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -95,7 +95,15 @@ def build_history_page(window) -> QWidget:
         window.history_filter.setClearButtonEnabled(True)
     except Exception:
         pass
-    window.history_filter.textChanged.connect(window.history_refresh)
+    # 防抖：history_refresh 每次都 extras.load_history() 读磁盘 + 重建 200 行表，
+    # 以前按每次击键触发。
+    window._history_filter_debounce = QTimer(window)
+    window._history_filter_debounce.setSingleShot(True)
+    window._history_filter_debounce.setInterval(180)
+    window._history_filter_debounce.timeout.connect(window.history_refresh)
+    window.history_filter.textChanged.connect(
+        lambda _text: window._history_filter_debounce.start()
+    )
     row.addWidget(window.history_filter, 1)
     row.addWidget(window._btn("刷新", window.history_refresh, secondary=True))
     row.addWidget(window._btn("清空历史", window.history_clear, danger=True))

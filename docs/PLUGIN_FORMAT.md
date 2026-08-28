@@ -22,7 +22,8 @@ my-plugin/
 
 `pi` 描述 Pi 要加载的资源，路径都相对于插件根目录；`piManager` 描述 PiManager 用于校验、兼容性检查和风险确认的元数据。两者不要重复维护同一资源路径。
 
-规划中的用户插件安装副本位于：
+用户插件的安装副本位于（已实现并强制，见 `plugin_manager._relative_install_root()` /
+`_validate_install_root_record()`；注册表记录被篡改成其他布局时会被拒绝）：
 
 ```text
 ~/.pi/agent/pimanager/plugins/<id>/<version>/

@@ -52,8 +52,14 @@ def test_apply_preset_unknown_returns_none():
     assert provider_presets.apply_preset("nope") is None
 
 
-def test_upsert_custom_provider_from_preset():
-    """模板可直接喂给 core.upsert_custom_provider 完成一键接入。"""
+def test_upsert_custom_provider_from_preset(isolated_home):
+    """模板可直接喂给 core.upsert_custom_provider 完成一键接入。
+
+    ``isolated_home`` 是必需的：本用例会真实写入 ``models.json`` 并把 API Key 交给
+    安全存储。缺它时会污染开发者真实的 ``~/.pi/agent/`` 与真实 OS keyring
+    （2026-08 审查 P0-1 已实际发生过）。仓库根 ``conftest.py`` 的 autouse 守卫与
+    ``test_plugin_standards.py`` 的静态门禁负责让这类遗漏不再可能。
+    """
     from pi_manager import core
 
     entry = provider_presets.apply_preset("zhipu")

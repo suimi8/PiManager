@@ -11,7 +11,7 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -389,28 +389,25 @@ def build_plugins_page(window) -> QWidget:
     window._plugin_refreshing = False
     window._plugin_operation_keys = set()
     window._plugin_pending_after = []
-    _bind_page_title(window)
-    _refresh(window)
+    # 尊重 MainWindow 的 start_background=False 契约：offscreen 测试与嵌入场景
+    # 构造期不得起线程、不得扫描插件目录。空态给出手动入口即可。
+    if getattr(window, "_background_enabled", True):
+        _refresh(window)
+    else:
+        window.plugins_global_status.setText("点击「刷新」扫描插件状态。")
     return page
 
 
-def _bind_page_title(window) -> None:
-    """在不改动导航配置的前提下，把当前页的壳层标题显示为“插件管理”。"""
-    nav = getattr(window, "nav", None)
-    header = getattr(window, "page_header", None)
-    if nav is None or header is None:
+def refresh_plugins_page(window, *, only_if_empty: bool = False) -> None:
+    """公开入口：触发插件页后台扫描。
+
+    ``only_if_empty=True`` 用于「首次进入该页时补扫」——构造期因
+    ``start_background=False`` 跳过扫描后，页面处于空态，进入时才真正扫描；
+    已有卡片则不重复扫描，避免每次切页都起线程。
+    """
+    if only_if_empty and getattr(window, "_plugin_cards", None):
         return
-
-    def update_title(key: str) -> None:
-        if key == "plugins":
-            header.set_page(
-                "插件管理",
-                "内置 skills / extensions 与用户自定义插件的统一管理。",
-            )
-
-    nav.pageChanged.connect(update_title)
-    if getattr(nav, "current_key", lambda: "")() == "plugins":
-        update_title("plugins")
+    _refresh(window)
 
 
 def _clear_list(window) -> None:
@@ -879,15 +876,29 @@ def _set_card_busy(window, plugin_key: str, text: str) -> None:
 
 
 def _track_worker(window, worker) -> None:
-    """登记 Worker，避免 QThread 运行中被垃圾回收。"""
-    window._active_workers = getattr(window, "_active_workers", [])
-    window._active_workers.append(worker)
-    worker.finished.connect(worker.deleteLater)
+    """登记 Worker：统一并入 WorkerTrackerMixin 的唯一登记表。
+
+    历史上这里维护过独立的 ``window._active_workers`` 列表，而
+    ``_shutdown_background_tasks`` 只遍历 ``window._workers``，导致插件安装 /
+    导入 / 卸载 / npm install 的 QThread 退出时从不被中断或 join —— 运行态析构
+    触发 qFatal，npm install 与插件注册表写入可能被截断。现在只登记一次。
+    """
+    tracker = getattr(window, "_track", None)
+    if callable(tracker):
+        tracker(worker)
+        return
+    # 兜底：window 未使用 WorkerTrackerMixin（嵌入/测试桩）时保持旧行为，
+    # 但仍复用同名列表，便于外部统一收割。
+    workers = getattr(window, "_workers", None)
+    if workers is None:
+        workers = window._workers = []
+    workers.append(worker)
     worker.finished.connect(lambda w=worker: _untrack_worker(window, w))
+    worker.finished.connect(worker.deleteLater)
 
 
 def _untrack_worker(window, worker) -> None:
-    workers = getattr(window, "_active_workers", [])
+    workers = getattr(window, "_workers", None) or []
     try:
         workers.remove(worker)
     except ValueError:
@@ -1149,27 +1160,48 @@ def _add_plugin(window) -> None:
     worker = Worker(_inspect_task, source)
     _track_worker(window, worker)
 
-    def on_done(inspection):
-        error_text = _result_error(inspection)
-        if error_text:
-            QMessageBox.warning(window, "插件检查失败", error_text)
-            window.plugins_global_status.setText(f"插件检查失败：{error_text}")
-            window._plugin_importing = False
-            window.plugins_add_btn.setEnabled(True)
-            return
-        preview = _preview_record(inspection)
-        if not preview:
-            QMessageBox.warning(window, "插件检查失败", "后端没有返回可预览的插件元数据，已停止导入。")
-            window._plugin_importing = False
-            window.plugins_add_btn.setEnabled(True)
-            return
+    def _finish_import(inspection) -> None:
+        """确认流程：在 Worker 槽之外的下一轮事件循环里执行。
+
+        ``_confirm_plugin_import`` 内部是 ``dialog.exec()``，会启动嵌套事件
+        循环；直接在 ``done`` 槽里调用，期间其他插件 Worker 的 done 槽会被
+        投递并执行 —— 包括 ``_refresh`` 的 ``_render_plugin_rows`` 把全部卡片
+        ``deleteLater()`` 并替换 ``window._plugin_cards``。用户看到的预览与随后
+        写入的状态可能已不是同一份数据。
+        """
         trust = _confirm_plugin_import(window, source, inspection)
         if trust is None:
             window.plugins_global_status.setText("已取消插件导入。")
             window._plugin_importing = False
             window.plugins_add_btn.setEnabled(True)
+            _re_enable_btns(window)
             return
         _import_plugin(window, source, trust=bool(trust))
+
+    def on_done(inspection):
+        error_text = _result_error(inspection)
+        if error_text:
+            window.plugins_global_status.setText(f"插件检查失败：{error_text}")
+            window._plugin_importing = False
+            window.plugins_add_btn.setEnabled(True)
+            QTimer.singleShot(
+                0, lambda: QMessageBox.warning(window, "插件检查失败", error_text)
+            )
+            return
+        preview = _preview_record(inspection)
+        if not preview:
+            window._plugin_importing = False
+            window.plugins_add_btn.setEnabled(True)
+            QTimer.singleShot(
+                0,
+                lambda: QMessageBox.warning(
+                    window, "插件检查失败", "后端没有返回可预览的插件元数据，已停止导入。"
+                ),
+            )
+            return
+        # _plugin_importing 保持 True，_re_enable_btns 才能正确识别忙碌态，
+        # 避免确认框还开着时按钮被其他回调提前放开。
+        QTimer.singleShot(0, lambda: _finish_import(inspection))
 
     def on_failed(error_text):
         window._plugin_importing = False

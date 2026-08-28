@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import zipfile
 
+import pytest
+
 from pi_manager import core
 from pi_manager import extras
 from pi_manager import secrets as secretstore
@@ -130,3 +132,51 @@ def test_command_style_api_key_is_kept(isolated_home, tmp_path, monkeypatch):
     files = _read_bundle(dest)
     exported = json.loads(files["models.json"].decode("utf-8"))
     assert exported["providers"]["Cmd"]["apiKey"] == "!credential-helper get"
+
+
+def test_uppercase_key_is_not_exported_as_env_reference(isolated_home, tmp_path):
+    """R2 P1-2（已实证）：全大写形态的真实 Key 曾被当成环境变量名，原封不动写进
+    未加密导出 ZIP 的 models.json —— 直接违反承诺 P2 与 P5。
+    """
+    aws_style = "AKIAIOSFODNN7EXAMPLE"
+    _write_models_with_plaintext_key(aws_style)
+    dest = tmp_path / "config.zip"
+    extras.export_config_bundle(str(dest))
+
+    assert aws_style.encode() not in dest.read_bytes()
+    files = _read_bundle(dest)
+    exported = json.loads(files["models.json"].decode("utf-8"))
+    assert exported["providers"]["Demo"]["apiKey"] == (
+        secretstore.provider_api_key_reference("Demo")
+    )
+    credential = secretstore.get_active_provider_credential("Demo")
+    assert credential is not None and credential["value"] == aws_style
+
+
+def test_export_fails_closed_when_a_known_secret_reaches_a_plain_member(
+    isolated_home, tmp_path
+):
+    """承诺 P5 的最后一道闸：承诺此前完全依赖 `referenced_env_name` 的判断，一旦
+    该判断出错（P1-2 就是实例）明文就直接进了 ZIP。这里用安全存储里的真实值做
+    精确比对，命中即拒绝导出。用例取一个逃过 header 名脱敏白名单的自定义头。
+    """
+    leaked = "sk-plaintext-leak-in-header"
+    secretstore.replace_provider_api_keys("Demo", [leaked])
+    models = {
+        "providers": {
+            "Demo": {
+                "baseUrl": "https://example.invalid/v1",
+                "apiKey": secretstore.provider_api_key_reference("Demo"),
+                "headers": {"X-Custom-Auth-Value": leaked},
+                "models": [],
+            }
+        }
+    }
+    core.ensure_agent_dir()
+    core.models_path().write_text(json.dumps(models), encoding="utf-8")
+
+    dest = tmp_path / "leak.zip"
+    with pytest.raises(ValueError, match="导出被中止"):
+        extras.export_config_bundle(str(dest))
+    assert not dest.exists()
+
