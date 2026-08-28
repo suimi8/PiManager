@@ -685,7 +685,7 @@ def test_managed_model_http_test_rotates_to_second_key(
     ]
 
 
-def test_google_model_fetch_uses_real_key_but_redacts_result_endpoint(monkeypatch):
+def test_google_model_fetch_uses_real_key_but_redacts_result_endpoint(monkeypatch, isolated_home):
     requested: list[str] = []
     sent_headers: list[dict[str, str]] = []
 

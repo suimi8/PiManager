@@ -163,7 +163,7 @@ def test_launch_keeps_reachable_proxy_vars(monkeypatch, tmp_path):
     assert calls[0][1]["env"]["HTTPS_PROXY"] == "http://127.0.0.1:7890"
 
 
-def test_launch_macos_wrapper_omits_unreachable_proxy(monkeypatch, tmp_path):
+def test_launch_macos_wrapper_omits_unreachable_proxy(monkeypatch, tmp_path, isolated_home):
     calls = []
     wrapper_dir = tmp_path / "pi-manager-wrapper-dir"
     wrapper_dir.mkdir()

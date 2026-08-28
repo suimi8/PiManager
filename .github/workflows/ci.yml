@@ -93,6 +93,8 @@ jobs:
         if [ $code -ne 0 ]; then
           echo "::error file=pytest.log::pytest failed with exit $code"
           grep -E "^(FAILED|ERROR)" _pytest.log | head -n 20 | sed 's/^/::error file=pytest.log::/'
+          echo "::error file=pytest.log::---- FAILED traceback ----"
+          sed -n '/^FAILED/,+14p' _pytest.log | head -n 120 | sed 's/^/::error file=pytest.log::/'
           echo "::error file=pytest.log::---- tail ----"
           tail -n 40 _pytest.log | sed 's/^/::error file=pytest.log::/'
           exit $code
@@ -109,6 +111,8 @@ jobs:
         if [ $code -ne 0 ]; then
           echo "::error file=pytest.log::pytest failed with exit $code"
           grep -E "^(FAILED|ERROR)" _pytest.log | head -n 20 | sed 's/^/::error file=pytest.log::/'
+          echo "::error file=pytest.log::---- FAILED traceback ----"
+          sed -n '/^FAILED/,+14p' _pytest.log | head -n 120 | sed 's/^/::error file=pytest.log::/'
           echo "::error file=pytest.log::---- tail ----"
           tail -n 40 _pytest.log | sed 's/^/::error file=pytest.log::/'
           exit $code
