@@ -141,7 +141,11 @@ jobs:
           set -e
           if [ $code -ne 0 ]; then
             echo "::error file=npm.log::npm test failed with exit $code"
-            tail -n 40 _npm.log | sed 's/^/::error file=npm.log::/'
+            grep -E "not ok|✖|AssertionError|expected|actual" _npm.log | head -n 25 | sed 's/^/::error file=npm.log::/'
+            echo "::error file=npm.log::---- head ----"
+            head -n 15 _npm.log | sed 's/^/::error file=npm.log::/'
+            echo "::error file=npm.log::---- tail ----"
+            tail -n 25 _npm.log | sed 's/^/::error file=npm.log::/'
             exit $code
           fi
 
