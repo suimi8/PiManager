@@ -12,4 +12,4 @@ pytest-cov==7.1.0
 # 因为未知参数直接报错。
 pytest-timeout==2.4.0
 # 构建工具（本地打包与 CI 的 build / nightly-packaging job）
-PyInstaller==6.19.0
+PyInstaller==6.22.2
