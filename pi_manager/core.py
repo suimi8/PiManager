@@ -77,6 +77,7 @@ from .core_process import (
     redact_proxy_url,
     run_pi,
     sanitize_proxy_env,
+    strip_pyinstaller_runtime_env,
     validate_launch_tokens,
     validate_proxy_url,
 )

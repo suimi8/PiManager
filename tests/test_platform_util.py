@@ -112,6 +112,34 @@ def test_cmd_launch_creates_console_without_nested_shell(monkeypatch, tmp_path):
     assert result.startswith("cmd:")
 
 
+def test_launch_strips_pyinstaller_runtime_vars(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(platform_util, "is_windows", lambda: True)
+    monkeypatch.setattr(platform_util, "is_macos", lambda: False)
+    monkeypatch.setattr(platform_util.shutil, "which", lambda name: None)
+    monkeypatch.setattr(core, "proxy_reachable", lambda url, timeout=0.4: True)
+    monkeypatch.setattr(
+        platform_util.subprocess,
+        "Popen",
+        lambda args, **kwargs: calls.append((args, kwargs)),
+    )
+    monkeypatch.setenv("_PYI_ARCHIVE_FILE", r"E:\dist\PiManager.exe")
+    monkeypatch.setenv("_PYI_PARENT_PROCESS_LEVEL", "1")
+
+    platform_util.launch_in_terminal(
+        ["pi"],
+        str(tmp_path),
+        terminal="auto",
+        env={"KEEP": "1"},
+    )
+
+    assert calls
+    child_env = calls[0][1]["env"]
+    assert child_env["KEEP"] == "1"
+    assert "_PYI_ARCHIVE_FILE" not in child_env
+    assert "_PYI_PARENT_PROCESS_LEVEL" not in child_env
+
+
 def test_launch_drops_unreachable_proxy_vars(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(platform_util, "is_windows", lambda: True)
@@ -200,6 +228,49 @@ def test_launch_macos_wrapper_omits_unreachable_proxy(monkeypatch, tmp_path, iso
     content = wrapper.read_text(encoding="utf-8")
     assert "HTTPS_PROXY" not in content
     assert "export KEEP=1" in content
+    assert calls
+
+
+def test_launch_macos_wrapper_unsets_pyinstaller_runtime_vars(
+    monkeypatch, tmp_path, isolated_home
+):
+    calls = []
+    wrapper_dir = tmp_path / "pi-manager-wrapper-dir"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "wrapper.sh"
+    monkeypatch.setattr(platform_util, "is_windows", lambda: False)
+    monkeypatch.setattr(platform_util, "is_macos", lambda: True)
+    monkeypatch.setattr(core, "proxy_reachable", lambda url, timeout=0.4: True)
+    monkeypatch.setenv("_PYI_ARCHIVE_FILE", "/tmp/PiManager")
+    monkeypatch.setenv("KEEP", "1")
+
+    def fake_mkdtemp(prefix):
+        return str(wrapper_dir)
+
+    def fake_popen(args, **kwargs):
+        calls.append((args, kwargs))
+
+        class _FakeProc:
+            returncode = 0
+            pid = 12345
+
+        return _FakeProc()
+
+    monkeypatch.setattr(os, "fchmod", lambda fd, mode: None, raising=False)
+    monkeypatch.setattr(platform_util.tempfile, "mkdtemp", fake_mkdtemp)
+    monkeypatch.setattr(platform_util.subprocess, "Popen", fake_popen)
+
+    platform_util.launch_in_terminal(
+        ["pi"],
+        str(tmp_path),
+        terminal="auto",
+        env={"KEEP": "1", "NEW_SECRET": "x"},
+    )
+
+    content = wrapper.read_text(encoding="utf-8")
+    assert "unset _PYI_ARCHIVE_FILE" in content
+    assert "export _PYI_ARCHIVE_FILE" not in content
+    assert "export NEW_SECRET=x" in content
     assert calls
 
 

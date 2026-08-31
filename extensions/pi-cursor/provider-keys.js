@@ -100,9 +100,14 @@ async function runWithProviderKeyFailover({ resolveCredential, markFailed, run }
   }
 }
 
+function markFailedHelperArgs(keyId) {
+  return ["--mark-failed", "--key-id", String(keyId)];
+}
+
 module.exports = {
   REASON_MAX_BYTES,
   classificationSignal,
+  markFailedHelperArgs,
   runWithProviderKeyFailover,
   truncateReasonBytes,
 };

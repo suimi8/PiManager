@@ -428,6 +428,23 @@ def sanitize_proxy_env(env: dict[str, str]) -> dict[str, str]:
     return result
 
 
+def is_pyinstaller_runtime_key(key: str) -> bool:
+    """Return True for PyInstaller bootloader bookkeeping variables."""
+    return key.startswith("_PYI_") or key == "PYINSTALLER_RESET_ENVIRONMENT"
+
+
+def strip_pyinstaller_runtime_env(env: dict[str, str]) -> dict[str, str]:
+    """Drop bootloader bookkeeping so a child is not treated as our worker.
+
+    Frozen onefile PiManager puts ``_PYI_*`` into ``os.environ``. Copying that
+    into ``pi`` / a terminal / a later ``PiManager.exe`` helper makes the
+    bootloader inherit the GUI instance. If the real parent is Cursor, node,
+    or cmd, PyInstaller 6.22+ aborts with
+    ``Security validation failure: parent process has different executable``.
+    """
+    return {key: value for key, value in env.items() if not is_pyinstaller_runtime_key(key)}
+
+
 def run_pi(
     args: list[str],
     *,

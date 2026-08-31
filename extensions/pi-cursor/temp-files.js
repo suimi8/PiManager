@@ -3,6 +3,8 @@
 // helper 的请求/响应临时文件里含明文 API Key 与 broker token。正常路径由
 // finally 删除，但宿主崩溃/强杀会留下残留 —— 兜底清理必须真正扫描目录，
 // 而不是遍历本进程刚初始化的空集合。
+const fs = require("fs");
+
 const TEMP_PREFIXES = Object.freeze(["pi-manager-env-", "pi-manager-config-"]);
 const DEFAULT_MAX_AGE_MS = 60 * 60 * 1000;
 
@@ -48,9 +50,36 @@ function staleTempFiles({
   return stale;
 }
 
+// 与 Python provider_env._shred_file / main.py:_shred_request_file 对齐：
+// 先零覆盖再 unlink。只处理普通文件，不跟随符号链接。
+function shredAndUnlink(file) {
+  try {
+    const info = fs.lstatSync(file);
+    if (!info.isFile()) return false;
+    if (info.size > 0) {
+      const fd = fs.openSync(file, "r+");
+      try {
+        fs.writeSync(fd, Buffer.alloc(info.size, 0), 0, info.size, 0);
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
+  } catch {
+    // 文件可能已被 helper 擦除，仍尝试 unlink。
+  }
+  try {
+    fs.unlinkSync(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 module.exports = {
   DEFAULT_MAX_AGE_MS,
   TEMP_PREFIXES,
   isHelperTempName,
+  shredAndUnlink,
   staleTempFiles,
 };

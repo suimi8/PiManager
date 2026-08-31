@@ -21,7 +21,11 @@ const { classificationSignal, runWithProviderKeyFailover } = require("../provide
 const { updateFailureCount } = require("../failover");
 const { PiRpcSession } = require("../rpc-session");
 const { RpcChatManager, retainRecentProviderEnvs } = require("../rpc-chat");
-const { resolveExecutablePath } = require("../invocation");
+const {
+  frozenRuntimeOverlay,
+  resolveExecutablePath,
+  sanitizeFrozenRuntimeEnv,
+} = require("../invocation");
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -91,6 +95,34 @@ test("Windows integrity is enforced by path judgement, not by skipping the check
     windowsPathAllows("C:\\tools\\pi.exe", { env: WIN_ENV, lstatFile: () => undefined, realPath: () => undefined }),
     true
   );
+});
+
+test("sanitizeFrozenRuntimeEnv drops bootloader vars and forces reset", () => {
+  const cleaned = sanitizeFrozenRuntimeEnv({
+    PATH: "/bin",
+    KEEP: "1",
+    _PYI_ARCHIVE_FILE: "E:\\\\dist\\\\PiManager.exe",
+    _PYI_APPLICATION_HOME_DIR: "C:\\\\Temp\\\\_MEI123",
+    _PYI_PARENT_PROCESS_LEVEL: "1",
+    PYINSTALLER_RESET_ENVIRONMENT: "0",
+    PI_MANAGER_PROVIDER_X_API_KEY: "sk-test",
+  });
+  assert.equal(cleaned.KEEP, "1");
+  assert.equal(cleaned.PI_MANAGER_PROVIDER_X_API_KEY, "sk-test");
+  assert.equal(cleaned.PYINSTALLER_RESET_ENVIRONMENT, "1");
+  assert.equal(cleaned._PYI_ARCHIVE_FILE, undefined);
+  assert.equal(cleaned._PYI_APPLICATION_HOME_DIR, undefined);
+  assert.equal(cleaned._PYI_PARENT_PROCESS_LEVEL, undefined);
+});
+
+test("frozenRuntimeOverlay blanks inherited _PYI_ keys for VS Code terminals", () => {
+  const overlay = frozenRuntimeOverlay(
+    { TOKEN: "secret" },
+    { PATH: "/bin", _PYI_ARCHIVE_FILE: "E:\\\\dist\\\\PiManager.exe" }
+  );
+  assert.equal(overlay.TOKEN, "secret");
+  assert.equal(overlay.PYINSTALLER_RESET_ENVIRONMENT, "1");
+  assert.equal(overlay._PYI_ARCHIVE_FILE, "");
 });
 
 test("cross-user writable roots are derived from the environment", () => {

@@ -12,7 +12,7 @@ import os
 import subprocess
 import sys
 
-from .core import sanitize_proxy_env
+from .core import sanitize_proxy_env, strip_pyinstaller_runtime_env
 
 
 def create_no_window_flag() -> int:
@@ -33,7 +33,9 @@ def spawn_env(
 
     ``sanitize_proxy_env`` drops proxy env vars that point at unreachable
     endpoints (a configured-but-stopped proxy would otherwise break every
-    child request with "Connection error").
+    child request with "Connection error"). Frozen onefile bookkeeping
+    (``_PYI_*``) is always stripped so a later ``PiManager.exe`` helper is
+    not treated as a worker of this GUI process.
 
     - ``sanitize_after_merge=True`` mirrors ``core.run_pi``: merge extras
       first, then drop unreachable proxy vars (a proxy var inside extras is
@@ -46,8 +48,9 @@ def spawn_env(
         env = os.environ.copy()
         if extra:
             env.update(extra)
-        return sanitize_proxy_env(env)
-    env = sanitize_proxy_env(os.environ.copy())
-    if extra:
-        env.update(extra)
-    return env
+        env = sanitize_proxy_env(env)
+    else:
+        env = sanitize_proxy_env(os.environ.copy())
+        if extra:
+            env.update(extra)
+    return strip_pyinstaller_runtime_env(env)

@@ -6,15 +6,24 @@ const https = require("https");
 const crypto = require("crypto");
 const { execFile } = require("child_process");
 const { chatWithFailover, normalizeModelPair, parseModelKey } = require("./failover");
-const { commandParts, resolveCommand, resolveExecutablePath } = require("./invocation");
+const {
+  commandParts,
+  frozenRuntimeOverlay,
+  resolveCommand,
+  resolveExecutablePath,
+  sanitizeFrozenRuntimeEnv,
+} = require("./invocation");
 const {
   pathIntegrityAllows,
   registeredHelperCommand,
+  trustedHelperCommand,
   withHelperMode,
 } = require("./helper-discovery");
+const { appendValidatedLaunchArgs, validateLaunchTokens } = require("./launch-tokens");
 const { proxyEnvFromManagerConfig } = require("./proxy-env");
 const {
   REASON_MAX_BYTES,
+  markFailedHelperArgs,
   runWithProviderKeyFailover,
   truncateReasonBytes,
 } = require("./provider-keys");
@@ -22,7 +31,7 @@ const { RpcChatManager } = require("./rpc-chat");
 const { SecretRegistry } = require("./redaction");
 const { vsixUpdateInfo } = require("./release");
 const { RpcRuntimeGate } = require("./rpc-runtime");
-const { isHelperTempName, staleTempFiles } = require("./temp-files");
+const { isHelperTempName, shredAndUnlink, staleTempFiles } = require("./temp-files");
 const {
   requireTrustedExecution,
   trustedConfigurationValue,
@@ -57,24 +66,7 @@ const corruptConfigFiles = new Set();
 // main.py:_shred_request_file / provider_env._shred_file 对齐，先零覆盖再删。
 // 只处理普通文件（lstat + isFile）：不跟随符号链接，避免被诱导去覆盖别的文件。
 function shredTempFile(file) {
-  try {
-    const info = fs.lstatSync(file);
-    if (!info.isFile()) return;
-    if (info.size > 0) {
-      const fd = fs.openSync(file, "r+");
-      try {
-        fs.writeSync(fd, Buffer.alloc(info.size, 0), 0, info.size, 0);
-        fs.fsyncSync(fd);
-      } finally {
-        fs.closeSync(fd);
-      }
-    }
-  } catch {
-    // 文件可能已被 helper 擦除删除（Python 侧也会 shred），忽略。
-  }
-  try {
-    fs.unlinkSync(file);
-  } catch {}
+  shredAndUnlink(file);
 }
 
 // 一次性临时文件的统一回收：从 ownedTempFiles 摘除并零覆盖删除。
@@ -283,10 +275,14 @@ async function setDefaultModel(provider, model, thinking) {
   const settings = readSettings();
   const cfg = vscode.workspace.getConfiguration("pi");
   const mgr = readManagerConfig();
+  const thinkingValue = thinking ? String(thinking) : String(settings.defaultThinkingLevel || "");
+  const tokenArgs = ["--provider", p, "--model", m];
+  if (thinkingValue) tokenArgs.push("--thinking", thinkingValue);
+  validateLaunchTokens(tokenArgs);
   await invokeConfigBroker("set_default_model", {
     provider: p,
     model: m,
-    thinking: thinking ? String(thinking) : String(settings.defaultThinkingLevel || ""),
+    thinking: thinkingValue,
     sync_enabled: cfg.get("syncEnabledModelsOnSwitch") !== false,
     favorites: Array.isArray(mgr.favorites) ? mgr.favorites.map(String) : [],
   });
@@ -339,7 +335,11 @@ function managerHelperCommand(mode) {
     executableConfiguration("providerEnvCommand", "") || process.env.PI_MANAGER_ENV_HELPER || ""
   ).trim();
   if (configured) {
-    return withHelperMode(commandParts(configured), mode);
+    const trusted = trustedHelperCommand(commandParts(configured));
+    if (!trusted) {
+      throw new Error("pi.providerEnvCommand 未通过路径完整性校验，已拒绝启动 helper");
+    }
+    return withHelperMode(trusted, mode);
   }
 
   const registered = registeredHelperCommand();
@@ -415,7 +415,7 @@ function invokeConfigBroker(operation, args) {
       execFile(
         bin,
         [...baseArgs, requestPath, "--output", responsePath],
-        { windowsHide: true, timeout: 20000 },
+        { windowsHide: true, timeout: 20000, env: sanitizeFrozenRuntimeEnv(process.env) },
         (error, stdout) => {
           let payload;
           let parseError = null;
@@ -528,7 +528,12 @@ function invokeProviderHelper(provider, helperArgs = [], { reason = null } = {})
         ...helperArgs,
         provider,
       ],
-      { windowsHide: true, timeout: 20000, cwd: path.dirname(command[1] || __dirname) },
+      {
+        windowsHide: true,
+        timeout: 20000,
+        cwd: path.dirname(command[1] || __dirname),
+        env: sanitizeFrozenRuntimeEnv(process.env),
+      },
       (err, stdout, stderr) => {
         let payload;
         try {
@@ -584,30 +589,12 @@ function resolveProviderEnv(provider) {
   return resolveProviderCredential(provider).then((credential) => credential.env);
 }
 
-// --reason 会进入 helper 的进程命令行，而命令行在所有主流系统上都是**非特权
-// 可读**的（Linux /proc/<pid>/cmdline、Windows Win32_Process.CommandLine、
-// macOS ps -ww）。Python 侧 secrets.py:893-901 确实脱敏，但那发生在进程内、
-// 在参数已经暴露之后（审查报告 P2-2）。这里在进入 argv 之前先做一次与
-// Python core_http.py:redact_secret_values 同构的本地脱敏。
-// 长度上限改成与 provider-keys.js 的分类信号一致（400，即 Python
-// _sanitize_reason 的截断值），不再在 200 字符处把 401/429 标志切掉
-//（审查报告 P2-3 / D1）。彻底移出 argv 需要 helper 支持文件/stdin 通道。
-function sanitizeFailureReason(reason) {
-  const redacted = secretRegistry.redact(String(reason || ""));
-  return redacted.length > CLASSIFICATION_SIGNAL_LIMIT
-    ? redacted.slice(-CLASSIFICATION_SIGNAL_LIMIT)
-    : redacted;
-}
-
+// 失败原因走 --reason-file，不再进入 argv（命令行在各平台对同用户可读）。
 function markProviderKeyFailed(provider, keyId, reason) {
   if (!provider || !keyId) return Promise.resolve({ marked: false, hasAvailable: false });
-  return invokeProviderHelper(provider, [
-    "--mark-failed",
-    "--key-id",
-    String(keyId),
-    "--reason",
-    sanitizeFailureReason(reason),
-  ]).then((payload) => ({
+  return invokeProviderHelper(provider, markFailedHelperArgs(keyId), {
+    reason: secretRegistry.redact(String(reason || "")),
+  }).then((payload) => ({
     marked: Boolean(payload.marked),
     status: String(payload.status || ""),
     failureKind: String(payload.failure_kind || ""),
@@ -616,10 +603,23 @@ function markProviderKeyFailed(provider, keyId, reason) {
   }));
 }
 
+function requireTrustedExecutablePath(target, label) {
+  const text = String(target || "").trim();
+  if (!text) return text;
+  if (!/[\\/]/.test(text) && !/^[A-Za-z]:/.test(text)) return text;
+  if (!pathIntegrityAllows(text, { allowRoot: true })) {
+    throw new Error(`${label}未通过路径完整性校验`);
+  }
+  return text;
+}
+
 function findPiCommand() {
   requireTrustedExecution(vscode.workspace);
   const custom = String(executableConfiguration("command", "pi") || "pi").trim();
-  if (custom && custom !== "pi") return custom;
+  if (custom && custom !== "pi") {
+    requireTrustedExecutablePath(custom, "pi.command");
+    return custom;
+  }
 
   const appdata = process.env.APPDATA || "";
   const cliCandidates = [
@@ -628,6 +628,7 @@ function findPiCommand() {
   ];
   for (const cli of cliCandidates) {
     if (fs.existsSync(cli)) {
+      requireTrustedExecutablePath(cli, "Pi CLI");
       return { kind: "node-cli", cli };
     }
   }
@@ -636,9 +637,11 @@ function findPiCommand() {
     path.join(appdata, "npm", "pi"),
   ];
   for (const candidate of candidates) {
-    if (candidate && fs.existsSync(candidate)) return candidate;
+    if (candidate && fs.existsSync(candidate)) {
+      requireTrustedExecutablePath(candidate, "Pi 可执行文件");
+      return candidate;
+    }
   }
-  // 兜底：把裸名 "pi" 解析成 PATH 上的绝对路径，不再依赖 libuv 的搜索顺序。
   return resolveExecutablePath("pi");
 }
 
@@ -690,9 +693,9 @@ function buildLaunchSpec({ withDefaults = true, prompt = null, provider = null, 
   if (cfg.get("appendChinesePrompt") !== false) {
     args.push("--append-system-prompt", ZH_PROMPT);
   }
-  args.push(...extra);
-  if (prompt) args.push("-p", "--approve", "--no-session", String(prompt));
-  return { executable: invocation.bin, args };
+  const merged = appendValidatedLaunchArgs(args, extra);
+  if (prompt) merged.push("-p", "--approve", "--no-session", String(prompt));
+  return { executable: invocation.bin, args: merged };
 }
 
 function resolveCwd(folderUri) {
@@ -719,7 +722,7 @@ function openPiTerminal(title, spec, cwd, env = {}) {
   const term = vscode.window.createTerminal({
     name: title,
     cwd,
-    env,
+    env: frozenRuntimeOverlay(env),
     shellPath: processSpec.executable,
     shellArgs: processSpec.args,
   });
@@ -903,7 +906,7 @@ function buildRpcSpawnSpec({ env, provider, model, sessionId, cwd }) {
   if (cfg.get("appendChinesePrompt") !== false) {
     args.push("--append-system-prompt", ZH_PROMPT);
   }
-  args.push(...commandParts(executableConfiguration("extraArgs", "")));
+  args = appendValidatedLaunchArgs(args, commandParts(executableConfiguration("extraArgs", "")));
   args.push("--session-id", sessionId, "-n", "Cursor 快速提问");
   if (process.platform === "win32" && /\.(cmd|bat)$/i.test(String(bin))) {
     const command = [shellQuote(String(bin), true), ...args.map((arg) => shellQuote(String(arg), true))].join(" ");
@@ -914,7 +917,7 @@ function buildRpcSpawnSpec({ env, provider, model, sessionId, cwd }) {
     executable: bin,
     args,
     cwd,
-    env: { ...process.env, ...managerProxyEnvSafe(), ...env },
+    env: sanitizeFrozenRuntimeEnv({ ...process.env, ...managerProxyEnvSafe(), ...env }),
   };
 }
 
@@ -983,7 +986,8 @@ function runPiPrompt(prompt, provider, model, cwd) {
   if (cfg.get("appendChinesePrompt") !== false) {
     args.push("--append-system-prompt", ZH_PROMPT);
   }
-  args.push(...extra, "-p", "--approve", "--no-session", prompt);
+  const merged = appendValidatedLaunchArgs(args, extra);
+  merged.push("-p", "--approve", "--no-session", prompt);
 
   return runWithProviderKeyFailover({
     resolveCredential: () => resolveProviderCredential(attemptProvider),
@@ -994,14 +998,14 @@ function runPiPrompt(prompt, provider, model, cwd) {
         const started = Date.now();
         const options = {
           cwd,
-          env: { ...process.env, ...proxyEnv, ...providerEnv },
+          env: sanitizeFrozenRuntimeEnv({ ...process.env, ...proxyEnv, ...providerEnv }),
           windowsHide: true,
           timeout: 180000,
           maxBuffer: 16 * 1024 * 1024,
           encoding: "utf8",
         };
         let runBin = bin;
-        let runArgs = [...args];
+        let runArgs = [...merged];
         if (process.platform === "win32" && /\.(cmd|bat)$/i.test(String(runBin))) {
           const command = [shellQuote(String(runBin), true), ...runArgs.map((arg) => shellQuote(String(arg), true))].join(" ");
           runBin = process.env.ComSpec || "cmd.exe";
@@ -1154,7 +1158,11 @@ function cmdCheckVersion() {
   const bin = invocation.bin;
   const args = [...invocation.args, "-v"];
 
-  execFile(bin, args, { windowsHide: true, timeout: 20000 }, (err, stdout, stderr) => {
+  execFile(
+    bin,
+    args,
+    { windowsHide: true, timeout: 20000, env: sanitizeFrozenRuntimeEnv(process.env) },
+    (err, stdout, stderr) => {
     if (err) {
       vscode.window
         .showErrorMessage(`未检测到 Pi：${err.message}。是否打开安装说明？`, "复制安装命令")
@@ -1558,12 +1566,7 @@ function cleanupStaleTempFiles() {
   });
   let removed = 0;
   for (const name of stale) {
-    try {
-      fs.unlinkSync(path.join(dir, name));
-      removed += 1;
-    } catch {
-      // 文件可能刚被别的宿主删掉，忽略
-    }
+    if (shredAndUnlink(path.join(dir, name))) removed += 1;
   }
   return removed;
 }
@@ -1573,9 +1576,7 @@ function purgeOwnedTempFiles() {
   for (const file of [...ownedTempFiles]) {
     ownedTempFiles.delete(file);
     if (!isHelperTempName(path.basename(file))) continue;
-    try {
-      fs.unlinkSync(file);
-    } catch {}
+    shredAndUnlink(file);
   }
 }
 

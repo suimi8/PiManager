@@ -61,8 +61,45 @@ function resolveCommand(command, pathExists = () => false) {
   return { bin: parts[0], args: parts.slice(1) };
 }
 
+const PYINSTALLER_RESET_ENVIRONMENT = "PYINSTALLER_RESET_ENVIRONMENT";
+
+function isPyinstallerRuntimeKey(key) {
+  return key === PYINSTALLER_RESET_ENVIRONMENT || String(key).startsWith("_PYI_");
+}
+
+// Packaged PiManager.exe (onefile) writes _PYI_* into its own environment.
+// Cursor started from that process tree still has them. execFile inherits
+// process.env by default, so a helper launch looks like a worker of the GUI
+// instance; the bootloader then sees Cursor.exe as parent and aborts with
+// "parent process has different executable". Strip the bookkeeping and mark
+// the child as an independent frozen instance.
+function sanitizeFrozenRuntimeEnv(env) {
+  const cleaned = {};
+  for (const [key, value] of Object.entries(env || {})) {
+    if (isPyinstallerRuntimeKey(key)) continue;
+    if (value === undefined || value === null) continue;
+    cleaned[key] = String(value);
+  }
+  cleaned[PYINSTALLER_RESET_ENVIRONMENT] = "1";
+  return cleaned;
+}
+
+// VS Code createTerminal overlays onto the host env instead of replacing it,
+// so omitted _PYI_* keys would still be inherited. Blank them and set RESET.
+function frozenRuntimeOverlay(extra = {}, ambient = process.env) {
+  const overlay = { ...extra };
+  for (const key of Object.keys(ambient || {})) {
+    if (String(key).startsWith("_PYI_")) overlay[key] = "";
+  }
+  overlay[PYINSTALLER_RESET_ENVIRONMENT] = "1";
+  return overlay;
+}
+
 module.exports = {
   commandParts,
+  frozenRuntimeOverlay,
+  isPyinstallerRuntimeKey,
   resolveCommand,
   resolveExecutablePath,
+  sanitizeFrozenRuntimeEnv,
 };

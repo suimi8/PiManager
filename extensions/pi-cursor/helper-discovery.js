@@ -218,6 +218,21 @@ function withHelperMode(command, mode) {
   return parts;
 }
 
+// 手工配置的 helper（pi.providerEnvCommand / PI_MANAGER_ENV_HELPER）与注册表
+// 同一套路径完整性：可执行文件必须是常规文件、非 UNC、不在跨用户可写目录。
+// 配置了但未通过校验时返回 null，由调用方决定是报错还是回退注册表。
+function trustedHelperCommand(parts, options = {}) {
+  if (!Array.isArray(parts) || !parts.length) return null;
+  const command = parts.map((part) => String(part || "").trim());
+  if (command.some((part) => !part)) return null;
+  const checkOptions = { allowRoot: true, ...options };
+  if (!pathIntegrityAllows(command[0], checkOptions)) return null;
+  if (command.length > 1 && /\.py$/i.test(command[1])) {
+    if (!pathIntegrityAllows(command[1], checkOptions)) return null;
+  }
+  return command;
+}
+
 module.exports = {
   crossUserWritableRoots,
   helperRegistryPath,
@@ -225,6 +240,7 @@ module.exports = {
   pathIntegrityAllows,
   registeredHelperCommand,
   statAllows,
+  trustedHelperCommand,
   windowsPathAllows,
   withHelperMode,
 };

@@ -236,6 +236,11 @@ def main() -> int:
         print(f"expected version: {expected_version}")
 
     env = os.environ.copy()
+    # A developer shell started from packaged PiManager still carries _PYI_*;
+    # the onefile bootloader would then treat this smoke launch as a worker.
+    for key in [name for name in env if name.startswith("_PYI_")]:
+        env.pop(key, None)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     # Headless-friendly Qt backend for CI / servers.
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
     env.setdefault("QT_OPENGL", "software")

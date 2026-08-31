@@ -704,7 +704,7 @@ def launch_in_terminal(
     terminal: str = "auto",
     env: dict[str, str] | None = None,
 ) -> str:
-    from .core import proxy_reachable
+    from .core import proxy_reachable, strip_pyinstaller_runtime_env
 
     workdir = str(Path(workdir).expanduser())
     Path(workdir).mkdir(parents=True, exist_ok=True)
@@ -722,6 +722,9 @@ def launch_in_terminal(
         value = full_env.get(var)
         if value and not proxy_reachable(value):
             full_env.pop(var, None)
+    # Frozen onefile bookkeeping must not leak into pi / terminals; a later
+    # PiManager.exe helper would then fail parent-exe validation.
+    full_env = strip_pyinstaller_runtime_env(full_env)
     mode = (terminal or "auto").lower()
     if is_windows():
         return _launch_windows(argv, workdir, mode, full_env)
@@ -840,6 +843,12 @@ def _launch_macos(argv: list[str], workdir: str, mode: str, env: dict[str, str])
                 if not key or not key.replace("_", "").isalnum():
                     continue
                 lines.append(f"export {key}={shlex.quote(value)}")
+            # Terminal.app may already be running with leaked _PYI_* from a
+            # previous frozen launch; the wrapper only exports diffs, so
+            # explicitly drop bootloader bookkeeping.
+            for key in os.environ:
+                if key.startswith("_PYI_") and key.replace("_", "").isalnum():
+                    lines.append(f"unset {key}")
             lines.extend(
                 [
                     'rm -f -- "$0" 2>/dev/null || true',
