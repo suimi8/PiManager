@@ -153,3 +153,34 @@ git push origin v1.8.8
 - 不要把本机 `~/.pi/agent` 配置、密钥库打进安装包
 - 二进制与 VSIX 的本地发布产物统一写入项目根目录 `release-assets/`，再由 CI 上传到 GitHub Releases
 - Apple 正式签名/公证需额外 Developer ID 证书（可选增强，不是独立运行的硬性条件）
+
+## 代码签名（可选）
+
+产物签名是公开发布的前提（Windows SmartScreen 拦截「未知发布者」，macOS
+Gatekeeper 拦截 ad-hoc 签名包），但需要真实证书，未配置时不阻塞本地/内部发布。
+CI（`build.yml`）已预留条件签名步骤，配置以下 secrets 后自动生效：
+
+| 平台 | Secret | 说明 |
+|---|---|---|
+| Windows | `WINDOWS_SIGN_CERT_BASE64` | 代码签名证书（.pfx）的 base64 |
+| Windows | `WINDOWS_SIGN_CERT_PASSWORD` | 证书私钥密码 |
+
+Windows 步骤在 `PyInstaller` 与 `smoke_test_dist.py` 之后、归档打包之前执行
+`signtool sign /tr http://timestamp.digicert.com /td sha256 /fd sha256`，确保
+zip 内即为已签名 exe。
+
+macOS 正式签名需 Developer ID 证书 + 公证（notarize），涉及 Apple 开发者账号与
+`xcrun notarytool`，本仓库未内置该流程；需要时在 `build.yml` 的 macOS job 中于
+`package_release.py` 之前对 `dist/PiManager.app` 执行：
+
+```bash
+codesign --force --options runtime --sign "Developer ID Application: <Your Name>" dist/PiManager.app
+xcrun notarytool submit dist/PiManager.app --keychain-profile <profile> --wait
+xcrun stapler staple dist/PiManager.app
+```
+
+注意：`package_release.py` 对 macOS 的 ad-hoc 签名是**硬闸门**（`--strict-sign`），
+外部先做 Developer ID 签名后该步骤会以 `--force` 覆盖为 ad-hoc——如需保留正式
+签名，请在调用 `package_release.py` 时去掉 macOS 的 `--strict-sign` 并设置
+环境变量 `PM_MACOS_SIGN_IDENTITY`（设为 Developer ID 时脚本改用该身份签名，
+而不是 ad-hoc；未设置时行为与现在完全一致）。

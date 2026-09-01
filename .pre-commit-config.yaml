@@ -1,0 +1,27 @@
+# PiManager 本地提交前门禁（可选安装）：
+#   pip install pre-commit && pre-commit install
+# 与 CI gate（ruff / check_secrets / check_versions）保持同一把尺子，
+# 让问题在提交前暴露，而不是等 GitHub Actions 跑完才发现。
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+        args: [--check]
+
+  - repo: local
+    hooks:
+      - id: check-secrets
+        name: Secret / sensitive-file scan
+        entry: python scripts/check_secrets.py --scan-tests
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: check-versions
+        name: Version + docs single-source consistency
+        entry: python scripts/check_versions.py
+        language: system
+        pass_filenames: false
+        always_run: true

@@ -172,6 +172,19 @@ class FeatureMixin:
         if self.health_timer:
             self.health_timer.stop()
         workers = list(getattr(self, "workers", []))
+        # InstallPiDialog 等模态子对话框的 Worker 经 _adopt_worker 挂在其自身名下
+        # （_init_workers + 自持登记表），不在主窗口的 workers 登记表里；安装/升级
+        # Pi（npm install -g，最长 300s）期间用户经托盘退出应用时，主窗口销毁链会
+        # 连带销毁运行中的 QThread → qFatal("QThread: Destroyed while thread is
+        # still running") 直接崩溃退出。这里用 findChildren 收割全部后代 Worker。
+        try:
+            from .ui import Worker as _WorkerClass
+        except Exception:  # pragma: no cover - 防御性，正常路径必有 ui 模块
+            _WorkerClass = None
+        if _WorkerClass is not None:
+            for child in self.findChildren(_WorkerClass):
+                if child not in workers:
+                    workers.append(child)
         for worker in workers:
             if worker.isRunning():
                 worker.requestInterruption()

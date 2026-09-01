@@ -437,6 +437,11 @@ def _ensure(
             base,
         )
         if thinking:
+            # escape_cmd_shim_args 只校验传入的 provider/model 列表，thinking 在
+            # 转义之后单独 append 会绕过白名单，成为 argv 参数注入面（thinking 值
+            # 可经 settings.json 的 defaultThinkingLevel 被配置包导入控制）。此处
+            # 显式校验后再拼接，非法值直接抛 ValueError 拒绝启动。
+            core.validate_launch_tokens(["--thinking", thinking])
             argv += ["--thinking", thinking]
         argv += ["--session-id", session_id, "-n", "PiManager 快速提问"]
         spawn_env = proc.spawn_env(provider_env, sanitize_after_merge=False)

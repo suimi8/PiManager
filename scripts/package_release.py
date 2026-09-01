@@ -387,12 +387,13 @@ def verify_binary_version(binary: Path, expected: str, timeout: int) -> list[str
 
 
 def prune_stale_archives(out: Path, version: str) -> list[Path]:
-    """Delete PiManager archives of other versions left in the output dir.
+    """Delete PiManager archives and stale Cursor VSIX of other versions.
 
     ``release-assets/`` is not cleaned between local builds, so ``gh release
     upload release-assets/*`` (or a manual upload) would ship the previous
-    version alongside the new one (review §5.4). Only PiManager archives are
-    touched; the independently versioned .vsix is left alone.
+    version alongside the new one (review §5.4). Both the PiManager archives
+    and the independently versioned .vsix are pruned down to the current
+    versions, so old VSIX cannot accumulate indefinitely.
     """
     removed: list[Path] = []
     for path in sorted(out.glob("PiManager-v*")):
@@ -402,6 +403,26 @@ def prune_stale_archives(out: Path, version: str) -> list[Path]:
             continue
         match = _ARCHIVE_STEM_RE.match(path.name)
         if match and match.group("version") == version:
+            continue
+        path.unlink()
+        removed.append(path)
+    # Cursor 扩展独立版本号（0.7.x），与桌面版 1.8.x 无关：只保留与
+    # extensions/pi-cursor/package.json 一致的 vsix，其余视为陈旧产物清理。
+    try:
+        import json
+
+        pkg = json.loads(
+            (Path(__file__).resolve().parents[1] / "extensions" / "pi-cursor" / "package.json").read_text(encoding="utf-8")
+        )
+        ext_version = str(pkg.get("version") or "")
+    except Exception:
+        ext_version = ""
+    vsix_re = re.compile(r"^pi-manager-pi-cursor-(?P<version>[0-9][^-]*?)\.vsix$")
+    for path in sorted(out.glob("pi-manager-pi-cursor-*.vsix")):
+        if not path.is_file():
+            continue
+        match = vsix_re.match(path.name)
+        if match and ext_version and match.group("version") == ext_version:
             continue
         path.unlink()
         removed.append(path)
@@ -599,11 +620,21 @@ def main() -> int:
         binary = app / "Contents" / "MacOS" / "PiManager"
         _ensure_executable(binary)
         # Ad-hoc sign for local consistency (not a Developer ID signature).
+        # 设置 PM_MACOS_SIGN_IDENTITY 时改用指定身份签名（正式分发 + hardened
+        # runtime），未设置时维持 ad-hoc —— 外部已做 Developer ID 签名时该 env
+        # 可避免被 --force 覆盖成 ad-hoc。
         # Signing before archiving is correct only because the archive writers
         # below preserve symlinks; otherwise the signature breaks on unpack.
+        sign_identity = os.environ.get("PM_MACOS_SIGN_IDENTITY", "").strip()
         if shutil.which("codesign"):
+            sign_args = ["codesign", "--force"]
+            if sign_identity:
+                sign_args += ["--options", "runtime", "--sign", sign_identity]
+            else:
+                sign_args += ["--sign", "-"]
+            sign_args.append(str(app))
             result = subprocess.run(
-                ["codesign", "--force", "--sign", "-", str(app)],
+                sign_args,
                 check=False,
                 capture_output=True,
                 text=True,

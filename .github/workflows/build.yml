@@ -167,6 +167,25 @@ jobs:
             --dist dist \
             --expected-version "${{ steps.ver.outputs.version }}"
 
+      # 代码签名是分发链路的前置条件（SmartScreen / Gatekeeper），但需要真实
+      # 证书：未配置 secrets 时本步骤自动跳过，不阻塞本地/内部发布。配置方式见
+      # BUILD.md 的「代码签名（可选）」一节。签名必须在打包归档之前完成，
+      # 否则 zip 里的 exe 仍是未签名副本。
+      - name: Sign Windows binary (conditional)
+        if: matrix.platform == 'windows' && secrets.WINDOWS_SIGN_CERT_BASE64 != ''
+        shell: bash
+        env:
+          WINDOWS_SIGN_CERT_BASE64: ${{ secrets.WINDOWS_SIGN_CERT_BASE64 }}
+          WINDOWS_SIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGN_CERT_PASSWORD }}
+        run: |
+          echo "$WINDOWS_SIGN_CERT_BASE64" | base64 -d > "$RUNNER_TEMP/cert.pfx"
+          SIGTOOL=$(powershell -NoProfile -Command "(Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe | Sort-Object FullName -Descending | Select-Object -First 1).FullName" | tr -d '\r')
+          if [ -z "$SIGTOOL" ]; then
+            echo "signtool.exe not found" >&2
+            exit 1
+          fi
+          powershell -NoProfile -Command "& '$SIGTOOL' sign /f '$env:RUNNER_TEMP\cert.pfx' /p '$env:WINDOWS_SIGN_CERT_PASSWORD' /tr http://timestamp.digicert.com /td sha256 /fd sha256 'dist\PiManager.exe'"
+
       - name: Package release archives
         shell: bash
         run: |

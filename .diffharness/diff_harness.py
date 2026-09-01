@@ -19,7 +19,47 @@ sys.path.insert(0, REPO)
 
 from pi_manager import core                          # noqa: E402
 from pi_manager import core_remote as new_mod        # noqa: E402
-from pi_manager import _ref_core_remote as ref_mod   # noqa: E402
+
+
+def _load_ref_module():
+    """加载拆分前的 core_remote 参考基线（_ref_core_remote）。
+
+    参考文件已从 pi_manager/ 包内移除（避免死代码留在生产包中）；这里优先
+    尝试直接导入，失败时用 git show 从历史恢复临时副本，并以 pi_manager 包内
+    子模块身份加载（该文件使用相对导入，必须挂在包名下）。
+    """
+    try:
+        from pi_manager import _ref_core_remote as ref_mod  # noqa: F401
+
+        return ref_mod
+    except ImportError:
+        pass
+    import importlib.util
+    import os
+    import subprocess
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="pi-ref-")
+    path = os.path.join(tmp, "_ref_core_remote.py")
+    with open(path, "w", encoding="utf-8") as fh:
+        subprocess.run(
+            ["git", "show", "HEAD:pi_manager/_ref_core_remote.py"],
+            cwd=REPO,
+            check=True,
+            stdout=fh,
+        )
+    spec = importlib.util.spec_from_file_location(
+        "pi_manager._ref_core_remote",
+        path,
+        submodule_search_locations=[],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pi_manager._ref_core_remote"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+ref_mod = _load_ref_module()
 
 core._effective_proxy_url = lambda p: ""
 

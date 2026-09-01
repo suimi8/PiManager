@@ -376,3 +376,16 @@ def test_set_model_failure_raises(fake_proc):
         assert "model not found" in str(results["err"])
     finally:
         _teardown(session, fake)
+
+
+def test_rpc_session_rejects_illegal_thinking_before_spawn(monkeypatch):
+    """P0-1 回归：RPC 路径的 --thinking 必须先过白名单，非法值在 spawn 前拒绝。"""
+    import pytest
+
+    from pi_manager import core as pi_core
+
+    monkeypatch.setattr(pi_core, "pi_base_cmd", lambda: ["pi"])
+    with pytest.raises(ValueError):
+        rpc_session._ensure(
+            "ProviderX", "model-1", {}, None, "high&calc"
+        )

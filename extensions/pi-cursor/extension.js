@@ -364,7 +364,12 @@ function providerHelperCommand() {
 
 function brokerToken() {
   try {
-    return fs.readFileSync(path.join(agentDir(), ".broker-token"), "utf8").trim();
+    const tokenPath = path.join(agentDir(), ".broker-token");
+    // 与 Python 侧 config_broker 的严格校验保持对称：拒绝符号链接/重解析点
+    // 与异常大小的文件，避免同机攻击者用 junction 把 token 读取指向别处。
+    const stat = fs.lstatSync(tokenPath);
+    if (!stat.isFile() || stat.size > 4096) return "";
+    return fs.readFileSync(tokenPath, "utf8").trim();
   } catch {
     return "";
   }
@@ -496,6 +501,20 @@ function invokeProviderHelper(provider, helperArgs = [], { reason = null } = {})
       reject(new Error(`无法创建 Pi Manager 临时响应文件：${err.message}`));
       return;
     }
+    // broker token 不进入 argv（命令行在各平台对同用户可读）：写入 0600 临时
+    // 文件走 --token-file，Python 侧会做普通文件/重解析点/属主加固校验。
+    let tokenPath = "";
+    if (token) {
+      tokenPath = path.join(os.tmpdir(), `pi-manager-env-token-${suffix}`);
+      try {
+        fs.writeFileSync(tokenPath, token, { encoding: "utf8", mode: 0o600, flag: "wx" });
+        ownedTempFiles.add(tokenPath);
+      } catch (err) {
+        releaseTempFile(output);
+        reject(new Error(`无法创建 Pi Manager broker token 文件：${err.message}`));
+        return;
+      }
+    }
     // 文件名沿用 pi-manager-env- 前缀，好让 temp-files.js 的兜底扫描
     // （前缀 + 时效 + 属主）连同它一起回收宿主崩溃时的残留。
     let reasonPath = "";
@@ -522,8 +541,7 @@ function invokeProviderHelper(provider, helperArgs = [], { reason = null } = {})
         ...baseArgs,
         "--output",
         output,
-        "--token",
-        token,
+        ...(tokenPath ? ["--token-file", tokenPath] : []),
         ...(reasonPath ? ["--reason-file", reasonPath] : []),
         ...helperArgs,
         provider,
@@ -626,6 +644,23 @@ function findPiCommand() {
     path.join(appdata, "npm", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
     path.join(appdata, "npm", "node_modules", "@mariozechner", "pi-coding-agent", "dist", "cli.js"),
   ];
+  // %APPDATA%\npm 只在默认 prefix 下成立；nvm / 自定义 npm prefix 环境下全局
+  // 包不在那里。动态解析 npm root -g 后优先命中，静态候选留作回退。
+  try {
+    const { execFileSync } = require("child_process");
+    const root = execFileSync(resolveExecutablePath("npm"), ["root", "-g"], {
+      encoding: "utf8",
+      timeout: 5000,
+      windowsHide: true,
+    }).trim();
+    if (root) {
+      for (const pkg of ["@earendil-works/pi-coding-agent", "@mariozechner/pi-coding-agent"]) {
+        cliCandidates.unshift(path.join(root, pkg, "dist", "cli.js"));
+      }
+    }
+  } catch {
+    // 静默降级：npm 不可用/超时则只依赖静态候选与 PATH 兜底。
+  }
   for (const cli of cliCandidates) {
     if (fs.existsSync(cli)) {
       requireTrustedExecutablePath(cli, "Pi CLI");

@@ -13,7 +13,7 @@ import json
 import logging
 import os
 
-from .core_http import _ssl_context
+from .core_http import _ssl_context, redact_endpoint_url
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +190,9 @@ def _zhipu_vision_request(
         return {
             "ok": False,
             "description": "",
-            "error": str(e),
+            # URLError 的 str 会带上完整 URL（可能含 inline key 查询参数），
+            # 必须经 redact_endpoint_url 脱敏后才允许进 UI 错误消息。
+            "error": redact_endpoint_url(str(e)),
             "http_status": 0,
             "model": model,
             "latency_ms": round((_time.perf_counter() - t0) * 1000, 1),

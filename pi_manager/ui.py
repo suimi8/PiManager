@@ -980,10 +980,11 @@ class InstallPiDialog(WorkerTrackerMixin, QDialog):
         # closeEvent\uff08X / Alt+F4 / \u7236\u7a97\u53e3\u9500\u6bc1\u94fe\uff09\u65f6 isRunning() \u4f1a\u629b
         # RuntimeError: Internal C++ object (Worker) already deleted\u3002
         # _untrack \u5728 deleteLater \u4e4b\u524d\u89e6\u53d1\uff0c\u6545 self._workers \u5929\u7136\u5b89\u5168\u3002
-        if any(w.isRunning() for w in self._workers):
-            event.ignore()
-            self.log.appendPlainText("\u5b89\u88c5\u4e2d\uff0c\u8bf7\u8010\u5fc3\u7b49\u5f85\u5b89\u88c5\u5b8c\u6210\u6216\u5931\u8d25\u3002")
-            return
+        # \u4e3b\u52a8\u5173\u95ed\u65f6\u5148\u6536\u5272\u8fd0\u884c\u4e2d\u7684 worker\uff08\u9884\u7b97 2.5s\uff0c\u8d85\u65f6\u8005\u8131\u94a9\u5ef6\u5bff\uff09\uff0c\u65e2\u4e0d
+        # \u95ea\u9000\u4e5f\u4e0d\u5361\u6b7b\uff1a\u4ecd\u5728\u8fd0\u884c\u7684\u4efb\u52a1\u8f6c\u5165\u540e\u53f0\u6536\u5c3e\uff0c\u5bf9\u8bdd\u6846\u53ef\u5b89\u5168\u5173\u95ed\u3002
+        stuck = self._reap_workers(budget=2.5)
+        if stuck:
+            self._note_detached_workers()
         super().closeEvent(event)
 
     def _run(self):

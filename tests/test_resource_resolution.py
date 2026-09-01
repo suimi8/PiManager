@@ -391,6 +391,7 @@ def test_prune_stale_archives_only_touches_other_versions(tmp_path):
         "PiManager-v1.8.6-windows-x64-onefile.zip",
         "PiManager-v1.8.5-linux-x64.tar.gz",
         "pi-manager-pi-cursor-0.7.2.vsix",
+        "pi-manager-pi-cursor-0.7.5.vsix",
         "RUN-windows.txt",
     ):
         (tmp_path / name).write_bytes(b"x")
@@ -398,9 +399,11 @@ def test_prune_stale_archives_only_touches_other_versions(tmp_path):
     assert removed == {
         "PiManager-v1.8.5-windows-x64-onefile.zip",
         "PiManager-v1.8.5-linux-x64.tar.gz",
+        "pi-manager-pi-cursor-0.7.2.vsix",
     }
     assert (tmp_path / "PiManager-v1.8.6-windows-x64-onefile.zip").exists()
-    assert (tmp_path / "pi-manager-pi-cursor-0.7.2.vsix").exists()
+    # 与当前扩展版本一致的 vsix 保留（prune 扩展至 vsix 后，旧版 vsix 一并清理）。
+    assert (tmp_path / "pi-manager-pi-cursor-0.7.5.vsix").exists()
     assert (tmp_path / "RUN-windows.txt").exists()
 
 

@@ -795,3 +795,45 @@ def test_masked_provider_key_hides_length_and_limits_visible_prefix(isolated_hom
     # 短 Key 与 8 字符 Key 的掩码等长：不通过掩码长度泄露密钥长度。
     assert secrets._masked_provider_key("abc") == secrets._masked_provider_key("a" * 8)
 
+
+
+def test_config_broker_rejects_illegal_launch_tokens(isolated_home):
+    """P0-1 回归：set_default_model 的 provider/model/thinking 必须过启动白名单。"""
+    token = config_broker._create_broker_token()
+    cases = [
+        {"provider": "P", "model": "m", "thinking": "high&calc"},
+        {"provider": "P", "model": "m", "thinking": "high|calc"},
+        {"provider": 'x" & calc & "y', "model": "m"},
+        {"provider": "P", "model": "m$(calc)"},
+    ]
+    for arguments in cases:
+        result = config_broker.mutate(
+            {
+                "schema_version": 1,
+                "request_id": "illegal-token-test",
+                "token": token,
+                "operation": "set_default_model",
+                "arguments": arguments,
+            }
+        )
+        # mutate 顶层把操作类错误统一折叠为「操作失败」（既有契约）——白名单
+        # 拒绝在此表现为 ok=False 且不落库，断言不强绑具体文案。
+        assert result["ok"] is False
+        assert result["error"]
+    assert "defaultThinkingLevel" not in core.load_settings()
+
+
+def test_config_broker_accepts_legal_thinking_level(isolated_home):
+    """合法 thinking（off/low/medium/high）仍可正常落库。"""
+    token = config_broker._create_broker_token()
+    result = config_broker.mutate(
+        {
+            "schema_version": 1,
+            "request_id": "legal-token-test",
+            "token": token,
+            "operation": "set_default_model",
+            "arguments": {"provider": "P", "model": "m", "thinking": "high"},
+        }
+    )
+    assert result["ok"] is True
+    assert core.load_settings()["defaultThinkingLevel"] == "high"

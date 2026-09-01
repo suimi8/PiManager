@@ -763,7 +763,10 @@ def load_models_config() -> dict[str, Any]:
 
 
 def save_models_config(data: dict[str, Any]) -> None:
-    save_json(models_path(), _sanitize_models_config(data))
+    # private=True：与 pi-manager.json 一致收紧 POSIX 权限位 / Windows DACL。
+    # models.json 虽无密钥本体，但含 provider 清单与 baseUrl，备份轮转副本
+    # 同路径加固（此前默认 private=False，继承父目录宽松 ACL）。
+    save_json(models_path(), _sanitize_models_config(data), private=True)
 
 
 def _sanitize_models_config(data: Any) -> Any:
@@ -979,6 +982,10 @@ def set_default_model(provider: str, model: str, thinking: str | None = None) ->
     pair = normalize_model_pair(provider, model, allow_empty=False)
     assert pair is not None
     provider, model = pair
+    if thinking:
+        # 与启动白名单同规则：defaultThinkingLevel 会作为 --thinking 进入 pi
+        # 命令行（rpc_session._ensure），非法值必须在此拦截而非等到启动时。
+        validate_launch_tokens(["--thinking", thinking])
 
     def _apply(settings: dict[str, Any]) -> Any:
         settings["defaultProvider"] = provider
@@ -1763,6 +1770,7 @@ def _run_version_command(command: list[str], timeout: float = 20) -> str | None:
             errors="replace",
             timeout=timeout,
             shell=False,
+            env=strip_pyinstaller_runtime_env(os.environ),
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
     except Exception:
@@ -1813,6 +1821,7 @@ def get_latest_pi_version(timeout: float = 20, tag: str | None = None) -> str | 
             errors="replace",
             timeout=timeout,
             shell=False,
+            env=strip_pyinstaller_runtime_env(os.environ),
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
     except Exception:
@@ -2084,6 +2093,7 @@ def install_or_update_pi(timeout: float = 300) -> tuple[int, str, str]:
             errors="replace",
             timeout=timeout,
             shell=False,
+            env=strip_pyinstaller_runtime_env(os.environ),
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
     except Exception as exc:

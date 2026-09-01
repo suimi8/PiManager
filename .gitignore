@@ -88,3 +88,6 @@ extensions/**/src/
 BaiduSyncdisk/
 .SynologyWorkingDirectory/
 ~$*
+
+# WorkBuddy agent local data (not part of the repo)
+.workbuddy/

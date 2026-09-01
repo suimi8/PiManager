@@ -293,6 +293,18 @@ def mutate(request: dict[str, Any]) -> dict[str, Any]:
             if not provider or not model:
                 raise ValueError("provider and model are required")
             thinking = str(arguments.get("thinking") or "").strip()
+            # 与 core_process.validate_launch_tokens 同规则校验：defaultThinkingLevel
+            # 会作为 --thinking 进入 pi 命令行（见 rpc_session._ensure），恶意/损坏
+            # 扩展可经此注入 argv 参数，必须与启动白名单保持一致。
+            try:
+                from . import core_process
+
+                tokens = ["--provider", provider, "--model", model]
+                if thinking:
+                    tokens += ["--thinking", thinking]
+                core_process.validate_launch_tokens(tokens)
+            except ValueError as exc:
+                raise ValueError(f"illegal launch tokens: {exc}") from exc
             sync_enabled = bool(arguments.get("sync_enabled", True))
             favorites = [str(item) for item in arguments.get("favorites", []) if isinstance(item, str)]
 
