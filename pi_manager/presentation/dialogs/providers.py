@@ -42,7 +42,7 @@ class ProviderEditorDialog(WorkerTrackerMixin, QDialog):
     def __init__(self, parent=None, existing: dict[str, Any] | None = None, name: str = ""):
         super().__init__(parent)
         self.setWindowTitle("编辑自定义 Provider" if existing else "添加自定义 Provider")
-        clamp_dialog_to_screen(self, 720, 700)
+        clamp_dialog_to_screen(self, 720, 760)
         self.existing = existing or {}
         self._worker = None
         self._init_workers()
@@ -114,7 +114,9 @@ class ProviderEditorDialog(WorkerTrackerMixin, QDialog):
         self.btn_fetch = QPushButton("拉取上游模型")
         self.btn_fetch.setProperty("success", True)
         self.btn_fetch.clicked.connect(self.fetch_models)
-        self.fetch_status = QLabel("拉取后可搜索、勾选；保存时只写入已勾选的模型。")
+        self.fetch_status = QLabel(
+            "拉取后可搜索、勾选；保存按默认写入 1M 上下文、只开思考。不会写入全部上游模型。"
+        )
         self.fetch_status.setObjectName("subtitle")
         self.fetch_status.setWordWrap(True)
         fetch_row.addWidget(self.btn_fetch)
@@ -229,7 +231,7 @@ class ProviderEditorDialog(WorkerTrackerMixin, QDialog):
         self.picker.set_models(models, checked_ids=already)
         self.fetch_status.setText(
             f"成功：{len(models)} 个模型  |  endpoint: {result.get('endpoint')}"
-            "  ·  搜索后勾选要接入的，不会默认写入全部。"
+            "  ·  勾选后保存：默认 1M 上下文、只开思考。可改能力条再一键应用。"
         )
         self.picker.search.setFocus()
 
@@ -485,7 +487,7 @@ class FetchModelsDialog(WorkerTrackerMixin, QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("从 BaseURL + API Key 获取模型")
-        clamp_dialog_to_screen(self, 720, 620)
+        clamp_dialog_to_screen(self, 720, 680)
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.name_edit = QLineEdit("custom")
@@ -513,7 +515,7 @@ class FetchModelsDialog(WorkerTrackerMixin, QDialog):
         layout.addLayout(form)
 
         tip = QLabel(
-            "空 API Key 会 401。拉取后请搜索并勾选要接入的模型，保存时只写入已勾选项。"
+            "空 API Key 会 401。拉取后请搜索并勾选；保存默认写入 1M 上下文、只开思考、不含图片。"
         )
         tip.setObjectName("subtitle")
         tip.setWordWrap(True)
@@ -605,7 +607,7 @@ class FetchModelsDialog(WorkerTrackerMixin, QDialog):
         px = f" | proxy={proxy}" if proxy else ""
         self.status.setText(
             f"成功获取 {len(self._models)} 个模型 | {result.get('endpoint')}{px}"
-            "  ·  搜索后勾选再保存"
+            "  ·  勾选后保存：默认 1M 上下文、只开思考"
         )
         self.picker.search.setFocus()
 

@@ -121,5 +121,5 @@ from .extras_chat import (
 )
 
 # 版本单一来源（R5）：脚本用正则从本文件提取 APP_VERSION，不得挪走。
-APP_VERSION = "1.8.10"
+APP_VERSION = "1.8.11"
 APP_NAME = "Pi Manager"

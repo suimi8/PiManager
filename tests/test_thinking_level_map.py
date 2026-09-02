@@ -92,7 +92,7 @@ def test_upsert_fills_incomplete_id_name_models(isolated_home):
     model = cfg["providers"]["grokified"]["models"][0]
     assert model["id"] == "grok-4.5"
     assert model["reasoning"] is True
-    assert model["contextWindow"] == 128000
+    assert model["contextWindow"] == core.DEFAULT_CONTEXT_WINDOW
     assert model["maxTokens"] == 32768
     assert model["thinkingLevelMap"]["max"] == "max"
 
@@ -103,7 +103,7 @@ def test_fill_model_defaults_preserves_explicit_non_reasoning(isolated_home):
     model = core.fill_model_defaults({"id": "gpt-4o-mini", "reasoning": False})
     assert model["reasoning"] is False
     assert "thinkingLevelMap" not in model
-    assert model["contextWindow"] == 128000
+    assert model["contextWindow"] == core.DEFAULT_CONTEXT_WINDOW
 
 
 def test_load_models_config_migrates_incomplete_handwritten_models(isolated_home):
@@ -130,4 +130,51 @@ def test_load_models_config_migrates_incomplete_handwritten_models(isolated_home
     assert model["reasoning"] is True
     assert model["thinkingLevelMap"]["max"] == "max"
     on_disk = storage.load_json(core.models_path(), {})
-    assert on_disk["providers"]["grokified"]["models"][0]["contextWindow"] == 128000
+    assert on_disk["providers"]["grokified"]["models"][0]["contextWindow"] == (
+        core.DEFAULT_CONTEXT_WINDOW
+    )
+
+
+def test_apply_model_capabilities_defaults_to_1m_thinking_only(isolated_home):
+    from pi_manager import core
+
+    model = core.apply_model_capabilities({"id": "qwen3", "contextWindow": 8192})
+    assert model["contextWindow"] == core.DEFAULT_CONTEXT_WINDOW
+    assert model["reasoning"] is True
+    assert model["input"] == ["text"]
+    assert model["thinkingLevelMap"]["max"] == "max"
+
+
+def test_apply_model_capabilities_can_enable_images_and_disable_thinking(isolated_home):
+    from pi_manager import core
+
+    model = core.apply_model_capabilities(
+        {"id": "vl", "reasoning": True, "thinkingLevelMap": {"high": "high"}},
+        context_window=200_000,
+        reasoning=False,
+        images=True,
+    )
+    assert model["contextWindow"] == 200_000
+    assert model["reasoning"] is False
+    assert model["input"] == ["text", "image"]
+    assert "thinkingLevelMap" not in model
+
+
+def test_apply_capabilities_to_saved_models_skips_unknown_provider(isolated_home):
+    from pi_manager import core
+
+    core.upsert_custom_provider(
+        "xkiro",
+        base_url="https://example.com/v1",
+        api_key="sk-test",
+        models=[{"id": "keep-me", "name": "keep-me"}],
+    )
+    result = core.apply_capabilities_to_saved_models(
+        [("xkiro", "keep-me"), ("builtin", "claude")]
+    )
+    assert result["updated"] == 1
+    assert result["skipped"] == 1
+    saved = core.load_models_config()["providers"]["xkiro"]["models"][0]
+    assert saved["contextWindow"] == core.DEFAULT_CONTEXT_WINDOW
+    assert saved["reasoning"] is True
+    assert saved["input"] == ["text"]

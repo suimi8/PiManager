@@ -889,7 +889,35 @@ def test_provider_editor_searches_upstream_and_saves_checked_only(qapp, isolated
         dialog.picker.check_visible()
         _name, data = dialog.result_data()
         assert [item["id"] for item in data["models"]] == ["qwen/qwen3-vl-plus:free"]
+        written = data["models"][0]
+        assert written["contextWindow"] == core.DEFAULT_CONTEXT_WINDOW
+        assert written["reasoning"] is True
+        assert written["input"] == ["text"]
+        assert written["thinkingLevelMap"]["max"] == "max"
+        dialog.picker.capability.image_check.setChecked(True)
+        dialog.picker.capability.think_check.setChecked(True)
+        applied = dialog.picker.apply_capabilities()
+        assert applied == 1
+        _name, data = dialog.result_data()
+        assert data["models"][0]["input"] == ["text", "image"]
+        assert data["models"][0]["reasoning"] is True
     finally:
         dialog.close()
         dialog.deleteLater()
+        qapp.processEvents()
+
+
+def test_capability_bar_defaults_to_1m_thinking_only(qapp, isolated_home):
+    from pi_manager.presentation.components import ModelCapabilityBar
+
+    bar = ModelCapabilityBar()
+    try:
+        spec = bar.capability_spec()
+        assert spec["context_window"] == core.DEFAULT_CONTEXT_WINDOW
+        assert spec["reasoning"] is True
+        assert spec["images"] is False
+        assert bar.context_combo.currentText() == "1M"
+        assert "思考" in bar.summary_text()
+    finally:
+        bar.deleteLater()
         qapp.processEvents()

@@ -8,6 +8,7 @@ from PySide6.QtGui import QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -27,6 +28,7 @@ from ... import core
 from ..components import (
     EmptyState,
     ErrorActionPanel,
+    ModelCapabilityDialog,
     PropertyTable,
     StatusBadge,
     SurfaceCard,
@@ -130,6 +132,9 @@ def build_models_page(window) -> QWidget:
     )
     actions.addWidget(window.model_test_cancel_btn)
     actions.addWidget(window._btn("收藏", window.model_add_favorite_batch, ghost=True))
+    actions.addWidget(
+        window._btn("配置能力", window.model_configure_capabilities, secondary=True)
+    )
     actions.addStretch(1)
     think_lbl = QLabel("Thinking")
     think_lbl.setObjectName("muted")
@@ -171,6 +176,7 @@ def build_models_page(window) -> QWidget:
     menu.addAction("全选可见", window.model_select_visible)
     menu.addAction("收藏当前过滤结果", window.model_fav_filtered)
     menu.addAction("写入循环列表 (enabledModels)", window.model_set_enabled)
+    menu.addAction("一键配置能力（1M + 思考）", window.model_configure_capabilities)
     menu.addSeparator()
     menu.addAction("测试默认模型", window.model_test_default)
     menu.addAction("测试过滤结果", window.model_test_filtered)
@@ -488,6 +494,40 @@ class ModelsPageMixin:
         self.fill_favorites()
         self.fill_models_table()
         self.status.showMessage(f"批量收藏 +{n}，共 {len(favs)}")
+
+    def model_configure_capabilities(self):
+        rows = self.selected_model_rows()
+        if not rows:
+            current = self.selected_model_row()
+            rows = [current] if current else []
+        if not rows:
+            self.notify_warning("请先选中要配置能力的模型")
+            return
+        dialog = ModelCapabilityDialog(self, count=len(rows))
+        if dialog.exec() != QDialog.Accepted:
+            return
+        spec = dialog.capability_spec()
+        result = core.apply_capabilities_to_saved_models(
+            [(item.provider, item.model) for item in rows],
+            **spec,
+        )
+        updated = int(result.get("updated") or 0)
+        skipped = int(result.get("skipped") or 0)
+        if updated:
+            summary = dialog.bar.summary_text()
+            msg = f"已将 {summary} 写入 {updated} 个模型"
+            if skipped:
+                msg += f"，跳过 {skipped} 个内置/未落盘模型"
+            notify = getattr(self, "notify_success", None)
+            if callable(notify):
+                notify(msg)
+            self.status.showMessage(msg)
+            self.refresh_models()
+            return
+        self.notify_warning(
+            "没有可改写的自定义 Provider 模型。请先在 Provider 里保存这些模型。"
+            + (f"（跳过 {skipped} 个）" if skipped else "")
+        )
 
     def model_select_visible(self):
         tree = self.models_table

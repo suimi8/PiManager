@@ -598,25 +598,180 @@ def remove_model_from_provider(provider: str, model_id: str) -> dict[str, Any]:
 
 
 
+# 拉取 / 添加 / 一键配置能力时的缺省值：1M 上下文，默认只开思考、不含图片。
+DEFAULT_CONTEXT_WINDOW = 1_048_576
+DEFAULT_MAX_TOKENS = 32_768
+CONTEXT_WINDOW_PRESETS: tuple[tuple[str, int], ...] = (
+    ("128K", 131_072),
+    ("200K", 200_000),
+    ("256K", 262_144),
+    ("512K", 524_288),
+    ("1M", DEFAULT_CONTEXT_WINDOW),
+)
+
+
 def default_model_template(model_id: str) -> dict[str, Any]:
     return {
         "id": model_id,
         "name": model_id,
         "reasoning": True,
         "input": ["text"],
-        "contextWindow": 128000,
-        "maxTokens": 32768,
+        "contextWindow": DEFAULT_CONTEXT_WINDOW,
+        "maxTokens": DEFAULT_MAX_TOKENS,
         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
     }
+
+
+def apply_model_capabilities(
+    model: dict[str, Any] | Any,
+    *,
+    context_window: int = DEFAULT_CONTEXT_WINDOW,
+    reasoning: bool = True,
+    images: bool = False,
+) -> dict[str, Any]:
+    """覆盖写入上下文与能力：默认 1M 上下文、仅思考、不含图片。
+
+    与 :func:`fill_model_defaults` 不同，这里会改已有 ``contextWindow`` /
+    ``reasoning`` / ``input``，供拉取后一键配置和模型页批量改能力使用。
+    """
+    if isinstance(model, dict):
+        result = dict(model)
+        mid = str(result.get("id") or result.get("name") or "").strip()
+    else:
+        result = {}
+        mid = str(model or "").strip()
+    if not mid:
+        return result if isinstance(model, dict) else {"id": "", "name": ""}
+    result["id"] = str(result.get("id") or mid).strip() or mid
+    result["name"] = str(result.get("name") or mid).strip() or mid
+    result["contextWindow"] = int(context_window)
+    result["reasoning"] = bool(reasoning)
+    inputs = ["text"]
+    if images:
+        inputs.append("image")
+    result["input"] = inputs
+    if "maxTokens" not in result:
+        result["maxTokens"] = DEFAULT_MAX_TOKENS
+    if "cost" not in result:
+        result["cost"] = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+    if reasoning:
+        return ensure_thinking_level_map(result)
+    result.pop("thinkingLevelMap", None)
+    return result
+
+
+def apply_model_capabilities_many(
+    models: list[Any],
+    *,
+    context_window: int = DEFAULT_CONTEXT_WINDOW,
+    reasoning: bool = True,
+    images: bool = False,
+) -> list[dict[str, Any]]:
+    """对模型列表逐条覆盖能力；无 id 的条目原样跳过。"""
+    out: list[dict[str, Any]] = []
+    for entry in models or []:
+        if isinstance(entry, dict) and not str(entry.get("id") or entry.get("name") or "").strip():
+            out.append(entry)
+            continue
+        out.append(
+            apply_model_capabilities(
+                entry,
+                context_window=context_window,
+                reasoning=reasoning,
+                images=images,
+            )
+        )
+    return out
+
+
+def apply_capabilities_to_saved_models(
+    pairs: list[tuple[str, str]],
+    *,
+    context_window: int = DEFAULT_CONTEXT_WINDOW,
+    reasoning: bool = True,
+    images: bool = False,
+) -> dict[str, Any]:
+    """把能力写进 ``models.json`` 里已有的自定义 Provider 模型。
+
+    内置 / 未落盘的模型会计入 ``skipped``，不会新建 Provider。
+    """
+    wanted: dict[str, set[str]] = {}
+    for provider, model in pairs:
+        name = str(provider or "").strip()
+        mid = str(model or "").strip()
+        if name and mid:
+            wanted.setdefault(name, set()).add(mid)
+    updated = 0
+    skipped = 0
+
+    def _apply(cfg: dict[str, Any]) -> Any:
+        nonlocal updated, skipped
+        providers = cfg.get("providers")
+        if not isinstance(providers, dict) or not wanted:
+            return storage.UNCHANGED
+        updated_providers = dict(providers)
+        changed = False
+        remaining = {name: set(ids) for name, ids in wanted.items()}
+        for name, ids in wanted.items():
+            entry = providers.get(name)
+            if not isinstance(entry, dict):
+                skipped += len(ids)
+                remaining.pop(name, None)
+                continue
+            models = entry.get("models")
+            if not isinstance(models, list):
+                skipped += len(ids)
+                remaining.pop(name, None)
+                continue
+            new_models: list[Any] = []
+            seen: set[str] = set()
+            any_changed = False
+            for item in models:
+                if not isinstance(item, dict):
+                    new_models.append(item)
+                    continue
+                mid = str(item.get("id") or item.get("name") or "").strip()
+                if mid in ids:
+                    new_models.append(
+                        apply_model_capabilities(
+                            item,
+                            context_window=context_window,
+                            reasoning=reasoning,
+                            images=images,
+                        )
+                    )
+                    seen.add(mid)
+                    updated += 1
+                    any_changed = True
+                else:
+                    new_models.append(item)
+            skipped += len(ids - seen)
+            remaining.pop(name, None)
+            if not any_changed:
+                continue
+            updated_entry = dict(entry)
+            updated_entry["models"] = new_models
+            updated_providers[name] = updated_entry
+            changed = True
+        skipped += sum(len(ids) for ids in remaining.values())
+        if not changed:
+            return storage.UNCHANGED
+        result = dict(cfg)
+        result["providers"] = updated_providers
+        return result
+
+    _core().update_models_config(_apply)
+    return {"updated": updated, "skipped": skipped}
 
 
 
 def fill_model_defaults(model: dict[str, Any]) -> dict[str, Any]:
     """补全手填模型缺少的 Pi 字段，与拉取 / 「添加模型」使用同一套缺省值。
 
-    只补缺失键，不覆盖用户已写的 ``reasoning: false`` 等显式值。补上
-    ``reasoning`` 后若仍无 ``thinkingLevelMap``，再交给
-    :func:`ensure_thinking_level_map`。未改动时返回原对象，供迁移做身份判断。
+    缺省为 1M 上下文、``reasoning: true``、仅文本输入。只补缺失键，不覆盖
+    用户已写的 ``reasoning: false`` 等显式值。补上 ``reasoning`` 后若仍无
+    ``thinkingLevelMap``，再交给 :func:`ensure_thinking_level_map`。
+    未改动时返回原对象，供迁移做身份判断。
     """
     if not isinstance(model, dict):
         return model

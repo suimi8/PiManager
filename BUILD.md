@@ -34,7 +34,7 @@ python main.py --self-check
 #   Windows:    python -m PyInstaller --noconfirm --clean PiManagerOneFile.spec
 #   macOS/Linux: python -m PyInstaller --noconfirm --clean PiManager.spec
 python scripts/smoke_test_dist.py
-python scripts/package_release.py --version 1.8.10
+python scripts/package_release.py --version 1.8.11
 ```
 
 ### 冒烟测试与打包脚本的门禁
@@ -113,14 +113,14 @@ python scripts/package_extension.py
 4. 可选上传到 GitHub Release
 
 手动触发：Actions → **Build** → **Run workflow**  
-- `version`：`1.8.10`
-- `upload_to_release`：`v1.8.10`（可选）
+- `version`：`1.8.11`
+- `upload_to_release`：`v1.8.11`（可选）
 
 打 tag 也会触发：
 
 ```bash
-git tag v1.8.10
-git push origin v1.8.10
+git tag v1.8.11
+git push origin v1.8.11
 ```
 
 ## 平台能力表

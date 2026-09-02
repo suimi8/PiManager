@@ -176,7 +176,7 @@ def build_dashboard_page(window) -> QWidget:
     form.addRow("API Key", window.quick_key)
     form.addRow("API 类型", window.quick_api)
     quick.content.addLayout(form)
-    window.quick_status = QLabel("等待连接")
+    window.quick_status = QLabel("等待连接 · 保存默认 1M 上下文、只开思考")
     window.quick_status.setObjectName("subtitle")
     window.quick_status.setWordWrap(True)
     quick.content.addWidget(window.quick_status)
@@ -336,7 +336,10 @@ class DashboardPageMixin:
             self.quick_status.setText(f"失败：{err}")
             QMessageBox.warning(self, "拉取失败", msg)
             return
-        models = result.get("models") or []
+        models = [
+            core.apply_model_capabilities(item) if isinstance(item, dict) else item
+            for item in (result.get("models") or [])
+        ]
         if not models:
             self.quick_status.setText("成功但模型列表为空")
             self.notify_warning("接口返回空模型列表，请检查 Base URL 是否正确")

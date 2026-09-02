@@ -350,15 +350,9 @@ def fetch_remote_models(
     def add_model(mid: str, name: str | None = None, extra: dict | None = None):
         if not mid:
             return
-        item = {
-            "id": mid,
-            "name": name or mid,
-            "reasoning": True,
-            "input": ["text"],
-            "contextWindow": 128000,
-            "maxTokens": 32768,
-            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-        }
+        item = core.default_model_template(mid)
+        if name:
+            item["name"] = name
         if extra:
             # common optional fields — providers may return non-numeric
             # strings (e.g. "128K", "unknown"), so coerce defensively.

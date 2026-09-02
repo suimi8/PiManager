@@ -147,10 +147,16 @@ from .core_store import (
     update_settings,
 )
 from .core_catalog import (
+    CONTEXT_WINDOW_PRESETS,
+    DEFAULT_CONTEXT_WINDOW,
+    DEFAULT_MAX_TOKENS,
     DEFAULT_THINKING_LEVEL,
     DEFAULT_THINKING_LEVEL_MAP,
     ModelInfo,
     add_model_to_provider,
+    apply_capabilities_to_saved_models,
+    apply_model_capabilities,
+    apply_model_capabilities_many,
     delete_custom_provider,
     ensure_thinking_level_map,
     fill_model_defaults,

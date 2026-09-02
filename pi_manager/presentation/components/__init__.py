@@ -1,4 +1,4 @@
-from .model_picker import RemoteModelPicker
+from .model_picker import ModelCapabilityBar, ModelCapabilityDialog, RemoteModelPicker
 from .navigation import NavigationRail
 from .primitives import (
     AppButton,
@@ -24,6 +24,8 @@ __all__ = [
     "FeedbackToast",
     "InlineBanner",
     "MetricCard",
+    "ModelCapabilityBar",
+    "ModelCapabilityDialog",
     "NavigationRail",
     "PageHeader",
     "PropertyTable",

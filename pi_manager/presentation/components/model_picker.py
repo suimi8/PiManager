@@ -6,6 +6,10 @@ from typing import Any
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -16,7 +20,106 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from ... import core
 from ...remote_models import filter_remote_models, model_id
+
+
+class ModelCapabilityBar(QFrame):
+    """一键配置上下文与能力：默认 1M、只开思考、不含图片。"""
+
+    applied = Signal(int)
+
+    def __init__(self, parent=None, *, apply_label: str = "一键应用到已选") -> None:
+        super().__init__(parent)
+        self.setObjectName("modelCapabilityBar")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        label = QLabel("能力")
+        label.setObjectName("muted")
+        row.addWidget(label)
+
+        self.context_combo = QComboBox()
+        self.context_combo.setMinimumWidth(88)
+        self.context_combo.setToolTip("写入 models.json 的 contextWindow；上游目录通常不带此字段。")
+        default_index = 0
+        for index, (label_text, value) in enumerate(core.CONTEXT_WINDOW_PRESETS):
+            self.context_combo.addItem(label_text, value)
+            if value == core.DEFAULT_CONTEXT_WINDOW:
+                default_index = index
+        self.context_combo.setCurrentIndex(default_index)
+        row.addWidget(self.context_combo)
+
+        ctx_hint = QLabel("上下文")
+        ctx_hint.setObjectName("muted")
+        row.addWidget(ctx_hint)
+
+        self.think_check = QCheckBox("思考")
+        self.think_check.setChecked(True)
+        self.think_check.setToolTip("写入 reasoning，并补全 thinkingLevelMap。默认只开思考。")
+        row.addWidget(self.think_check)
+
+        self.image_check = QCheckBox("图片")
+        self.image_check.setChecked(False)
+        self.image_check.setToolTip("写入 input 是否含 image。默认不含图片。")
+        row.addWidget(self.image_check)
+
+        self.apply_btn = QPushButton(apply_label)
+        self.apply_btn.setProperty("secondary", True)
+        self.apply_btn.setToolTip("立刻按当前选项覆盖已选模型的上下文与能力。")
+        row.addWidget(self.apply_btn)
+        row.addStretch(1)
+
+    def capability_spec(self) -> dict[str, Any]:
+        value = self.context_combo.currentData()
+        context_window = (
+            int(value) if value is not None else core.DEFAULT_CONTEXT_WINDOW
+        )
+        return {
+            "context_window": context_window,
+            "reasoning": self.think_check.isChecked(),
+            "images": self.image_check.isChecked(),
+        }
+
+    def summary_text(self) -> str:
+        spec = self.capability_spec()
+        ctx = self.context_combo.currentText() or "1M"
+        parts = [f"{ctx} 上下文"]
+        if spec["reasoning"]:
+            parts.append("思考")
+        if spec["images"]:
+            parts.append("图片")
+        if not spec["reasoning"] and not spec["images"]:
+            parts.append("仅文本")
+        return "、".join(parts)
+
+
+class ModelCapabilityDialog(QDialog):
+    """模型页批量改已保存模型的能力。"""
+
+    def __init__(self, parent=None, count: int = 0) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("配置模型能力")
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            f"将覆盖选中的 {count} 个自定义 Provider 模型。"
+            "默认 1M 上下文、只开思考、不含图片。内置模型不会改写。"
+        )
+        hint.setObjectName("subtitle")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.bar = ModelCapabilityBar(apply_label="预览选项")
+        self.bar.apply_btn.setVisible(False)
+        layout.addWidget(self.bar)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("应用")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def capability_spec(self) -> dict[str, Any]:
+        return self.bar.capability_spec()
 
 
 class RemoteModelPicker(QFrame):
@@ -46,6 +149,15 @@ class RemoteModelPicker(QFrame):
         search_row.addWidget(self.search, 1)
         search_row.addWidget(self.count_label)
         root.addLayout(search_row)
+
+        self.capability = ModelCapabilityBar()
+        self.capability.apply_btn.clicked.connect(self.apply_capabilities)
+        root.addWidget(self.capability)
+        cap_hint = QLabel("保存时按上面的能力写入。默认 1M 上下文、只开思考、不含图片。")
+        cap_hint.setObjectName("subtitle")
+        cap_hint.setWordWrap(True)
+        self.capability_hint = cap_hint
+        root.addWidget(cap_hint)
 
         self.empty = QLabel("拉取上游模型后，可在这里搜索并勾选要接入的模型。")
         self.empty.setObjectName("subtitle")
@@ -99,9 +211,42 @@ class RemoteModelPicker(QFrame):
     def checked_ids(self) -> set[str]:
         return set(self._checked)
 
+    def capability_spec(self) -> dict[str, Any]:
+        return self.capability.capability_spec()
+
     def checked_models(self) -> list[Any]:
+        spec = self.capability_spec()
         wanted = self._checked
-        return [entry for entry in self._models if model_id(entry) in wanted]
+        out: list[Any] = []
+        for entry in self._models:
+            ident = model_id(entry)
+            if ident not in wanted:
+                continue
+            out.append(core.apply_model_capabilities(entry, **spec))
+        return out
+
+    def apply_capabilities(self) -> int:
+        spec = self.capability_spec()
+        if not self._checked:
+            self.capability_hint.setText("请先勾选要接入的模型，再一键应用能力。")
+            self.capability.applied.emit(0)
+            self.checkedChanged.emit(0)
+            return 0
+        updated: list[Any] = []
+        count = 0
+        for entry in self._models:
+            ident = model_id(entry)
+            if ident in self._checked:
+                updated.append(core.apply_model_capabilities(entry, **spec))
+                count += 1
+            else:
+                updated.append(entry)
+        self._models = updated
+        summary = self.capability.summary_text()
+        self.capability_hint.setText(f"已将 {summary} 应用到 {count} 个已选模型。")
+        self.capability.applied.emit(count)
+        self.checkedChanged.emit(len(self._checked))
+        return count
 
     def visible_models(self) -> list[Any]:
         return filter_remote_models(self._models, self.search.text())
