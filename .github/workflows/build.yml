@@ -172,12 +172,16 @@ jobs:
       # BUILD.md 的「代码签名（可选）」一节。签名必须在打包归档之前完成，
       # 否则 zip 里的 exe 仍是未签名副本。
       - name: Sign Windows binary (conditional)
-        if: matrix.platform == 'windows' && secrets.WINDOWS_SIGN_CERT_BASE64 != ''
+        if: matrix.platform == 'windows'
         shell: bash
         env:
           WINDOWS_SIGN_CERT_BASE64: ${{ secrets.WINDOWS_SIGN_CERT_BASE64 }}
           WINDOWS_SIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGN_CERT_PASSWORD }}
         run: |
+          if [ -z "$WINDOWS_SIGN_CERT_BASE64" ]; then
+            echo "No WINDOWS_SIGN_CERT_BASE64 secret; skip signing."
+            exit 0
+          fi
           echo "$WINDOWS_SIGN_CERT_BASE64" | base64 -d > "$RUNNER_TEMP/cert.pfx"
           SIGTOOL=$(powershell -NoProfile -Command "(Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe | Sort-Object FullName -Descending | Select-Object -First 1).FullName" | tr -d '\r')
           if [ -z "$SIGTOOL" ]; then
