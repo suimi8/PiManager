@@ -45,6 +45,7 @@ class NavigationRail(QFrame):
         super().__init__(parent)
         self.setObjectName("navRail")
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.setAttribute(Qt.WA_AlwaysShowToolTips, True)
         self._pages = list(pages)
         self._buttons: dict[str, QToolButton] = {}
         self._badges: dict[str, QLabel] = {}
@@ -110,7 +111,7 @@ class NavigationRail(QFrame):
         for page in self._pages:
             if page.group != current_group:
                 current_group = page.group
-                label = QLabel(current_group.upper())
+                label = QLabel(current_group)
                 label.setObjectName("navSection")
                 self._group_labels.append(label)
                 nav_layout.addWidget(label)
@@ -123,6 +124,7 @@ class NavigationRail(QFrame):
             button.setIconSize(QSize(18, 18))
             button.setText(page.title)
             button.setToolTip(f"{page.title}\n{page.description}")
+            button.setAccessibleName(page.title)
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             button.clicked.connect(lambda checked=False, key=page.key: self.set_current_key(key))
             self._buttons[page.key] = button
@@ -239,11 +241,14 @@ class NavigationRail(QFrame):
         self.brand_copy.setVisible(not self._collapsed)
         for label in self._group_labels:
             label.setVisible(not self._collapsed)
-        for button in self._buttons.values():
+        for page in self._pages:
+            button = self._buttons[page.key]
             button.setToolButtonStyle(
                 Qt.ToolButtonIconOnly if self._collapsed else Qt.ToolButtonTextBesideIcon
             )
             button.setIconSize(QSize(20 if self._collapsed else 18, 20 if self._collapsed else 18))
+            button.setToolTip(f"{page.title}\n{page.description}")
+            button.setAccessibleName(page.title)
         self.collapse_button.setToolTip("展开侧边栏" if self._collapsed else "收起侧边栏")
         self.launch_button.setText("" if self._collapsed else "启动 Pi")
         self.launch_button.setToolTip("启动完整 Pi")

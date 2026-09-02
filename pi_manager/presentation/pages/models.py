@@ -4,11 +4,10 @@ from __future__ import annotations
 import logging
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -25,9 +24,16 @@ from PySide6.QtWidgets import (
 )
 
 from ... import core
-from ..components import SectionHeading, StatusBadge, SurfaceCard
+from ..components import (
+    EmptyState,
+    ErrorActionPanel,
+    PropertyTable,
+    StatusBadge,
+    SurfaceCard,
+)
 from ..design.icons import icon
 from ..design.tokens import tokens_for
+from ..status import classify_test_result, format_capability
 from ..workers import BATCH_TEST_TIMEOUT_DIRECT, BATCH_TEST_TIMEOUT_PI, BatchTestWorker, Worker
 
 LATENCY_OK_MS = 800
@@ -36,28 +42,35 @@ LATENCY_WARN_MS = 2000
 logger = logging.getLogger(__name__)
 
 
+class _ModelsPageBody(QWidget):
+    """把窗口宽度变化转给列自适应，避免窄窗口把延迟列挤没。"""
+
+    def __init__(self, window, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._window = window
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        adapt = getattr(self._window, "_adapt_models_columns", None)
+        if callable(adapt):
+            adapt()
+
+
 def build_models_page(window) -> QWidget:
-    page = QWidget()
+    page = _ModelsPageBody(window)
     page.setObjectName("pageBody")
     layout = QVBoxLayout(page)
-    layout.setContentsMargins(26, 22, 26, 24)
-    layout.setSpacing(12)
+    layout.setContentsMargins(24, 22, 24, 24)
+    layout.setSpacing(16)
 
-    filter_card = SurfaceCard(margins=(14, 12, 14, 12), spacing=8)
     filters = QHBoxLayout()
     filters.setSpacing(8)
-    window.model_provider_filter = QComboBox()
-    window.model_provider_filter.setMinimumWidth(160)
-    window.model_provider_filter.addItem("全部 Provider", "")
-    window.model_provider_filter.currentIndexChanged.connect(window.fill_models_table)
     window.model_filter = QLineEdit()
     window.model_filter.setPlaceholderText("搜索模型名称、Provider 或能力…")
     try:
         window.model_filter.setClearButtonEnabled(True)
     except Exception:
         pass
-    # 搜索防抖：整树重建在 200 模型规模下是 25 ms+，按每次击键触发会让输入
-    # 明显发涩。180 ms 静默后才重建；用户直接调 fill_models_table 不受影响。
     window._model_filter_debounce = QTimer(window)
     window._model_filter_debounce.setSingleShot(True)
     window._model_filter_debounce.setInterval(180)
@@ -65,27 +78,121 @@ def build_models_page(window) -> QWidget:
     window.model_filter.textChanged.connect(
         lambda _text: window._model_filter_debounce.start()
     )
+    window.model_provider_filter = QComboBox()
+    window.model_provider_filter.setMinimumWidth(120)
+    window.model_provider_filter.addItem("全部 Provider", "")
+    window.model_provider_filter.currentIndexChanged.connect(window.fill_models_table)
+    window.model_capability_filter = QComboBox()
+    window.model_capability_filter.addItem("全部能力", "")
+    window.model_capability_filter.addItem("支持思考", "thinking")
+    window.model_capability_filter.addItem("支持图片", "images")
+    window.model_capability_filter.currentIndexChanged.connect(window.fill_models_table)
     window.model_only_favorites = QCheckBox("仅看收藏")
     window.model_only_favorites.toggled.connect(window.fill_models_table)
-    filters.addWidget(window.model_provider_filter)
     filters.addWidget(window.model_filter, 1)
+    filters.addWidget(window.model_provider_filter)
+    filters.addWidget(window.model_capability_filter)
     filters.addWidget(window.model_only_favorites)
-    filters.addWidget(window._btn("刷新", window.refresh_models, secondary=True))
-    filter_card.content.addLayout(filters)
+    window.models_refresh_btn = window._btn("刷新", window.refresh_models, secondary=True)
+    window.models_refresh_cancel_btn = window._btn(
+        "取消刷新", window.refresh_models_cancel, ghost=True
+    )
+    window.models_refresh_cancel_btn.setEnabled(False)
+    window.models_refresh_cancel_btn.setToolTip("停止尚未完成的模型列表读取")
+    filters.addWidget(window.models_refresh_btn)
+    filters.addWidget(window.models_refresh_cancel_btn)
+    layout.addLayout(filters)
+
     meta = QHBoxLayout()
     window.models_count_lbl = QLabel("0 个模型")
     window.models_count_lbl.setObjectName("subtitle")
     meta.addWidget(window.models_count_lbl, 1)
-    legend = QLabel("按 Provider 分组 · 点击箭头展开/收起 · 双击模型设为默认")
-    legend.setObjectName("subtitle")
-    meta.addWidget(legend)
-    filter_card.content.addLayout(meta)
-    layout.addWidget(filter_card)
+    window.model_detail_toggle = window._btn(
+        "收起详情", window.toggle_model_detail, ghost=True
+    )
+    window.model_detail_toggle.setToolTip("窄窗口时可收起右侧详情栏")
+    meta.addWidget(window.model_detail_toggle)
+    layout.addLayout(meta)
+
+    actions = QHBoxLayout()
+    actions.setSpacing(8)
+    actions.addWidget(window._btn("设为默认", window.model_set_default, success=True))
+    actions.addWidget(window._btn("启动 Pi", window.model_launch, secondary=True))
+    actions.addWidget(
+        window._btn("测试选中", window.model_test_selected, secondary=True)
+    )
+    window.model_test_cancel_btn = window._btn(
+        "停止测试", window.model_test_cancel, danger=True
+    )
+    window.model_test_cancel_btn.setEnabled(False)
+    window.model_test_cancel_btn.setToolTip(
+        "停止正在进行的批量测试；未开始的项不再执行"
+    )
+    actions.addWidget(window.model_test_cancel_btn)
+    actions.addWidget(window._btn("收藏", window.model_add_favorite_batch, ghost=True))
+    actions.addStretch(1)
+    think_lbl = QLabel("Thinking")
+    think_lbl.setObjectName("muted")
+    actions.addWidget(think_lbl)
+    window.thinking_combo = QComboBox()
+    window.thinking_combo.addItems(
+        ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+    )
+    try:
+        from ... import core as _core
+
+        _default_thinking = _core.get_default_model()[2]
+        if _default_thinking:
+            window.thinking_combo.setCurrentText(_default_thinking)
+    except Exception:
+        window.thinking_combo.setCurrentText("high")
+    window.thinking_combo.setMaximumWidth(100)
+    actions.addWidget(window.thinking_combo)
+    test_lbl = QLabel("测试")
+    test_lbl.setObjectName("muted")
+    actions.addWidget(test_lbl)
+    window.test_mode_combo = QComboBox()
+    window.test_mode_combo.addItem("自动", "auto")
+    window.test_mode_combo.addItem("HTTP", "http")
+    window.test_mode_combo.addItem("Pi", "pi")
+    window.test_mode_combo.setMaximumWidth(90)
+    actions.addWidget(window.test_mode_combo)
+
+    more = QToolButton()
+    window.model_more_button = more
+    more.setText("更多")
+    more.setPopupMode(QToolButton.InstantPopup)
+    more.setProperty("secondary", True)
+    more.setCursor(Qt.PointingHandCursor)
+    more.setToolTip("高风险批量操作")
+    colors = tokens_for(*_theme_pair(window))
+    more.setIcon(icon("ellipsis", colors.text_muted, 17))
+    menu = QMenu(more)
+    menu.addAction("全选可见", window.model_select_visible)
+    menu.addAction("收藏当前过滤结果", window.model_fav_filtered)
+    menu.addAction("写入循环列表 (enabledModels)", window.model_set_enabled)
+    menu.addSeparator()
+    menu.addAction("测试默认模型", window.model_test_default)
+    menu.addAction("测试过滤结果", window.model_test_filtered)
+    menu.addAction("批量测试收藏", window.model_test_favorites)
+    menu.addAction("测试全部模型", window.model_test_all)
+    more.setMenu(menu)
+    actions.addWidget(more)
+    layout.addLayout(actions)
+
+    window.test_status = QLabel("可使用 Ctrl / Shift 多选模型")
+    window.test_status.setObjectName("subtitle")
+    window.test_status.setWordWrap(True)
+    layout.addWidget(window.test_status)
 
     splitter = QSplitter(Qt.Horizontal)
-    splitter.setChildrenCollapsible(False)
+    splitter.setChildrenCollapsible(True)
+    window.models_splitter = splitter
 
-    table_card = SurfaceCard(margins=(0, 0, 0, 12), spacing=10)
+    table_host = QWidget()
+    table_layout = QVBoxLayout(table_host)
+    table_layout.setContentsMargins(0, 0, 0, 0)
+    table_layout.setSpacing(8)
     window.models_table = QTreeWidget()
     window.models_table.setColumnCount(5)
     window.models_table.setHeaderLabels(["模型", "Provider", "能力", "状态", "延迟"])
@@ -104,7 +211,6 @@ def build_models_page(window) -> QWidget:
     )
 
     def _on_model_double_clicked(item, _column):
-        # 双击模型设为默认；双击 Provider 分组切换展开/收起
         data = item.data(0, Qt.UserRole) if item is not None else None
         if isinstance(data, (list, tuple)) and len(data) == 2 and data[1]:
             window.model_set_default()
@@ -113,101 +219,90 @@ def build_models_page(window) -> QWidget:
 
     window.models_table.itemDoubleClicked.connect(_on_model_double_clicked)
     if hasattr(window, "_on_model_selection_changed"):
-        window.models_table.itemSelectionChanged.connect(window._on_model_selection_changed)
-    table_card.content.addWidget(window.models_table, 1)
+        window.models_table.itemSelectionChanged.connect(
+            window._on_model_selection_changed
+        )
+    window.models_empty = EmptyState(
+        "尚未发现模型",
+        "请先配置至少一个 Provider，然后同步可用模型。",
+    )
+    window.models_empty.add_action(
+        window._btn("配置 Provider", lambda: window._goto_page("providers"), success=True)
+    )
+    window.models_empty.add_action(
+        window._btn("重新扫描", window.refresh_models, secondary=True)
+    )
+    window.models_empty.setVisible(False)
+    table_layout.addWidget(window.models_table, 1)
+    table_layout.addWidget(window.models_empty, 1)
+    splitter.addWidget(table_host)
 
-    action_row = QHBoxLayout()
-    action_row.setContentsMargins(12, 0, 12, 0)
-    action_row.setSpacing(8)
-    action_row.addWidget(window._btn("设为默认", window.model_set_default, success=True))
-    action_row.addWidget(window._btn("启动 Pi", window.model_launch, secondary=True))
-    action_row.addWidget(window._btn("测试选中", window.model_test_selected, secondary=True))
-    # BatchTestWorker 一直支持协作式取消，但此前没有任何 UI 入口。
-    window.model_test_cancel_btn = window._btn("停止测试", window.model_test_cancel, danger=True)
-    window.model_test_cancel_btn.setEnabled(False)
-    window.model_test_cancel_btn.setToolTip("停止正在进行的批量测试；未开始的项不再执行")
-    action_row.addWidget(window.model_test_cancel_btn)
-    action_row.addWidget(window._btn("收藏", window.model_add_favorite_batch, ghost=True))
-    action_row.addStretch(1)
-    action_row.addWidget(QLabel("Thinking"))
-    window.thinking_combo = QComboBox()
-    window.thinking_combo.addItems(["off", "minimal", "low", "medium", "high", "xhigh", "max"])
-    try:
-        from ... import core as _core
-        _default_thinking = _core.get_default_model()[2]
-        if _default_thinking:
-            window.thinking_combo.setCurrentText(_default_thinking)
-    except Exception:
-        window.thinking_combo.setCurrentText("high")
-    window.thinking_combo.setMaximumWidth(100)
-    action_row.addWidget(window.thinking_combo)
-    action_row.addWidget(QLabel("测试"))
-    window.test_mode_combo = QComboBox()
-    window.test_mode_combo.addItem("自动", "auto")
-    window.test_mode_combo.addItem("HTTP", "http")
-    window.test_mode_combo.addItem("Pi", "pi")
-    window.test_mode_combo.setMaximumWidth(90)
-    action_row.addWidget(window.test_mode_combo)
-
-    more = QToolButton()
-    window.model_more_button = more
-    more.setText("更多")
-    more.setPopupMode(QToolButton.InstantPopup)
-    more.setProperty("secondary", True)
-    more.setCursor(Qt.PointingHandCursor)
-    colors = tokens_for(*_theme_pair(window))
-    more.setIcon(icon("ellipsis", colors.text_muted, 17))
-    menu = QMenu(more)
-    menu.addAction("全选可见", window.model_select_visible)
-    menu.addAction("收藏当前过滤结果", window.model_fav_filtered)
-    menu.addAction("写入循环列表 (enabledModels)", window.model_set_enabled)
-    menu.addSeparator()
-    menu.addAction("测试默认模型", window.model_test_default)
-    menu.addAction("测试过滤结果", window.model_test_filtered)
-    menu.addAction("批量测试收藏", window.model_test_favorites)
-    menu.addAction("测试全部模型", window.model_test_all)
-    more.setMenu(menu)
-    action_row.addWidget(more)
-    table_card.content.addLayout(action_row)
-    window.test_status = QLabel("可使用 Ctrl / Shift 多选模型")
-    window.test_status.setObjectName("subtitle")
-    window.test_status.setWordWrap(True)
-    window.test_status.setContentsMargins(12, 0, 12, 0)
-    table_card.content.addWidget(window.test_status)
-    splitter.addWidget(table_card)
-
-    detail = SurfaceCard(margins=(17, 16, 17, 16), spacing=10)
-    detail.setMinimumWidth(255)
-    detail.setMaximumWidth(340)
-    detail.content.addWidget(SectionHeading("模型详情", "当前选中模型的能力、状态与快捷操作。"))
+    detail = SurfaceCard(margins=(16, 16, 16, 16), spacing=8)
+    window.model_detail_panel = detail
+    detail.setMinimumWidth(0)
     window.model_detail_badge = StatusBadge("未选择", "neutral")
     detail.content.addWidget(window.model_detail_badge, 0, Qt.AlignLeft)
     window.model_detail_title = QLabel("选择一个模型")
-    window.model_detail_title.setObjectName("heroValue")
+    window.model_detail_title.setObjectName("sectionTitle")
     window.model_detail_title.setWordWrap(True)
     detail.content.addWidget(window.model_detail_title)
     window.model_detail_provider = QLabel("—")
     window.model_detail_provider.setObjectName("heroProvider")
     detail.content.addWidget(window.model_detail_provider)
-    divider = QFrame()
-    divider.setObjectName("divider")
-    divider.setFixedHeight(1)
-    detail.content.addWidget(divider)
+    window.model_prop_table = PropertyTable()
+    window.model_prop_table.set_rows([("提示", "选择模型后显示关键属性")])
+    detail.content.addWidget(window.model_prop_table, 1)
+    window.model_error_panel = ErrorActionPanel()
+    window.model_error_panel.setVisible(False)
+    window.model_error_retry_btn = window._btn(
+        "重新测试", window.model_test_selected, secondary=True
+    )
+    window.model_error_provider_btn = window._btn(
+        "前往 Provider 设置", window.model_goto_provider, ghost=True
+    )
+    window.model_error_detail_btn = window._btn(
+        "查看详情", window.model_toggle_error_detail, ghost=True
+    )
+    window.model_error_copy_btn = window._btn(
+        "复制错误", window.model_copy_error, ghost=True
+    )
+    window.model_error_panel.add_action(window.model_error_retry_btn)
+    window.model_error_panel.add_action(window.model_error_provider_btn)
+    window.model_error_panel.add_action(window.model_error_detail_btn)
+    window.model_error_panel.add_action(window.model_error_copy_btn)
+    detail.content.addWidget(window.model_error_panel)
+    window.model_raw_toggle = window._btn(
+        "查看原始配置", window.toggle_model_raw, ghost=True
+    )
+    detail.content.addWidget(window.model_raw_toggle)
     window.model_detail_text = QPlainTextEdit()
     window.model_detail_text.setReadOnly(True)
     window.model_detail_text.setObjectName("mono")
     window.model_detail_text.setPlainText("选择模型后显示配置与测试状态。")
-    detail.content.addWidget(window.model_detail_text, 1)
-    detail_actions = QVBoxLayout()
-    detail_actions.setSpacing(7)
-    detail_actions.addWidget(window._btn("使用此模型", window.model_set_default, success=True))
-    detail_actions.addWidget(window._btn("测试连接", window.model_test_selected, secondary=True))
+    window.model_detail_text.setVisible(False)
+    window.model_detail_text.setMaximumHeight(160)
+    detail.content.addWidget(window.model_detail_text)
+    detail_actions = QHBoxLayout()
+    detail_actions.setSpacing(8)
+    detail_actions.addWidget(
+        window._btn("使用此模型", window.model_set_default, success=True)
+    )
+    detail_actions.addWidget(
+        window._btn("测试连接", window.model_test_selected, secondary=True)
+    )
     detail.content.addLayout(detail_actions)
     splitter.addWidget(detail)
     splitter.setStretchFactor(0, 1)
     splitter.setStretchFactor(1, 0)
-    splitter.setSizes([900, 290])
+    collapsed = bool((getattr(window, "mgr", None) or {}).get("ui_models_detail_collapsed"))
+    splitter.setSizes([900, 0] if collapsed else [900, 280])
+    detail.setVisible(not collapsed)
+    window.model_detail_toggle.setText("展开详情" if collapsed else "收起详情")
     layout.addWidget(splitter, 1)
+
+    find_shortcut = QShortcut(QKeySequence("Ctrl+F"), page)
+    find_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+    find_shortcut.activated.connect(window.model_filter.setFocus)
     return page
 
 
@@ -262,18 +357,27 @@ class ModelsPageMixin:
             colors = self._table_colors()
         res = self.test_results.get(m.key)
         muted = QColor(colors.text_muted)
-        if not res:
-            return "—", "—", muted, muted, "", ""
-        if res.get("pending"):
-            return "…", "…", QColor(colors.warning), QColor(colors.warning), "", ""
-        if res.get("available") is True:
-            status_text, status_color, status_tip = "✓", QColor(colors.success), "可用"
-        elif res.get("available") is False:
-            status_text, status_color = "✗", QColor(colors.danger)
-            status_tip = str(res.get("error") or res.get("preview") or "不可用")[:300]
+        view = classify_test_result(res)
+        if view.tone == "success":
+            status_color = QColor(colors.success)
+        elif view.tone == "danger":
+            status_color = QColor(colors.danger)
+        elif view.tone == "warning":
+            status_color = QColor(colors.warning)
+        elif view.tone == "info":
+            status_color = QColor(colors.info)
         else:
-            status_text, status_color, status_tip = "?", muted, ""
-        lat = res.get("latency_ms")
+            status_color = muted
+        table_label = {
+            "连接正常": "可用",
+            "连接失败": "失败",
+            "尚未测试": "未测",
+            "测试中": "测试中",
+        }.get(view.label, view.label)
+        status_tip = view.reason or view.label
+        if view.detail:
+            status_tip = f"{view.reason}\n{view.detail}"[:300]
+        lat = None if not res else res.get("latency_ms")
         if isinstance(lat, (int, float)):
             latency_text = f"{lat:.0f}ms"
             if lat < LATENCY_OK_MS:
@@ -284,7 +388,9 @@ class ModelsPageMixin:
                 latency_color = QColor(colors.danger)
         else:
             latency_text, latency_color = "—", muted
-        return status_text, latency_text, status_color, latency_color, status_tip, ""
+        if not res:
+            latency_text, latency_color = "—", muted
+        return table_label, latency_text, status_color, latency_color, status_tip, ""
 
     def _model_item_key(self, item) -> tuple[str, str] | None:
         """从树节点读取 (provider, model)；组节点（model 为空）返回 None。"""
@@ -340,14 +446,14 @@ class ModelsPageMixin:
     def model_test_selected(self):
         rows = self.selected_model_rows()
         if not rows:
-            QMessageBox.information(self, "提示", "请先在模型列表中选择一个或多个模型")
+            self.notify_warning("请先在模型列表中选择一个或多个模型")
             return
         self._run_model_tests([(m.provider, m.model) for m in rows])
 
     def model_test_default(self):
         provider, model, _thinking = core.get_default_model()
         if not provider or not model:
-            QMessageBox.information(self, "提示", "尚未设置默认模型")
+            self.notify_warning("尚未设置默认模型")
             return
         self._run_model_tests([(provider, model)])
 
@@ -359,7 +465,7 @@ class ModelsPageMixin:
             if parsed:
                 pairs.append(parsed)
         if not pairs:
-            QMessageBox.information(self, "提示", "收藏列表为空，请先收藏模型")
+            self.notify_warning("收藏列表为空，请先收藏模型")
             return
         self._run_model_tests(pairs)
 
@@ -370,7 +476,7 @@ class ModelsPageMixin:
             m = self.selected_model_row()
             rows = [m] if m else []
         if not rows:
-            QMessageBox.information(self, "提示", "请先多选模型（Ctrl/Shift）")
+            self.notify_warning("请先多选模型（Ctrl/Shift）")
             return
         favs = list(self.mgr.get("favorites") or [])
         n = 0
@@ -378,8 +484,7 @@ class ModelsPageMixin:
             if m.key not in favs:
                 favs.append(m.key)
                 n += 1
-        self.mgr["favorites"] = favs
-        self.persist_mgr()
+        self.persist_mgr(favorites=favs)
         self.fill_favorites()
         self.fill_models_table()
         self.status.showMessage(f"批量收藏 +{n}，共 {len(favs)}")
@@ -393,19 +498,38 @@ class ModelsPageMixin:
             for j in range(group.childCount()):
                 group.child(j).setSelected(True)
 
+    def _model_matches_capability(self, m: core.ModelInfo) -> bool:
+        cap = ""
+        combo = getattr(self, "model_capability_filter", None)
+        if combo is not None:
+            cap = str(combo.currentData() or "")
+        if not cap:
+            return True
+        if cap == "thinking":
+            return format_capability(m.thinking) == "支持"
+        if cap == "images":
+            return format_capability(m.images) == "支持"
+        return True
+
     def _visible_model_pairs(self) -> list[tuple[str, str]]:
         q = (self.model_filter.text() or "").lower().strip()
         rows = [
             m
             for m in self.models
-            if not q or q in m.key.lower() or q in m.provider.lower() or q in m.model.lower()
+            if self._model_matches_capability(m)
+            and (
+                not q
+                or q in m.key.lower()
+                or q in m.provider.lower()
+                or q in m.model.lower()
+            )
         ]
         return [(m.provider, m.model) for m in rows]
 
     def model_test_filtered(self):
         pairs = self._visible_model_pairs()
         if not pairs:
-            QMessageBox.information(self, "提示", "当前过滤结果为空")
+            self.notify_warning("当前过滤结果为空")
             return
         if len(pairs) > 30:
             if QMessageBox.question(
@@ -417,11 +541,15 @@ class ModelsPageMixin:
     def model_test_all(self):
         pairs = [(m.provider, m.model) for m in self.models]
         if not pairs:
-            QMessageBox.information(self, "提示", "请先刷新模型列表")
+            self.notify_warning("请先刷新模型列表")
             return
         if len(pairs) > 20:
             if QMessageBox.question(
-                self, "确认", f"将测试全部 {len(pairs)} 个模型，确认？"
+                self,
+                "测试全部模型",
+                f"将向各 Provider 发送 {len(pairs)} 次真实请求。\n\n"
+                "这可能产生费用，并占用较长时间。已完成的结果会即时写入列表。"
+                "确定继续？",
             ) != QMessageBox.Yes:
                 return
         self._run_model_tests(pairs)
@@ -437,15 +565,14 @@ class ModelsPageMixin:
             if key not in favs:
                 favs.append(key)
                 n += 1
-        self.mgr["favorites"] = favs
-        self.persist_mgr()
+        self.persist_mgr(favorites=favs)
         self.fill_favorites()
-        QMessageBox.information(self, "收藏", f"过滤结果新增收藏 {n} 个，共 {len(favs)}")
+        self.notify_success(f"过滤结果新增收藏 {n} 个，共 {len(favs)}")
 
     def fav_test(self):
         item = self.fav_list.currentItem()
         if not item:
-            QMessageBox.information(self, "提示", "请先选择一个收藏模型")
+            self.notify_warning("请先选择一个收藏模型")
             return
         parsed = core.parse_favorite_key(item.text())
         if not parsed:
@@ -457,7 +584,7 @@ class ModelsPageMixin:
         if not pairs:
             return
         if getattr(self, "_test_running", False):
-            QMessageBox.information(self, "提示", "已有测试进行中，请稍候完成后再试。")
+            self.notify_warning("已有测试进行中，请稍候完成后再试。")
             return
         mode = self._test_mode()
         workdir = self.workdir_edit.text().strip() or str(core.user_home())
@@ -479,9 +606,9 @@ class ModelsPageMixin:
                 "mode": mode,
             }
         self.fill_models_table()
-        self.status.showMessage(f"测试中 0/{n}（{mode}，完成一项刷新一项）…")
+        self.status.showMessage(f"正在测试模型 0 / {n}（{mode}）…")
         if hasattr(self, "test_status"):
-            self.test_status.setText(f"实时测试：0/{n} 完成 …")
+            self.test_status.setText(f"正在测试模型 0 / {n} …")
 
         w = self._track(
             BatchTestWorker(
@@ -515,6 +642,7 @@ class ModelsPageMixin:
             self._set_test_cancel_enabled(False)
             return
         worker.requestInterruption()
+        self._test_running = False
         self._set_test_cancel_enabled(False)
         self.status.showMessage("已请求停止测试，正在收尾已发起的请求…")
         if hasattr(self, "test_status"):
@@ -544,10 +672,12 @@ class ModelsPageMixin:
             self.history_refresh()
         except Exception as e:
             logger.warning("history refresh during model test failed: %s", e)
-        self.status.showMessage(f"测试中 {done}/{total} · 可用 {ok_n} · 刚完成 {key}")
+        self.status.showMessage(f"正在测试模型 {done} / {total} · 可用 {ok_n} · 刚完成 {key}")
         if hasattr(self, "test_status"):
             recent = " | ".join(self._test_lines[-4:])
-            self.test_status.setText(f"进度 {done}/{total}（可用 {ok_n}） · {recent}")
+            self.test_status.setText(
+                f"正在测试模型 {done} / {total}（可用 {ok_n}） · {recent}"
+            )
 
     def _on_model_tests_done(self, results: list):
         self._test_running = False
@@ -569,14 +699,26 @@ class ModelsPageMixin:
             self.history_refresh()
         except Exception as e:
             logger.warning("history refresh after model tests failed: %s", e)
-        summary = f"测试完成：{ok_n}/{len(results)} 可用（已实时写入列表与历史）"
+        expected = int(getattr(self, "_test_total", 0) or 0)
+        cancelled = expected > 0 and len(results) < expected
+        verb = "已停止" if cancelled else "完成"
+        summary = f"测试{verb}：{ok_n}/{len(results)} 可用（已实时写入列表与历史）"
         self.status.showMessage(summary)
         if hasattr(self, "test_status"):
             self.test_status.setText(summary + (" · " + " | ".join(lines[-6:]) if lines else ""))
+        try:
+            self.refresh_dashboard()
+        except Exception as e:
+            logger.warning("dashboard refresh after model tests failed: %s", e)
         # only popup for very small batches; large ones already streamed to UI
         if len(results) <= 2:
-            nl = chr(10)
-            QMessageBox.information(self, "测试结果", summary + nl + nl.join(lines))
+            body = summary + ("\n\n" + "\n".join(lines) if lines else "")
+            tone = "success" if ok_n else "warning"
+            show = getattr(self, "show_result", None)
+            if callable(show):
+                show("测试结果", body, tone=tone)
+            else:
+                QMessageBox.information(self, "测试结果", body)
 
     def _on_model_tests_fail(self, err: str):
         self._test_running = False
@@ -592,20 +734,64 @@ class ModelsPageMixin:
         QMessageBox.warning(self, "测试失败", err)
 
     def refresh_models(self):
-        self.status.showMessage("正在读取 pi --list-models …")
-        w = self._track(Worker(core.list_models))
+        existing = getattr(self, "_models_refresh_worker", None)
+        try:
+            if existing is not None and existing.isRunning():
+                self.refresh_models_cancel()
+                return
+        except RuntimeError:
+            pass
+
+        def job(is_cancelled=None):
+            return core.list_models(is_cancelled=is_cancelled)
+
+        self._set_models_refresh_busy(True)
+        self.status.showMessage("正在读取模型列表…")
+        w = self._track(Worker(job))
+        self._models_refresh_worker = w
         w.done.connect(self._on_models_loaded)
-        w.failed.connect(lambda e: QMessageBox.warning(self, "错误", e))
+        w.failed.connect(self._on_models_load_fail)
         w.start()
 
+    def refresh_models_cancel(self) -> None:
+        worker = getattr(self, "_models_refresh_worker", None)
+        try:
+            if worker is None or not worker.isRunning():
+                self._set_models_refresh_busy(False)
+                return
+            worker.requestInterruption()
+        except RuntimeError:
+            self._set_models_refresh_busy(False)
+            return
+        self.status.showMessage("正在取消刷新…")
+
+    def _set_models_refresh_busy(self, busy: bool) -> None:
+        setter = getattr(self, "_set_action_busy", None)
+        if callable(setter):
+            setter(getattr(self, "models_refresh_btn", None), busy, idle="刷新", busy_text="正在刷新…")
+        cancel = getattr(self, "models_refresh_cancel_btn", None)
+        if cancel is not None:
+            cancel.setEnabled(bool(busy))
+
+    def _on_models_load_fail(self, err: str) -> None:
+        self._models_refresh_worker = None
+        self._set_models_refresh_busy(False)
+        QMessageBox.warning(self, "错误", err)
+
     def _on_models_loaded(self, models: list[core.ModelInfo]):
+        self._models_refresh_worker = None
+        self._set_models_refresh_busy(False)
         self.models = models
         self.fill_models_table()
         try:
             self.refresh_chat_model_choices()
         except Exception:
             pass
-        self.status.showMessage(f"已加载 {len(models)} 个模型")
+        summary = f"已加载 {len(models)} 个模型"
+        self.status.showMessage(summary)
+        notify = getattr(self, "notify_success", None)
+        if callable(notify):
+            notify(summary)
 
     def fill_models_table(self):
         q = (self.model_filter.text() or "").lower().strip()
@@ -646,6 +832,8 @@ class ModelsPageMixin:
             if only_fav and m.key not in fav_set:
                 continue
             if q and q not in m.key.lower() and q not in m.provider.lower() and q not in m.model.lower():
+                continue
+            if not self._model_matches_capability(m):
                 continue
             groups.setdefault(m.provider, []).append(m)
 
@@ -789,6 +977,8 @@ class ModelsPageMixin:
             if prov:
                 extra += f" · {prov}"
             self.models_count_lbl.setText(f"显示 {shown} / 共 {total}{extra}")
+        self._sync_models_empty_state(shown=sum(len(v) for v in groups.values()))
+        self._adapt_models_columns()
 
     def update_model_row_status(self, provider: str, model: str) -> bool:
         """增量刷新单行的状态/延迟列；命中返回 True，未命中返回 False。
@@ -823,6 +1013,9 @@ class ModelsPageMixin:
             # 树已在别处重建，索引失效：让调用方走全量重建
             self._model_row_index = {}
             return False
+        current = self._model_item_key(self.models_table.currentItem())
+        if current == (provider, model) and hasattr(self, "_on_model_selection_changed"):
+            self._on_model_selection_changed()
         return True
 
     def _remember_tree_expanded(self, item, expanded: bool) -> None:
@@ -845,13 +1038,16 @@ class ModelsPageMixin:
     def model_set_default(self):
         m = self.selected_model_row()
         if not m:
-            QMessageBox.information(self, "提示", "请先选择模型")
+            self.notify_warning("请先选择模型")
             return
         core.set_default_model(m.provider, m.model, self.thinking_combo.currentText())
         self.refresh_dashboard()
         self.settings_load()
         self.fill_models_table()
         self.status.showMessage(f"默认模型已切换为 {m.key}")
+        notify = getattr(self, "notify_success", None)
+        if callable(notify):
+            notify(f"默认模型已切换为 {m.key}")
 
     def model_launch(self):
         m = self.selected_model_row()
@@ -865,9 +1061,101 @@ class ModelsPageMixin:
         if m and m.key not in favs:
             favs.append(m.key)
         if not favs:
-            QMessageBox.information(self, "提示", "请先收藏一些模型，或选中一个模型")
+            self.notify_warning("请先收藏一些模型，或选中一个模型")
+            return
+        if QMessageBox.question(
+            self,
+            "覆盖 enabledModels",
+            "将用当前收藏列表覆盖 settings.json 中的 enabledModels。\n\n"
+            "Pi 会话里 Ctrl+P 循环切换将只包含这些模型，"
+            "不会删除 models.json 里的其它模型。确定写入？",
+        ) != QMessageBox.Yes:
             return
         core.set_enabled_models(favs)
         self.settings_load()
         self.status.showMessage(f"enabledModels = {favs}")
-        QMessageBox.information(self, "已更新", "已写入 settings.enabledModels。\n在 Pi 会话中可用 Ctrl+P 在列表中循环切换。")
+        self.notify_success("已写入 enabledModels，Pi 会话里可用 Ctrl+P 循环切换")
+
+    def toggle_model_detail(self) -> None:
+        panel = getattr(self, "model_detail_panel", None)
+        splitter = getattr(self, "models_splitter", None)
+        if panel is None:
+            return
+        visible = panel.isHidden()
+        panel.setVisible(visible)
+        if splitter is not None:
+            splitter.setSizes([900, 280] if visible else [900, 0])
+        button = getattr(self, "model_detail_toggle", None)
+        if button is not None:
+            button.setText("收起详情" if visible else "展开详情")
+        try:
+            self.persist_mgr(ui_models_detail_collapsed=not visible)
+        except Exception:
+            pass
+
+    def toggle_model_raw(self) -> None:
+        editor = getattr(self, "model_detail_text", None)
+        if editor is None:
+            return
+        editor.setVisible(editor.isHidden())
+        button = getattr(self, "model_raw_toggle", None)
+        if button is not None:
+            button.setText("隐藏原始配置" if not editor.isHidden() else "查看原始配置")
+
+    def model_goto_provider(self) -> None:
+        info = self.selected_model_row()
+        self._goto_page("providers")
+        if info is None or not hasattr(self, "provider_list"):
+            return
+        matches = self.provider_list.findItems(info.provider, Qt.MatchExactly)
+        if matches:
+            self.provider_list.setCurrentItem(matches[0])
+
+    def model_toggle_error_detail(self) -> None:
+        panel = getattr(self, "model_error_panel", None)
+        if panel is not None:
+            panel.toggle_detail()
+
+    def model_copy_error(self) -> None:
+        panel = getattr(self, "model_error_panel", None)
+        text = panel.detail_text() if panel is not None else ""
+        if not text:
+            return
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.clipboard().setText(text)
+        self.status.showMessage("已复制错误详情", 4000)
+
+    def _sync_models_empty_state(self, *, shown: int) -> None:
+        empty = getattr(self, "models_empty", None)
+        table = getattr(self, "models_table", None)
+        if empty is None or table is None:
+            return
+        if shown:
+            empty.setVisible(False)
+            table.setVisible(True)
+            return
+        table.setVisible(False)
+        empty.setVisible(True)
+        if self.models:
+            empty.set_copy(
+                "没有匹配的模型",
+                "当前搜索或筛选条件下没有结果。可以清除筛选后再试。",
+            )
+        else:
+            empty.set_copy(
+                "尚未发现模型",
+                "请先配置至少一个 Provider，然后同步可用模型。",
+            )
+
+    def _adapt_models_columns(self) -> None:
+        table = getattr(self, "models_table", None)
+        if table is None:
+            return
+        width = max(table.width(), self.width() if hasattr(self, "width") else 0)
+        try:
+            table.setColumnHidden(1, True)
+            table.setColumnHidden(2, width < 1100)
+            table.setColumnHidden(4, width < 900)
+        except Exception:
+            pass

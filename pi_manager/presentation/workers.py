@@ -163,7 +163,7 @@ class WorkerTrackerMixin:
 
     def _note_detached_workers(self) -> None:
         """把「请求仍在后台收尾」写到对话框自己的状态标签（可被子类覆写）。"""
-        for attr in ("fetch_status", "status", "log"):
+        for attr in ("fetch_status", "verify_status", "status", "log"):
             label = getattr(self, attr, None)
             setter = getattr(label, "setText", None) if label is not None else None
             if callable(setter):
@@ -220,8 +220,7 @@ class BatchTestWorker(QThread):
                     on_one=on_one,
                     **health_kwargs,
                 )
-                if self.isInterruptionRequested():
-                    return
+                # 取消后仍回传已完成项：界面要立刻解除「进行中」，并展示部分结果。
                 self.done.emit(result)
                 return
 
@@ -242,8 +241,6 @@ class BatchTestWorker(QThread):
                 append_history_each=True,
                 is_cancelled=self.isInterruptionRequested,
             )
-            if self.isInterruptionRequested():
-                return
             self.done.emit(results)
         except Exception as e:
             logger.exception("BatchTestWorker failed")

@@ -1,6 +1,9 @@
 """启动 Pi：构造参数、外部终端、非交互 -p。"""
 from __future__ import annotations
 
+from collections.abc import Callable
+
+
 def _core():
     from . import core
 
@@ -78,6 +81,7 @@ def run_pi_print(
     model: str | None = None,
     thinking: str | None = None,
     timeout: float = 300,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> tuple[int, str, str]:
     args = build_pi_launch_args(provider=provider, model=model, thinking=thinking)
     args = _core().append_language_args(args)
@@ -86,15 +90,20 @@ def run_pi_print(
     args += ["--approve"]
     attempted_key_ids: set[str] = set()
     while True:
+        if is_cancelled and is_cancelled():
+            return -1, "", "已停止生成"
         credential = _core().provider_runtime_credential(provider)
         p = _core().run_pi(
             args,
             cwd=workdir,
             timeout=timeout,
             env=credential["env"],
+            is_cancelled=is_cancelled,
         )
         stdout = p.stdout or ""
         stderr = p.stderr or ""
+        if (is_cancelled and is_cancelled()) or "已停止生成" in stderr:
+            return -1, stdout, "已停止生成"
         key_id = str(credential.get("key_id") or "")
         if p.returncode == 0 or not key_id or not _core().is_provider_key_error(
             p.returncode, stdout, stderr

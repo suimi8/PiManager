@@ -129,6 +129,14 @@ def test_run_self_check_returns_list(isolated_home, monkeypatch):
     assert "配置目录" in names
 
 
+def test_run_self_check_cancelled_returns_partial(isolated_home):
+    checks = extras.run_self_check(is_cancelled=lambda: True)
+    assert checks
+    assert checks[0]["name"] == "自检进度"
+    assert checks[0]["ok"] is False
+    assert {c["name"] for c in checks} == {"自检进度"}
+
+
 # ---------------------------------------------------------------------------
 # list_sessions_filtered
 # ---------------------------------------------------------------------------

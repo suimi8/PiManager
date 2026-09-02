@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from ... import extras
-from ..components import SurfaceCard
+from ..components import EmptyState, SurfaceCard
 
 
 def build_history_page(window) -> QWidget:
@@ -57,7 +57,16 @@ def build_history_page(window) -> QWidget:
     window.history_table.setHorizontalHeaderLabels(["时间", "模型", "可用", "延迟", "方式", "错误 / 预览"])
     window.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
     window._polish_table(window.history_table)
+    window.history_empty = EmptyState(
+        "还没有测试记录",
+        "在模型页测试连接后，可用性和延迟会出现在这里。",
+    )
+    window.history_empty.add_action(
+        window._btn("去测试模型", lambda: window._goto_page("models"), success=True)
+    )
+    window.history_empty.setVisible(False)
     table_card.content.addWidget(window.history_table, 1)
+    table_card.content.addWidget(window.history_empty, 1)
     layout.addWidget(table_card, 1)
     return page
 
@@ -84,9 +93,25 @@ class HistoryPageMixin:
             self.history_table.setItem(i, 4, QTableWidgetItem(str(r.get("mode") or "")))
             extra = r.get("error") or r.get("preview") or ""
             self.history_table.setItem(i, 5, QTableWidgetItem(str(extra)[:120]))
+        empty = getattr(self, "history_empty", None)
+        if empty is not None:
+            has_rows = bool(rows)
+            self.history_table.setVisible(has_rows)
+            empty.setVisible(not has_rows)
+            if not has_rows and q:
+                empty.set_copy("没有匹配的测试记录", "当前搜索条件下没有结果。可以清空搜索后再试。")
+            elif not has_rows:
+                empty.set_copy(
+                    "还没有测试记录",
+                    "在模型页测试连接后，可用性和延迟会出现在这里。",
+                )
 
     def history_clear(self):
-        if QMessageBox.question(self, "确认", "清空全部测试历史？") != QMessageBox.Yes:
+        if QMessageBox.question(
+            self,
+            "清空测试历史",
+            "将删除本机保存的全部连接测试记录，不影响模型配置、收藏和 API Key。\n\n确定清空？",
+        ) != QMessageBox.Yes:
             return
         extras.save_history([])
         self.history_refresh()

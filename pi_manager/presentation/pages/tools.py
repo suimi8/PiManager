@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 
 from ... import core
 from ... import extras
-from ..components import SectionHeading, SurfaceCard
+from ..components import EmptyState, SectionHeading, SurfaceCard
 
 logger = logging.getLogger(__name__)
 
@@ -38,19 +38,40 @@ def build_tools_page(window) -> QWidget:
     body = QWidget()
     layout = QVBoxLayout(body)
     layout.setContentsMargins(26, 22, 26, 24)
-    layout.setSpacing(12)
+    layout.setSpacing(16)
+
+    intro = QLabel(
+        "本页用于环境自检、配置导入导出与更新，不会在这里直接执行模型工具。"
+    )
+    intro.setObjectName("subtitle")
+    intro.setWordWrap(True)
+    layout.addWidget(intro)
 
     selfcheck = SurfaceCard(margins=(17, 15, 17, 15), spacing=10)
     selfcheck_header = QHBoxLayout()
     selfcheck_header.addWidget(SectionHeading("环境自检", "验证 Pi CLI、配置路径、密钥存储与运行环境。"), 1)
-    selfcheck_header.addWidget(window._btn("运行自检", window.self_check_run, success=True), 0, Qt.AlignTop)
+    window.selfcheck_run_btn = window._btn("运行自检", window.self_check_run, success=True)
+    window.selfcheck_cancel_btn = window._btn("取消自检", window.self_check_cancel, ghost=True)
+    window.selfcheck_cancel_btn.setEnabled(False)
+    window.selfcheck_cancel_btn.setToolTip("停止尚未完成的检查；已完成的项目会保留")
+    selfcheck_header.addWidget(window.selfcheck_run_btn, 0, Qt.AlignTop)
+    selfcheck_header.addWidget(window.selfcheck_cancel_btn, 0, Qt.AlignTop)
     selfcheck.content.addLayout(selfcheck_header)
     window.selfcheck_table = QTableWidget(0, 3)
     window.selfcheck_table.setHorizontalHeaderLabels(["项目", "状态", "详情"])
     window.selfcheck_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
     window._polish_table(window.selfcheck_table)
-    window.selfcheck_table.setMinimumHeight(210)
+    window.selfcheck_table.setMinimumHeight(140)
+    window.selfcheck_empty = EmptyState(
+        "尚未运行自检",
+        "运行一次后，这里会列出 Pi CLI、配置目录和密钥存储是否就绪。",
+    )
+    window.selfcheck_empty.add_action(
+        window._btn("运行自检", window.self_check_run, success=True)
+    )
     selfcheck.content.addWidget(window.selfcheck_table)
+    selfcheck.content.addWidget(window.selfcheck_empty)
+    window.selfcheck_table.setVisible(False)
     layout.addWidget(selfcheck)
 
     transfers = SurfaceCard(margins=(17, 15, 17, 15), spacing=10)
@@ -75,7 +96,7 @@ def build_tools_page(window) -> QWidget:
     backup_row = QHBoxLayout()
     backup_row.setSpacing(8)
     window.backup_combo = QComboBox()
-    window.backup_combo.setMinimumWidth(340)
+    window.backup_combo.setMinimumWidth(200)
     backup_row.addWidget(window.backup_combo, 1)
     backup_row.addWidget(window._btn("刷新", window.backup_refresh, ghost=True))
     backup_row.addWidget(window._btn("恢复所选备份", window.backup_restore, danger=True))
@@ -98,7 +119,12 @@ def build_tools_page(window) -> QWidget:
     window.update_url_edit = QLineEdit(str((window.mgr or {}).get("update_manifest_url") or ""))
     window.update_url_edit.setPlaceholderText("自定义 manifest URL（留空使用 GitHub Releases）")
     update_row.addWidget(window.update_url_edit, 1)
-    update_row.addWidget(window._btn("检查更新", window.check_manager_update, success=True))
+    window.update_check_btn = window._btn("检查更新", window.check_manager_update, success=True)
+    window.update_cancel_btn = window._btn("取消检查", window.check_manager_update_cancel, ghost=True)
+    window.update_cancel_btn.setEnabled(False)
+    window.update_cancel_btn.setToolTip("停止尚未发出的更新请求")
+    update_row.addWidget(window.update_check_btn)
+    update_row.addWidget(window.update_cancel_btn)
     updates.content.addLayout(update_row)
     window.update_status = QLabel("尚未检查")
     window.update_status.setObjectName("subtitle")
@@ -133,7 +159,7 @@ class ToolsPageMixin:
     def backup_restore(self):
         combo = getattr(self, "backup_combo", None)
         if combo is None or combo.count() == 0:
-            QMessageBox.information(self, "备份恢复", "请先刷新并选择一个备份。")
+            self.notify_warning("请先刷新并选择一个备份。")
             return
         data = combo.currentData()
         if not data:
@@ -148,23 +174,69 @@ class ToolsPageMixin:
             return
         result = core.restore_config_backup(path)
         if result.get("ok"):
-            QMessageBox.information(self, "恢复成功", f"已恢复 {result['target']}。正在刷新界面…")
+            self.notify_success(f"已恢复 {result['target']}。正在刷新界面…")
             self.refresh_all()
             self.backup_refresh()
         else:
             QMessageBox.critical(self, "恢复失败", str(result.get("error") or "未知错误"))
 
     def self_check_run(self):
-        def job():
-            return extras.run_self_check()
+        existing = getattr(self, "_selfcheck_worker", None)
+        try:
+            if existing is not None and existing.isRunning():
+                self.self_check_cancel()
+                return
+        except RuntimeError:
+            pass
 
+        def job(is_cancelled=None):
+            return extras.run_self_check(is_cancelled=is_cancelled)
+
+        self._set_selfcheck_busy(True)
         w = self._track(self._worker_fn(job))
+        self._selfcheck_worker = w
         w.done.connect(self._on_selfcheck_done)
-        w.failed.connect(lambda e: QMessageBox.warning(self, "自检失败", e))
+        w.failed.connect(self._on_selfcheck_fail)
         w.start()
         self.status.showMessage("正在自检…")
 
+    def self_check_cancel(self) -> None:
+        worker = getattr(self, "_selfcheck_worker", None)
+        try:
+            if worker is None or not worker.isRunning():
+                self._set_selfcheck_busy(False)
+                return
+            worker.requestInterruption()
+        except RuntimeError:
+            self._set_selfcheck_busy(False)
+            return
+        self.status.showMessage("正在取消自检…")
+        notify = getattr(self, "notify_warning", None)
+        if callable(notify):
+            notify("正在取消自检…")
+
+    def _set_selfcheck_busy(self, busy: bool) -> None:
+        setter = getattr(self, "_set_action_busy", None)
+        if callable(setter):
+            setter(getattr(self, "selfcheck_run_btn", None), busy, idle="运行自检", busy_text="正在自检…")
+        header = getattr(self, "header_selfcheck_btn", None)
+        if header is not None:
+            header.setEnabled(True)
+            header.setText("取消自检" if busy else "自检")
+        cancel = getattr(self, "selfcheck_cancel_btn", None)
+        if cancel is not None:
+            cancel.setEnabled(bool(busy))
+
+    def _set_selfcheck_idle(self) -> None:
+        self._selfcheck_worker = None
+        self._set_selfcheck_busy(False)
+
+    def _on_selfcheck_fail(self, err: str) -> None:
+        self._set_selfcheck_idle()
+        QMessageBox.warning(self, "自检失败", err)
+
     def _on_selfcheck_done(self, checks: list):
+        self._set_selfcheck_idle()
         if not hasattr(self, "selfcheck_table"):
             return
         self.selfcheck_table.setRowCount(len(checks))
@@ -174,7 +246,16 @@ class ToolsPageMixin:
             self.selfcheck_table.setItem(i, 1, QTableWidgetItem("通过" if ok else "注意"))
             self.selfcheck_table.setItem(i, 2, QTableWidgetItem(str(c.get("detail") or "")))
         bad = sum(1 for c in checks if not c.get("ok"))
-        self.status.showMessage(f"自检完成：{len(checks) - bad}/{len(checks)} 通过")
+        empty = getattr(self, "selfcheck_empty", None)
+        has_rows = bool(checks)
+        self.selfcheck_table.setVisible(has_rows)
+        if empty is not None:
+            empty.setVisible(not has_rows)
+        summary = f"自检完成：{len(checks) - bad}/{len(checks)} 通过"
+        self.status.showMessage(summary)
+        notify = getattr(self, "notify_success" if bad == 0 else "notify_warning", None)
+        if callable(notify):
+            notify(summary)
 
     def export_config(self):
         path, _ = QFileDialog.getSaveFileName(self, "导出配置", str(Path.home() / "pi-manager-config.zip"), "ZIP (*.zip)")
@@ -183,12 +264,17 @@ class ToolsPageMixin:
         try:
             with self._busy("正在打包配置…"):
                 out = extras.export_config_bundle(path, include_secrets=False)
-            QMessageBox.information(self, "已导出", f"已导出到：\n{out}\n（密钥已脱敏/占位）")
+            self.notify_success(f"已导出到：{out}（密钥已脱敏）")
         except Exception as e:
             QMessageBox.critical(self, "导出失败", str(e))
 
     def export_config_with_secrets(self):
-        if QMessageBox.question(self, "确认", "将导出包含 API Key 的配置包，请妥善保管。继续？") != QMessageBox.Yes:
+        if QMessageBox.question(
+            self,
+            "导出含密钥配置",
+            "导出包将包含已加密的 API Key。任何人拿到这个 ZIP 和你设置的密码，都能恢复全部密钥。\n\n"
+            "请只在本机备份或可信通道中使用。确定继续？",
+        ) != QMessageBox.Yes:
             return
         path, _ = QFileDialog.getSaveFileName(self, "导出配置（含密钥）", str(Path.home() / "pi-manager-config-secrets.zip"), "ZIP (*.zip)")
         if not path:
@@ -216,7 +302,7 @@ class ToolsPageMixin:
         try:
             with self._busy("正在打包配置并加密密钥…"):
                 out = extras.export_config_bundle(path, include_secrets=True, password=password)
-            QMessageBox.information(self, "已导出", f"已导出到：\n{out}")
+            self.notify_success(f"已导出到：{out}")
         except Exception as e:
             QMessageBox.critical(self, "导出失败", str(e))
 
@@ -355,39 +441,79 @@ class ToolsPageMixin:
         warns = res.get("warnings") or []
         if warns:
             lines += ["", "警告：", *(f"  · {item}" for item in warns)]
-        QMessageBox.information(self, "导入成功", "\n".join(lines))
+        body = "\n".join(lines)
+        tone = "warning" if (skipped or warns or risks) else "success"
+        show = getattr(self, "show_result", None)
+        if callable(show):
+            show("导入成功", body, tone=tone)
+        else:
+            QMessageBox.information(self, "导入成功", body)
 
     def secure_keys_now(self):
         with self._busy("正在把明文 API Key 写入系统密钥库…"):
             res = extras.secure_existing_keys()
-        QMessageBox.information(
-            self,
-            "加密完成",
-            f"已处理 provider 明文 Key。\n密钥库条目：{len(res.get('secrets') or [])}",
-        )
+        self.notify_success(f"已处理明文 Key。密钥库条目：{len(res.get('secrets') or [])}")
         self.refresh_providers()
 
     def check_manager_update(self, silent: bool = False):
         if hasattr(self, "update_url_edit"):
             url = self.update_url_edit.text().strip()
-            self.mgr["update_manifest_url"] = url
-            self.persist_mgr()
+            self.persist_mgr(update_manifest_url=url)
 
-        def job():
-            return extras.check_manager_update()
+        existing = getattr(self, "_update_worker", None)
+        try:
+            if existing is not None and existing.isRunning():
+                self.check_manager_update_cancel()
+                return
+        except RuntimeError:
+            pass
 
+        def job(is_cancelled=None):
+            return extras.check_manager_update(is_cancelled=is_cancelled)
+
+        self._set_update_busy(True)
         w = self._track(self._worker_fn(job))
+        self._update_worker = w
         w.done.connect(lambda res: self._on_mgr_update(res, silent=silent))
-        w.failed.connect(
-            lambda e: (
-                self.status.showMessage(f"检查更新失败: {e}")
-                if silent
-                else QMessageBox.warning(self, "检查失败", e)
-            )
-        )
+        w.failed.connect(lambda e: self._on_mgr_update_fail(e, silent=silent))
         w.start()
 
+    def check_manager_update_cancel(self) -> None:
+        worker = getattr(self, "_update_worker", None)
+        try:
+            if worker is None or not worker.isRunning():
+                self._set_update_busy(False)
+                return
+            worker.requestInterruption()
+        except RuntimeError:
+            self._set_update_busy(False)
+            return
+        self.status.showMessage("正在取消更新检查…")
+
+    def _set_update_busy(self, busy: bool) -> None:
+        setter = getattr(self, "_set_action_busy", None)
+        if callable(setter):
+            setter(getattr(self, "update_check_btn", None), busy, idle="检查更新", busy_text="正在检查更新…")
+        cancel = getattr(self, "update_cancel_btn", None)
+        if cancel is not None:
+            cancel.setEnabled(bool(busy))
+
+    def _on_mgr_update_fail(self, err: str, *, silent: bool = False) -> None:
+        self._update_worker = None
+        self._set_update_busy(False)
+        if silent:
+            self.status.showMessage(f"检查更新失败: {err}")
+        else:
+            QMessageBox.warning(self, "检查失败", err)
+
     def _on_mgr_update(self, res: dict, silent: bool = False):
+        self._update_worker = None
+        self._set_update_busy(False)
+        if res.get("cancelled"):
+            self.status.showMessage(res.get("message") or "已取消检查更新")
+            if hasattr(self, "update_status"):
+                self.update_status.setText(res.get("message") or "已取消检查更新")
+            return
         self._last_manager_update = dict(res or {})
         try:
             self._refresh_update_indicators()
@@ -408,7 +534,7 @@ class ToolsPageMixin:
 
         if not res.get("has_update"):
             if not silent:
-                QMessageBox.information(self, "更新检查", msg)
+                self.notify_success(msg)
             return
 
         remote = str(res.get("remote") or "")

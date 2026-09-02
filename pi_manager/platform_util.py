@@ -568,6 +568,14 @@ def npm_global_roots() -> list[Path]:
     return out
 
 
+def _pi_cli_js_candidates(root: Path, scope: str, name: str) -> list[Path]:
+    """npm 全局根下 pi CLI 的候选路径（node_modules 与 lib/node_modules）。"""
+    return [
+        root / "node_modules" / scope / name / "dist" / "cli.js",
+        root / "lib" / "node_modules" / scope / name / "dist" / "cli.js",
+    ]
+
+
 def find_pi_cli_js() -> Path | None:
     packages = (
         ("@earendil-works", "pi-coding-agent"),
@@ -575,12 +583,7 @@ def find_pi_cli_js() -> Path | None:
     )
     for root in npm_global_roots():
         for scope, name in packages:
-            candidates = [
-                root / "node_modules" / scope / name / "dist" / "cli.js",
-                root / "lib" / "node_modules" / scope / name / "dist" / "cli.js",
-                root / "lib" / "node_modules" / scope / name / "dist" / "cli.js",
-            ]
-            for c in candidates:
+            for c in _pi_cli_js_candidates(root, scope, name):
                 if c.is_file():
                     return c
     return None

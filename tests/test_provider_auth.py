@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -215,9 +216,9 @@ def test_npm_commands_do_not_invoke_a_shell(monkeypatch):
         stdout = "1.2.3\n"
         stderr = ""
 
-    monkeypatch.setattr(core.shutil, "which", lambda name: f"C:/tools/{name}")
+    monkeypatch.setattr(shutil, "which", lambda name: f"C:/tools/{name}")
     monkeypatch.setattr(
-        core.subprocess,
+        subprocess,
         "run",
         lambda argv, **kwargs: calls.append((argv, kwargs)) or Result(),
     )

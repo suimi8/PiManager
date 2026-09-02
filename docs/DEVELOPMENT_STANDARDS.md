@@ -83,7 +83,9 @@ CONTRIBUTING.md（新贡献者第一入口，导航壳）
 - import 顺序：标准库 → 第三方 → 本地（`pi_manager`/`main`），组间空行（isort 风格）。
 - `pi_manager/core.py` 是公共 API 汇聚模块，**禁止删除其中的 re-export**（曾被
   ruff 误删 `ProviderKeyError` 导致下游 import 失败；该文件 F401 已豁免，清理前
-  必须先确认无下游引用）。
+  必须先确认无下游引用）。re-export 仅指 `from .xxx import ...` 的转发符号；
+  顶层 `import shutil` / `import subprocess` / `import sys` 不在该列表内，可以
+  删除。测试应直接打桩标准库模块，不得依赖 core.py 为这三者做 re-export。
 
 ### 2.2 TypeScript（扩展侧）
 

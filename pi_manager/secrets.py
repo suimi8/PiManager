@@ -27,11 +27,21 @@ from . import platform_util
 from .storage import locked
 
 SERVICE = "PiManager"
+logger = logging.getLogger(__name__)
 _KEYRING = None
 _KEYRING_TRIED = False
 _KEYRING_TRIED_AT = 0.0
 _KEYRING_RETRY_COOLDOWN = 60.0
 _KEYRING_PROBE_TIMEOUT = 5.0
+_KEYRING_UNAVAILABLE_REASON = ""
+_KEYRING_FALLBACK_LOGGED = False
+
+# 进程内热路径缓存：盐不变则 PBKDF2 密钥不变；vault 按路径+mtime+size 命中。
+_KDF_LOCK = threading.Lock()
+_KDF_CACHED_SALT: bytes | None = None
+_KDF_CACHED_KEY: bytes | None = None
+_VAULT_CACHE_LOCK = threading.Lock()
+_VAULT_CACHE: tuple[tuple[str, int, int], dict[str, str]] | None = None
 
 
 class VaultCorruptError(ValueError):
@@ -81,10 +91,28 @@ def _keyring_backend_is_unsafe(backend: Any) -> bool:
     return any(marker in name for marker in ("file", "plaintext", "keyrings.alt"))
 
 
+def _log_keyring_fallback_once(
+    reason: str, *, exc: BaseException | None = None
+) -> None:
+    """OS keyring 不可用时记一条 warning（只一次），绝不写入密钥值。"""
+    global _KEYRING_UNAVAILABLE_REASON, _KEYRING_FALLBACK_LOGGED
+    _KEYRING_UNAVAILABLE_REASON = reason
+    if not _KEYRING_FALLBACK_LOGGED:
+        _KEYRING_FALLBACK_LOGGED = True
+        logger.warning(
+            "OS keyring 不可用（%s），已回退到文件保险库",
+            reason,
+        )
+    if exc is not None:
+        logger.debug("OS keyring 不可用的细节", exc_info=exc)
+
+
 def _get_keyring():
     global _KEYRING, _KEYRING_TRIED, _KEYRING_TRIED_AT
+    global _KEYRING_UNAVAILABLE_REASON, _KEYRING_FALLBACK_LOGGED
     if _KEYRING_TRIED:
-        if _KEYRING is None and time.monotonic() - _KEYRING_TRIED_AT >= _KEYRING_RETRY_COOLDOWN:
+        cooldown_ok = time.monotonic() - _KEYRING_TRIED_AT >= _KEYRING_RETRY_COOLDOWN
+        if _KEYRING is None and cooldown_ok:
             _KEYRING_TRIED = False
         else:
             return _KEYRING
@@ -92,15 +120,20 @@ def _get_keyring():
     _KEYRING_TRIED_AT = time.monotonic()
     try:
         import keyring  # type: ignore
-    except Exception:
+    except Exception as exc:
         _KEYRING = None
+        _log_keyring_fallback_once("无法导入 keyring 模块", exc=exc)
         return _KEYRING
     outcome: dict[str, Any] = {}
 
     def probe() -> None:
         try:
             backend = keyring.get_keyring()
-            if backend is None or _keyring_backend_is_unsafe(backend):
+            if backend is None:
+                outcome["reason"] = "未找到可用后端"
+                return
+            if _keyring_backend_is_unsafe(backend):
+                outcome["reason"] = "明文文件后端已被拒绝"
                 return
             # 只读探测：历史实现会向 keyring 写入并删除一条
             # __pi_manager_probe__ 记录，在 macOS 上可能弹出授权框、并在系统
@@ -111,14 +144,28 @@ def _get_keyring():
             outcome["backend"] = keyring
         except Exception as exc:
             outcome["error"] = exc
+            outcome["reason"] = "探测失败"
 
     thread = threading.Thread(target=probe, daemon=True, name="keyring-probe")
     thread.start()
     thread.join(_KEYRING_PROBE_TIMEOUT)
-    if thread.is_alive() or "error" in outcome:
+    if thread.is_alive():
         _KEYRING = None
+        _log_keyring_fallback_once("探测超时")
+    elif "error" in outcome:
+        _KEYRING = None
+        probe_exc = outcome.get("error")
+        _log_keyring_fallback_once(
+            str(outcome.get("reason") or "探测失败"),
+            exc=probe_exc if isinstance(probe_exc, BaseException) else None,
+        )
+    elif outcome.get("backend") is not None:
+        _KEYRING = outcome["backend"]
+        _KEYRING_UNAVAILABLE_REASON = ""
+        _KEYRING_FALLBACK_LOGGED = False
     else:
-        _KEYRING = outcome.get("backend")
+        _KEYRING = None
+        _log_keyring_fallback_once(str(outcome.get("reason") or "未找到可用后端"))
     return _KEYRING
 
 
@@ -255,8 +302,37 @@ def _legacy_migration_enabled() -> bool:
 
 
 def _derive_key_from_salt(salt: bytes) -> bytes:
-    """Derive a 32-byte AES key from a salt using PBKDF2 + fixed pepper."""
-    return hashlib.pbkdf2_hmac("sha256", _PEPPER, salt, _KDF_ITERATIONS, dklen=32)
+    """Derive a 32-byte AES key from a salt using PBKDF2 + fixed pepper.
+
+    相同盐字节命中进程内最近一条缓存，避免 get_secret 热路径重复 600k PBKDF2。
+    """
+    global _KDF_CACHED_SALT, _KDF_CACHED_KEY
+    salt_key = bytes(salt)
+    with _KDF_LOCK:
+        if _KDF_CACHED_SALT == salt_key and _KDF_CACHED_KEY is not None:
+            return _KDF_CACHED_KEY
+    key = hashlib.pbkdf2_hmac("sha256", _PEPPER, salt_key, _KDF_ITERATIONS, dklen=32)
+    with _KDF_LOCK:
+        _KDF_CACHED_SALT = salt_key
+        _KDF_CACHED_KEY = key
+    return key
+
+
+def _clear_runtime_caches() -> None:
+    """清掉进程内 KDF / vault 缓存与 keyring 回退日志标记。
+
+    测试的 isolated_home 在切换 HOME 后必须调用，避免上一用例的盐或
+    vault 路径命中缓存。
+    """
+    global _KDF_CACHED_SALT, _KDF_CACHED_KEY, _VAULT_CACHE
+    global _KEYRING_FALLBACK_LOGGED, _KEYRING_UNAVAILABLE_REASON
+    with _KDF_LOCK:
+        _KDF_CACHED_SALT = None
+        _KDF_CACHED_KEY = None
+    with _VAULT_CACHE_LOCK:
+        _VAULT_CACHE = None
+    _KEYRING_FALLBACK_LOGGED = False
+    _KEYRING_UNAVAILABLE_REASON = ""
 
 
 def _validate_master_key_salt(path: Path) -> bytes:
@@ -286,6 +362,11 @@ def _get_master_key() -> bytes:
 
 
 def _xor_stream(data: bytes, key: bytes) -> bytes:
+    """仅用于 ``filekey:`` 旧格式的一次性迁移解密。
+
+    ``decrypt_blob`` 只在 ``_legacy_migration_enabled()`` 为真时调用本函数。
+    ``local:`` 固定密钥格式无迁移路径、永久拒绝，不得用本函数解密。
+    """
     if not key:
         raise ValueError("empty key")
     return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
@@ -297,7 +378,7 @@ def encrypt_blob(data: bytes) -> bytes:
         try:
             return b"dpapi:" + base64.b64encode(_dpapi_protect(data))
         except Exception:
-            pass
+            logger.debug("DPAPI 加密失败，回退 AES-GCM 文件保险库", exc_info=True)
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     key = _get_master_key()
@@ -319,7 +400,8 @@ def decrypt_blob(raw: bytes) -> bytes:
             payload[:12], payload[12:], b"PiManagerVault:v2"
         )
     if raw.startswith(b"filekey:"):
-        # Legacy unauthenticated fallback; successful reads are upgraded on next write.
+        # 无认证 XOR（_xor_stream）：默认拒绝；仅迁移开关打开时可读，下次写入升级。
+        # 与 local: 不同：local: 无迁移路径、永久拒绝（密钥硬编码在程序内）。
         if not _legacy_migration_enabled():
             raise VaultCorruptError(
                 "旧的无认证加密格式（filekey:）默认已禁用（XOR 无完整性保护，"
@@ -328,7 +410,7 @@ def decrypt_blob(raw: bytes) -> bytes:
             )
         key = _get_master_key()
         plaintext = _xor_stream(base64.b64decode(raw[8:]), key)
-        logging.getLogger(__name__).warning(
+        logger.warning(
             "读取了无认证的旧格式 vault 条目（filekey:），将在下次写入时升级为 AES-GCM"
         )
         return plaintext
@@ -336,7 +418,7 @@ def decrypt_blob(raw: bytes) -> bytes:
         # 该格式的 XOR key 硬编码并随二进制分发，任何本地写入者都能零知识伪造
         # 出合法密文，注入后还会被重写成 DPAPI 格式「洗白」（R2 审计 P0-3，已
         # 实证）。因此无条件移除、不提供迁移开关——保留开关等于保留一条对所有
-        # 平台都成立的凭据注入通道。
+        # 平台都成立的凭据注入通道。不走 _xor_stream。
         raise VaultCorruptError(
             "旧的固定密钥加密格式（local:）已永久移除：其加密密钥硬编码在程序内，"
             "任何本地进程都能伪造，无法与凭据注入区分。请重新填写 API Key"
@@ -346,8 +428,43 @@ def decrypt_blob(raw: bytes) -> bytes:
         try:
             return _dpapi_unprotect(raw)
         except Exception:
-            pass
+            logger.debug("无法按旧版 DPAPI 整文件格式解密 vault", exc_info=True)
     raise VaultCorruptError("vault 数据无法识别加密格式")
+
+
+def _vault_stat_token(path: Path) -> tuple[str, int, int]:
+    """``(绝对路径, mtime_ns, size)``；文件不存在时 mtime/size 为 0。"""
+    abs_path = os.path.normcase(os.path.abspath(str(path)))
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return (abs_path, 0, 0)
+    return (abs_path, info.st_mtime_ns, info.st_size)
+
+
+def _invalidate_vault_cache() -> None:
+    global _VAULT_CACHE
+    with _VAULT_CACHE_LOCK:
+        _VAULT_CACHE = None
+
+
+def _vault_cache_get() -> dict[str, str] | None:
+    token = _vault_stat_token(_vault_path())
+    with _VAULT_CACHE_LOCK:
+        cached = _VAULT_CACHE
+        if cached is None or cached[0] != token:
+            return None
+        return dict(cached[1])
+
+
+def _vault_cache_put(data: dict[str, str]) -> dict[str, str]:
+    """写入缓存并返回独立拷贝（调用方不得改到缓存对象）。"""
+    global _VAULT_CACHE
+    snapshot = dict(data)
+    token = _vault_stat_token(_vault_path())
+    with _VAULT_CACHE_LOCK:
+        _VAULT_CACHE = (token, snapshot)
+    return dict(snapshot)
 
 
 def load_vault() -> dict[str, str]:
@@ -360,7 +477,13 @@ def load_vault() -> dict[str, str]:
     warning is logged so no secret is silently dropped.
     """
     _ensure_dir()
+    hit = _vault_cache_get()
+    if hit is not None:
+        return hit
     with locked(_vault_path()):
+        hit = _vault_cache_get()
+        if hit is not None:
+            return hit
         errors: list[str] = []
         found = False
         primary: dict[str, str] | None = None
@@ -390,13 +513,15 @@ def load_vault() -> dict[str, str]:
                     _save_vault_unlocked(legacy_data)
                     legacy_path.unlink(missing_ok=True)
                 except Exception:
-                    pass
-                return legacy_data
+                    logger.debug("legacy vault 提升到主 vault 失败", exc_info=True)
+                    # 提升失败：不缓存，下次仍尝试迁移。
+                    return dict(legacy_data)
+                return _vault_cache_put(legacy_data)
             if found:
                 raise VaultCorruptError(
                     "Vault 无法解密或解析；原文件未被修改。" + " | ".join(errors)
                 )
-            return {}
+            return _vault_cache_put({})
 
         if legacy_data is not None:
             subset = all(
@@ -410,12 +535,12 @@ def load_vault() -> dict[str, str]:
                 except OSError:
                     pass
             else:
-                logging.getLogger(__name__).warning(
+                logger.warning(
                     "legacy vault %s 含有主 vault 没有的条目，保留文件待处理：%s",
                     legacy_path,
                     "、".join(sorted(legacy_data)),
                 )
-        return primary
+        return _vault_cache_put(primary)
 
 
 def _read_vault_file(path: Path, *, rewrite_legacy_format: bool = False) -> dict[str, str]:
@@ -463,14 +588,14 @@ def _read_vault_file(path: Path, *, rewrite_legacy_format: bool = False) -> dict
         raise ValueError("Vault 顶层必须是 JSON 对象")
     result = {str(k): str(v) for k, v in data.items()}
     if rewrite_legacy_format and not raw.startswith((b"dpapi:", b"aesgcm:")):
-        # Legacy unauthenticated formats (filekey:/local: XOR, raw DPAPI
-        # blobs, plaintext) are readable but must not stay on disk: rewrite
-        # immediately with authenticated encryption.
+        # filekey: XOR（仅迁移开关）、裸 DPAPI、明文 JSON 读到即升级。
+        # local: 不会走到这里：decrypt_blob 已永久拒绝，不提供迁移。
         _save_vault_unlocked(result)
     return result
 
 
 def _save_vault_unlocked(data: dict[str, str]) -> None:
+    _invalidate_vault_cache()
     payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
     blob = encrypt_blob(payload)
     vault = _vault_path()
@@ -492,6 +617,7 @@ def _save_vault_unlocked(data: dict[str, str]) -> None:
             os.chmod(vault, 0o600)
         except OSError:
             pass
+        _vault_cache_put(data)
     finally:
         temp.unlink(missing_ok=True)
 
@@ -562,10 +688,18 @@ def set_secret(name: str, value: str) -> None:
                     try:
                         kr.delete_password(SERVICE, name)
                     except Exception:
+                        logger.debug(
+                            "从 OS keyring 删除失败，将保留文件保险库副本",
+                            exc_info=True,
+                        )
                         keyring_delete_confirmed = False
                     else:
                         keyring_delete_confirmed = True
             except Exception:
+                logger.debug(
+                    "写入 OS keyring 失败或写后回读未确认，改写入文件保险库",
+                    exc_info=True,
+                )
                 kr = None
         vault = load_vault()
         if value:
@@ -596,7 +730,7 @@ def get_secret(name: str) -> str:
             if val:
                 return str(val)
         except Exception:
-            pass
+            logger.debug("从 OS keyring 读取失败，回退到文件保险库", exc_info=True)
     return str(load_vault().get(name) or "")
 
 
@@ -608,7 +742,10 @@ def delete_secret(name: str) -> None:
             try:
                 kr.delete_password(SERVICE, name)
             except Exception:
-                pass
+                logger.debug(
+                    "从 OS keyring 删除失败，继续清理文件保险库",
+                    exc_info=True,
+                )
         vault = load_vault()
         if name in vault:
             del vault[name]
@@ -630,7 +767,7 @@ def list_secret_names() -> list[str]:
                 current = _load_index()
                 _save_index(names | current)
         except Exception:
-            pass
+            logger.debug("secrets index 自愈写入失败", exc_info=True)
     return sorted(names)
 
 
@@ -1258,12 +1395,20 @@ def migrate_plaintext_keys(
     return out
 
 
+def using_os_keyring() -> bool:
+    """当前进程是否正在使用 OS keyring（而非仅文件保险库回退）。"""
+    return _get_keyring() is not None
+
+
 def backend_description() -> str:
-    parts = []
-    if _get_keyring() is not None:
-        parts.append("OS keyring")
+    """当前密钥后端的用户可见说明（不含任何密钥值）。"""
+    if using_os_keyring():
+        if sys.platform == "win32":
+            return "OS keyring + DPAPI vault"
+        return "OS keyring + per-user file vault"
+    reason = _KEYRING_UNAVAILABLE_REASON.strip() or "未启用或探测失败"
     if sys.platform == "win32":
-        parts.append("DPAPI vault")
-    else:
-        parts.append("per-user file vault")
-    return " + ".join(parts) if parts else "file vault"
+        return (
+            f"文件保险库回退（OS keyring 不可用：{reason}；当前使用 DPAPI vault）"
+        )
+    return f"文件保险库回退（OS keyring 不可用：{reason}）"

@@ -283,10 +283,13 @@ def provider_runtime_env(provider: str | None) -> dict[str, str]:
 def all_provider_runtime_env(*, strict: bool = False) -> dict[str, str]:
     """Resolve credentials needed while Pi enumerates all custom models."""
     from . import core
+    from . import secrets as secretstore
 
     cfg = core.load_models_config()
     providers = cfg.get("providers") or {}
     result: dict[str, str] = {}
+    # 预热进程内 vault 缓存，避免每个 provider 的 get_secret 重复解密。
+    secretstore.load_vault()
     for provider in providers if isinstance(providers, dict) else {}:
         try:
             result.update(provider_runtime_env(str(provider)))

@@ -197,6 +197,9 @@ class FeatureMixin:
             self.hide()
             self.tray.showMessage("Pi Manager", "已最小化到托盘。右键可切换模型/启动 Pi。", QSystemTrayIcon.Information, 2000)
             return
+        if hasattr(self, "confirm_leave_settings") and not self.confirm_leave_settings():
+            event.ignore()
+            return
         if self.tray:
             self.tray.hide()
         self._shutdown_background_tasks()

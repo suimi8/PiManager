@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 
 from ... import core
 from ... import extras
-from ..components import SurfaceCard
+from ..components import EmptyState, SurfaceCard
 
 
 def build_sessions_page(window) -> QWidget:
@@ -67,7 +67,19 @@ def build_sessions_page(window) -> QWidget:
     header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
     header.setSectionResizeMode(4, QHeaderView.Stretch)
     window._polish_table(window.sessions_table)
+    window.sessions_empty = EmptyState(
+        "还没有会话记录",
+        "启动完整 Pi 或在快速提问中对话后，会话会出现在这里。",
+    )
+    window.sessions_empty.add_action(
+        window._btn("去概览启动", lambda: window._goto_page("simple"), success=True)
+    )
+    window.sessions_empty.add_action(
+        window._btn("打开快速提问", lambda: window._goto_page("chat"), secondary=True)
+    )
+    window.sessions_empty.setVisible(False)
     table_card.content.addWidget(window.sessions_table, 1)
+    table_card.content.addWidget(window.sessions_empty, 1)
     actions = QHBoxLayout()
     actions.setContentsMargins(12, 0, 12, 0)
     actions.setSpacing(8)
@@ -176,6 +188,29 @@ class SessionsPageMixin:
             prev_item = QTableWidgetItem(preview or r.get("name") or "")
             prev_item.setToolTip(preview or r.get("name") or path)
             self.sessions_table.setItem(i, 4, prev_item)
+        empty = getattr(self, "sessions_empty", None)
+        if empty is not None:
+            has_rows = bool(rows)
+            self.sessions_table.setVisible(has_rows)
+            empty.setVisible(not has_rows)
+            if not has_rows:
+                filtered = bool(
+                    (getattr(self, "session_filter_wd", None) and self.session_filter_wd.text().strip())
+                    or (
+                        getattr(self, "session_filter_name", None)
+                        and self.session_filter_name.text().strip()
+                    )
+                )
+                if filtered:
+                    empty.set_copy(
+                        "没有匹配的会话",
+                        "当前筛选条件下没有会话。可以清空筛选后再试。",
+                    )
+                else:
+                    empty.set_copy(
+                        "还没有会话记录",
+                        "启动完整 Pi 或在快速提问中对话后，会话会出现在这里。",
+                    )
 
     def sessions_apply_filter(self):
         """按筛选词重建会话表，只对缓存做内存过滤。
@@ -230,11 +265,11 @@ class SessionsPageMixin:
             return
         rows = sm.selectedRows()
         if not rows:
-            QMessageBox.information(self, "提示", "请先选择会话")
+            self.notify_warning("请先选择会话")
             return
         cwd = self._session_cwd_at(rows[0].row())
         if not cwd:
-            QMessageBox.information(self, "提示", "无法解析该会话的项目目录")
+            self.notify_warning("无法解析该会话的项目目录")
             return
         p = Path(cwd)
         if not p.exists():
@@ -267,7 +302,7 @@ class SessionsPageMixin:
     def session_rename(self):
         path = self.session_selected_path()
         if not path:
-            QMessageBox.information(self, "提示", "请先选择会话")
+            self.notify_warning("请先选择会话")
             return
         name, ok = QInputDialog.getText(self, "重命名", "新文件名：", text=Path(path).name)
         if not ok or not name.strip():
@@ -282,9 +317,14 @@ class SessionsPageMixin:
     def session_delete(self):
         path = self.session_selected_path()
         if not path:
-            QMessageBox.information(self, "提示", "请先选择会话")
+            self.notify_warning("请先选择会话")
             return
-        if QMessageBox.question(self, "确认删除", f"删除会话文件？\n{path}") != QMessageBox.Yes:
+        if QMessageBox.question(
+            self,
+            "删除会话",
+            f"将永久删除这个本地会话文件，无法从 Pi Manager 恢复：\n\n{path}\n\n"
+            "不会影响 Provider、模型或密钥配置。确定删除？",
+        ) != QMessageBox.Yes:
             return
         if extras.session_delete(path):
             self.refresh_sessions()
@@ -302,9 +342,14 @@ class SessionsPageMixin:
             if path:
                 paths.append(path)
         if not paths:
-            QMessageBox.information(self, "提示", "请多选要删除的会话")
+            self.notify_warning("请多选要删除的会话")
             return
-        if QMessageBox.question(self, "批量删除", f"删除 {len(paths)} 个会话文件？") != QMessageBox.Yes:
+        if QMessageBox.question(
+            self,
+            "批量删除会话",
+            f"将永久删除选中的 {len(paths)} 个本地会话文件，无法从 Pi Manager 恢复。\n\n"
+            "不会影响 Provider、模型或密钥配置。确定删除？",
+        ) != QMessageBox.Yes:
             return
         ok = 0
         for p in paths:

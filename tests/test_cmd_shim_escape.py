@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -500,6 +501,29 @@ def test_run_pi_timeout_kills_tree(child_scripts, monkeypatch):
             },
         )
     _assert_heartbeat_stopped(child_scripts["beat"], "run_pi 超时")
+
+
+def test_run_pi_cancelled_kills_tree(child_scripts, monkeypatch):
+    """协作式取消：is_cancelled 为真时终止进程树并返回已停止。"""
+    from pi_manager import core
+
+    monkeypatch.setattr(
+        core, "pi_base_cmd", lambda: [sys.executable, str(child_scripts["parent"])]
+    )
+    started = time.monotonic()
+    result = core_process.run_pi(
+        [],
+        timeout=30,
+        env={
+            "PROBE_BEAT": str(child_scripts["beat"]),
+            "PROBE_PID": str(child_scripts["pidfile"]),
+            "PROBE_MODE": "sleep",
+        },
+        is_cancelled=lambda: time.monotonic() - started > 0.2,
+    )
+    assert result.returncode == -1
+    assert "已停止生成" in result.stderr
+    _assert_heartbeat_stopped(child_scripts["beat"], "run_pi 取消")
 
 
 def test_run_pi_success_fast_path_still_works(tmp_path, monkeypatch):

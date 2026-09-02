@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 from . import core
@@ -248,7 +249,13 @@ class PiRpcSession:
             raise RpcSessionError(f"切换模型失败：{response.get('error') or '未知错误'}")
         return response.get("data")
 
-    def prompt(self, text: str, timeout: float = _PROMPT_TIMEOUT) -> dict[str, Any]:
+    def prompt(
+        self,
+        text: str,
+        timeout: float = _PROMPT_TIMEOUT,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         with self._state_lock:
             if self._turn is not None:
                 raise RpcSessionError("上一个 Pi 请求仍在进行")
@@ -286,12 +293,24 @@ class PiRpcSession:
             clear_turn()
             return finish(error=str(ack.get("error") or "prompt 预检失败"))
 
-        if not turn["event"].wait(timeout):
+        deadline = time.monotonic() + max(0.05, float(timeout))
+        cancelled = False
+        while not turn["event"].is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if is_cancelled and is_cancelled():
+                cancelled = True
+                break
+            turn["event"].wait(min(0.15, remaining))
+        if cancelled or not turn["event"].is_set():
             clear_turn()
             try:
                 self.send({"type": "abort"})
             except RpcSessionError:
                 pass
+            if cancelled:
+                return finish(error="已停止生成", cancelled=True)
             return finish(error=f"Pi 响应超时（{int(timeout)}s）")
         if turn.get("dead"):
             raise self._dead_error()
@@ -498,6 +517,7 @@ def rpc_chat_once(
     workdir: str | None = None,
     timeout: float = 180,
     thinking: str | None = "off",
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """chat_once-shaped attempt over the persistent RPC session.
 
@@ -528,7 +548,7 @@ def rpc_chat_once(
                     provider, model, dict(credential.get("env") or {}), workdir, str(thinking or "off")
                 )
             session = entry["session"]
-            result = session.prompt(prompt, timeout=timeout)
+            result = session.prompt(prompt, timeout=timeout, is_cancelled=is_cancelled)
         except RpcSessionError as exc:
             with _manager_lock:
                 if _entry is not None and not _entry["session"].is_alive():
@@ -548,6 +568,8 @@ def rpc_chat_once(
                 _entry["last_used"] = time.monotonic()
                 _schedule_idle_reaper()
         result["provider"], result["model"] = provider, model
+        if result.get("cancelled"):
+            return result
         if result.get("ok") or not key_id:
             if result.get("ok"):
                 with _runtime_lock:

@@ -7,6 +7,7 @@ monkeypatch 点（``extras.xxx``）稳定。对会被测试 patch 的符号走 `
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -73,7 +74,9 @@ def _pick_release_asset(assets: list[dict[str, Any]]) -> dict[str, str]:
     return {"name": "", "url": ""}
 
 
-def check_manager_update() -> dict[str, Any]:
+def check_manager_update(
+    is_cancelled: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     """Check the official release feed without trusting it for installation."""
     cfg = core.load_manager_config()
     settings = core.load_settings()
@@ -102,8 +105,20 @@ def check_manager_update() -> dict[str, Any]:
         "source": "",
         "message": f"当前版本 {local}",
     }
-    cfg["last_manager_update_check"] = datetime.now().isoformat(timespec="seconds")
-    core.save_manager_config(cfg)
+
+    def _stamp_check(current: dict[str, Any]) -> dict[str, Any]:
+        current["last_manager_update_check"] = datetime.now().isoformat(
+            timespec="seconds"
+        )
+        return current
+
+    core.update_manager_config(_stamp_check)
+
+    if is_cancelled and is_cancelled():
+        result["ok"] = False
+        result["cancelled"] = True
+        result["message"] = "已取消检查更新"
+        return result
 
     try:
         if url:
@@ -147,18 +162,21 @@ def check_manager_update() -> dict[str, Any]:
     except Exception as e:
         result["ok"] = False
         result["message"] = f"检查失败：{e}"
-    cfg = core.load_manager_config()
-    cfg["manager_update_status"] = {
-        "state": "ok" if result.get("ok") else "failed",
-        "local": result.get("local"),
-        "remote": result.get("remote"),
-        "has_update": bool(result.get("has_update")),
-        "notes": str(result.get("notes") or "")[:2000],
-        "url": str(result.get("url") or ""),
-        "message": str(result.get("message") or ""),
-        "checked_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    core.save_manager_config(cfg)
+
+    def _stamp_status(current: dict[str, Any]) -> dict[str, Any]:
+        current["manager_update_status"] = {
+            "state": "ok" if result.get("ok") else "failed",
+            "local": result.get("local"),
+            "remote": result.get("remote"),
+            "has_update": bool(result.get("has_update")),
+            "notes": str(result.get("notes") or "")[:2000],
+            "url": str(result.get("url") or ""),
+            "message": str(result.get("message") or ""),
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        return current
+
+    core.update_manager_config(_stamp_status)
     return result
 
 

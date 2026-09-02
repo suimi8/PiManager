@@ -227,6 +227,36 @@ def test_prompt_timeout_sends_abort_and_returns_error(fake_proc):
         _teardown(session, fake)
 
 
+def test_prompt_cancelled_sends_abort(fake_proc):
+    fake = fake_proc
+    session = rpc_session.PiRpcSession(["pi"], env={})
+    try:
+        results: dict = {}
+        cancelled = threading.Event()
+
+        def run():
+            results["r"] = session.prompt("hello", timeout=5, is_cancelled=cancelled.is_set)
+
+        t = threading.Thread(target=run)
+        t.start()
+        _wait_writes(fake, 1)
+        fake.stdout.push(json.dumps({"type": "response", "id": "1", "success": True}))
+        cancelled.set()
+        _wait_writes(fake, 2)
+        abort_cmd = json.loads(fake.stdin.writes[1])
+        assert abort_cmd["type"] == "abort"
+        fake.stdout.push(json.dumps({"type": "response", "id": "2", "success": True}))
+        t.join(2)
+        assert not t.is_alive()
+        r = results["r"]
+        assert r["ok"] is False
+        assert r.get("cancelled") is True
+        assert "停止" in r["error"]
+        assert session.is_busy() is False
+    finally:
+        _teardown(session, fake)
+
+
 def test_prompt_rejects_overlapping_turns(fake_proc):
     fake = fake_proc
     session = rpc_session.PiRpcSession(["pi"], env={})

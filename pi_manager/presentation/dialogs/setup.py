@@ -10,19 +10,23 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
-    QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QStackedWidget,
     QVBoxLayout,
+    QWidget,
 )
 
 from ... import core
 from ..design import ACCENT_LABELS
+from ..geometry import clamp_dialog_to_screen
 from ..workers import Worker, WorkerTrackerMixin
 
 logger = logging.getLogger(__name__)
@@ -34,7 +38,7 @@ class InstallPiDialog(WorkerTrackerMixin, QDialog):
     def __init__(self, parent=None, status: dict | None = None):
         super().__init__(parent)
         self.setWindowTitle("\u5b89\u88c5 / \u5347\u7ea7 Pi")
-        self.resize(620, 460)
+        clamp_dialog_to_screen(self, 620, 460)
         self._worker = None
         self._init_workers()
         self.install_succeeded = False
@@ -154,22 +158,138 @@ class InstallPiDialog(WorkerTrackerMixin, QDialog):
         QMessageBox.warning(self, "\u5931\u8d25", err)
 
 
-class SetupWizardDialog(QDialog):
-    """First-run simplified setup wizard."""
+class SetupWizardDialog(WorkerTrackerMixin, QDialog):
+    """首次运行向导：每一步只解决一个问题，允许跳过。"""
+
+    STEPS = ("工作目录", "配置 Provider", "验证 API Key", "选择默认模型", "完成")
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Pi Manager 基础配置向导")
-        self.resize(560, 480)
+        self.setWindowTitle("Pi Manager 配置向导")
+        clamp_dialog_to_screen(self, 620, 520)
+        self._init_workers()
+        self._models: list[tuple[str, str]] = []
+        self._verified = False
+        self._pending_verify: dict[str, str] = {}
         layout = QVBoxLayout(self)
+        self.step_index = QLabel("第 1 步 / 共 5 步")
+        self.step_index.setObjectName("wizardStepIndex")
+        layout.addWidget(self.step_index)
         title = QLabel("欢迎使用 Pi Manager")
         title.setObjectName("pageTitle")
         layout.addWidget(title)
-        sub = QLabel("完成以下基础项后即可使用「简化配置」接入自定义 Provider 并启动官方 Pi。")
-        sub.setObjectName("subtitle")
-        sub.setWordWrap(True)
-        layout.addWidget(sub)
+        self.sub = QLabel("每一步只做一件事。可以跳过，稍后在对应页面继续完成。")
+        self.sub.setObjectName("subtitle")
+        self.sub.setWordWrap(True)
+        layout.addWidget(self.sub)
 
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._build_workdir_step())
+        self.stack.addWidget(self._build_provider_step())
+        self.stack.addWidget(self._build_verify_step())
+        self.stack.addWidget(self._build_model_step())
+        self.stack.addWidget(self._build_finish_step())
+        layout.addWidget(self.stack, 1)
+
+        nav = QHBoxLayout()
+        self.btn_back = QPushButton("上一步")
+        self.btn_back.setProperty("secondary", True)
+        self.btn_back.clicked.connect(self._back)
+        self.btn_skip = QPushButton("跳过")
+        self.btn_skip.setProperty("ghost", True)
+        self.btn_skip.clicked.connect(self._skip)
+        self.btn_next = QPushButton("下一步")
+        self.btn_next.setProperty("success", True)
+        self.btn_next.setDefault(True)
+        self.btn_next.clicked.connect(self._next)
+        nav.addWidget(self.btn_back)
+        nav.addStretch(1)
+        nav.addWidget(self.btn_skip)
+        nav.addWidget(self.btn_next)
+        layout.addLayout(nav)
+        self._show_step(0)
+
+    def _build_workdir_step(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel("选择 Pi 启动时使用的工作目录。"))
+        row = QHBoxLayout()
+        self.workdir = QLineEdit(str(core.user_home()))
+        self.workdir.setPlaceholderText("项目目录")
+        browse = QPushButton("浏览")
+        browse.setProperty("secondary", True)
+        browse.clicked.connect(self._browse_workdir)
+        row.addWidget(self.workdir, 1)
+        row.addWidget(browse)
+        layout.addLayout(row)
+        hint = QLabel("可随时在概览页更改；拖入文件夹也会更新这里。")
+        hint.setObjectName("subtitle")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        layout.addStretch(1)
+        return page
+
+    def _build_provider_step(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel("填写兼容 API 的地址和密钥。可以跳过，稍后在 Provider 页完成。"))
+        form = QFormLayout()
+        self.quick_name = QLineEdit("custom")
+        self.quick_base = QLineEdit("https://api.openai.com/v1")
+        self.quick_key = QLineEdit()
+        self.quick_key.setEchoMode(QLineEdit.PasswordEchoOnEdit)
+        self.quick_key.setPlaceholderText("sk-… 不会写入 models.json")
+        self.quick_api = QComboBox()
+        self.quick_api.addItems(
+            [
+                "openai-completions",
+                "openai-responses",
+                "anthropic-messages",
+                "google-generative-ai",
+            ]
+        )
+        form.addRow("名称", self.quick_name)
+        form.addRow("Base URL", self.quick_base)
+        form.addRow("API Key", self.quick_key)
+        form.addRow("API 类型", self.quick_api)
+        layout.addLayout(form)
+        layout.addStretch(1)
+        return page
+
+    def _build_verify_step(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel("用刚才的密钥拉取模型列表，确认连接可用。"))
+        self.verify_status = QLabel("尚未验证，可跳过。")
+        self.verify_status.setObjectName("subtitle")
+        self.verify_status.setWordWrap(True)
+        layout.addWidget(self.verify_status)
+        self.btn_verify = QPushButton("验证 API Key")
+        self.btn_verify.setProperty("success", True)
+        self.btn_verify.setToolTip("用当前 Base URL 与 API Key 拉取模型列表")
+        self.btn_verify.clicked.connect(self._verify_key)
+        layout.addWidget(self.btn_verify)
+        layout.addStretch(1)
+        return page
+
+    def _build_model_step(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel("选择启动 Pi 时使用的默认模型。"))
+        self.default_model = QComboBox()
+        self.default_model.setEditable(True)
+        layout.addWidget(self.default_model)
+        hint = QLabel("列表来自刚才验证到的模型，或已保存在 models.json 中的配置。")
+        hint.setObjectName("subtitle")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        layout.addStretch(1)
+        return page
+
+    def _build_finish_step(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel("外观与安全偏好。保存后即可开始使用。"))
         form = QFormLayout()
         self.lang = QComboBox()
         self.lang.addItem("简体中文（优先）", "zh-CN")
@@ -180,7 +300,6 @@ class SetupWizardDialog(QDialog):
             if self.lang.itemData(i) == lang0:
                 self.lang.setCurrentIndex(i)
                 break
-
         self.ui_mode = QComboBox()
         self.ui_mode.addItem("夜间模式（全局）", "night")
         self.ui_mode.addItem("白天模式（全局）", "day")
@@ -189,7 +308,6 @@ class SetupWizardDialog(QDialog):
             if self.ui_mode.itemData(i) == ut.get("mode"):
                 self.ui_mode.setCurrentIndex(i)
                 break
-
         self.ui_accent = QComboBox()
         for key, label in ACCENT_LABELS.items():
             self.ui_accent.addItem(label, key)
@@ -197,33 +315,166 @@ class SetupWizardDialog(QDialog):
             if self.ui_accent.itemData(i) == ut.get("accent"):
                 self.ui_accent.setCurrentIndex(i)
                 break
-
-
         self.secure = QCheckBox("保存 Provider 时加密 API Key（系统密钥库 / 安全保险库）")
         self.secure.setChecked(True)
         self.auto_update = QCheckBox("启动时检查 Pi 更新")
         self.auto_update.setChecked(True)
-
         form.addRow("默认语言（Pi 回复）", self.lang)
         form.addRow("全局昼夜模式", self.ui_mode)
         form.addRow("全局主题色", self.ui_accent)
         form.addRow("", self.secure)
         form.addRow("", self.auto_update)
         layout.addLayout(form)
-
-        tip2 = QLabel("下一步：在「简化配置」页用 Base URL + API Key 拉取模型，设为默认后即可启动。")
-        tip2.setObjectName("subtitle")
-        tip2.setWordWrap(True)
-        layout.addWidget(tip2)
         layout.addStretch(1)
+        return page
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Save).setText("保存并开始")
-        buttons.button(QDialogButtonBox.Cancel).setText("稍后")
-        buttons.button(QDialogButtonBox.Save).setDefault(True)
-        buttons.accepted.connect(self._save)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+    def _browse_workdir(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "选择工作目录", self.workdir.text())
+        if chosen:
+            self.workdir.setText(chosen)
+
+    def _show_step(self, index: int) -> None:
+        index = max(0, min(index, self.stack.count() - 1))
+        self.stack.setCurrentIndex(index)
+        total = self.stack.count()
+        name = self.STEPS[index]
+        done = "、".join(self.STEPS[:index]) if index else "无"
+        self.step_index.setText(f"第 {index + 1} 步 / 共 {total} 步 · {name}")
+        self.sub.setText(f"已完成：{done}。当前步骤可以跳过。" if index < total - 1 else "保存后即可开始使用。")
+        self.btn_back.setEnabled(index > 0)
+        self.btn_skip.setVisible(index < total - 1)
+        self.btn_next.setText("保存并开始" if index == total - 1 else "下一步")
+        if index == 3:
+            self._fill_model_choices()
+
+    def _back(self) -> None:
+        self._show_step(self.stack.currentIndex() - 1)
+
+    def _skip(self) -> None:
+        current = self.stack.currentIndex()
+        if current == 1:
+            self._show_step(4)
+            return
+        self._show_step(current + 1)
+
+    def _next(self) -> None:
+        current = self.stack.currentIndex()
+        if current == 0:
+            path = self.workdir.text().strip()
+            if path:
+
+                def _apply(cfg: dict) -> dict:
+                    cfg["last_workdir"] = path
+                    return cfg
+
+                core.update_manager_config(_apply)
+            self._show_step(1)
+            return
+        if current == 1:
+            if self.quick_name.text().strip() and self.quick_base.text().strip():
+                self._show_step(2)
+            else:
+                self._show_step(4)
+            return
+        if current == 2:
+            self._show_step(3)
+            return
+        if current == 3:
+            self._apply_default_model()
+            self._show_step(4)
+            return
+        self._save()
+
+    def closeEvent(self, event):
+        stuck = self._reap_workers(budget=2.5)
+        if stuck:
+            self._note_detached_workers()
+        super().closeEvent(event)
+
+    def _set_verify_busy(self, busy: bool) -> None:
+        self.btn_verify.setEnabled(not busy)
+        self.btn_verify.setText("正在验证…" if busy else "验证 API Key")
+
+    def _verify_key(self) -> None:
+        name = self.quick_name.text().strip() or "custom"
+        base = self.quick_base.text().strip()
+        key = self.quick_key.text().strip()
+        api = self.quick_api.currentText()
+        if not base:
+            self.verify_status.setText("请先填写 Base URL。")
+            return
+        self._pending_verify = {"name": name, "base": base, "key": key, "api": api}
+        self.verify_status.setText("正在验证 API Key…")
+        self._set_verify_busy(True)
+        worker = self._track(Worker(core.fetch_remote_models, base, key, api=api))
+        worker.done.connect(self._on_verify_done)
+        worker.failed.connect(self._on_verify_fail)
+        worker.start()
+
+    def _on_verify_fail(self, err: str) -> None:
+        self._set_verify_busy(False)
+        self._verified = False
+        self.verify_status.setText(f"验证失败：{err}")
+
+    def _on_verify_done(self, result) -> None:
+        self._set_verify_busy(False)
+        pending = dict(self._pending_verify or {})
+        if not isinstance(result, dict) or not result.get("ok"):
+            self._verified = False
+            error = ""
+            if isinstance(result, dict):
+                error = str(result.get("error") or "")
+            self.verify_status.setText(f"验证失败：{error or '未知错误'}")
+            return
+        name = pending.get("name") or "custom"
+        models = result.get("models") or []
+        self._models = [
+            (name, str(item.get("id") or item.get("name") or ""))
+            for item in models
+            if isinstance(item, dict)
+        ]
+        try:
+            core.upsert_custom_provider(
+                name,
+                base_url=pending.get("base") or "",
+                api=pending.get("api") or "openai-completions",
+                api_key=pending.get("key") or "",
+                models=models,
+                compat={"supportsDeveloperRole": False, "supportsReasoningEffort": True},
+            )
+        except Exception as exc:
+            self.verify_status.setText(f"密钥可用，但保存失败：{exc}")
+            return
+        self._verified = True
+        self.verify_status.setText(f"验证成功，已保存「{name}」· {len(models)} 个模型。")
+        self._fill_model_choices()
+
+    def _fill_model_choices(self) -> None:
+        self.default_model.clear()
+        seen: set[str] = set()
+        for provider, model in self._models:
+            key = f"{provider}/{model}"
+            if model and key not in seen:
+                self.default_model.addItem(key, (provider, model))
+                seen.add(key)
+        try:
+            cfg = core.load_models_config()
+        except Exception:
+            cfg = {}
+        for name, entry in (cfg.get("providers") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            for item in entry.get("models") or []:
+                mid = item.get("id") if isinstance(item, dict) else str(item)
+                key = f"{name}/{mid}"
+                if mid and key not in seen:
+                    self.default_model.addItem(key, (name, str(mid)))
+                    seen.add(key)
+
+    def _apply_default_model(self) -> None:
+        data = self.default_model.currentData()
+        if isinstance(data, (tuple, list)) and len(data) == 2:
+            core.set_default_model(str(data[0]), str(data[1]))
 
     def _save(self):
         core.set_language(self.lang.currentData() or "zh-CN")
@@ -232,14 +483,15 @@ class SetupWizardDialog(QDialog):
             mode=self.ui_mode.currentData() or "night",
             accent=self.ui_accent.currentData() or "blue",
         )
-        # 持锁读改写：裸的 load → 改 → save 会覆盖掉 load 与 save 之间
-        # 其它写者（测试线程池、健康检查、helper 进程）对 pi-manager.json 的写入。
         secure_keys = self.secure.isChecked()
         auto_check = self.auto_update.isChecked()
+        workdir = self.workdir.text().strip()
 
         def _apply_setup(cfg: dict) -> dict:
             cfg["secure_keys"] = secure_keys
             cfg["auto_check_update"] = auto_check
+            if workdir:
+                cfg["last_workdir"] = workdir
             return cfg
 
         core.update_manager_config(_apply_setup)

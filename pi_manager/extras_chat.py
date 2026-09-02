@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 from . import core
@@ -19,6 +20,10 @@ def _extras():
     return extras
 
 
+def _cancelled(flag: Callable[[], bool] | None) -> bool:
+    return bool(flag and flag())
+
+
 def chat_once(
     prompt: str,
     *,
@@ -27,7 +32,20 @@ def chat_once(
     workdir: str | None = None,
     timeout: float = 180,
     thinking: str | None = "off",
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
+    if _cancelled(is_cancelled):
+        return {
+            "ok": False,
+            "returncode": -1,
+            "stdout": "",
+            "stderr": "已停止生成",
+            "latency_ms": 0,
+            "provider": provider,
+            "model": model,
+            "error": "已停止生成",
+            "cancelled": True,
+        }
     _extras().apply_proxy_env()
     t0 = time.perf_counter()
     try:
@@ -38,16 +56,18 @@ def chat_once(
             model=model,
             thinking=thinking or "off",
             timeout=timeout,
+            is_cancelled=is_cancelled,
         )
     except Exception as exc:
         code, out, err = -1, "", str(exc)
     ms = round((time.perf_counter() - t0) * 1000, 1)
     text = (out or "").strip()
     err_text = (err or "").strip()
-    ok = code == 0 and bool(text)
+    cancelled = _cancelled(is_cancelled) or "已停止生成" in err_text
+    ok = (not cancelled) and code == 0 and bool(text)
     if code == 0 and not text and err_text and "error" not in err_text.lower():
         text = err_text
-        ok = True
+        ok = not cancelled
     return {
         "ok": ok,
         "returncode": code,
@@ -57,6 +77,7 @@ def chat_once(
         "provider": provider,
         "model": model,
         "error": "" if ok else (err_text or text or f"退出码 {code}"),
+        "cancelled": cancelled,
     }
 
 
@@ -104,9 +125,7 @@ def _model_pair_key(provider: str | None, model: str | None) -> str:
     return f"{pair[0]}/{pair[1]}" if pair is not None else ""
 
 
-def _fail_counts() -> dict[str, int]:
-    mgr = core.load_manager_config()
-    raw = mgr.get("failover_fail_counts") or {}
+def _parse_fail_counts(raw: Any) -> dict[str, int]:
     if not isinstance(raw, dict):
         return {}
     out: dict[str, int] = {}
@@ -118,17 +137,24 @@ def _fail_counts() -> dict[str, int]:
     return out
 
 
-def _save_fail_counts(counts: dict[str, int]) -> None:
+def _fail_counts() -> dict[str, int]:
     mgr = core.load_manager_config()
-    mgr["failover_fail_counts"] = counts
-    core.save_manager_config(mgr)
+    return _parse_fail_counts(mgr.get("failover_fail_counts"))
 
 
 # 串行化 fail_count 的读-改-写，避免跨线程并发丢失更新。
-# 注意：不能用 storage.locked(manager_config_path())，因为 _fail_counts/
-# _save_fail_counts 内部走 core.load/save_manager_config → storage.load/save_json
-# → storage.locked(path)，跨进程锁 msvcrt/fcntl 不可重入，会触发死锁。
+# 注意：file lock 不可重入，updater 内部禁止再 load_manager_config。
 _fail_counts_lock = threading.Lock()
+
+
+def _save_fail_counts(counts: dict[str, int]) -> None:
+    """只更新 failover_fail_counts 键，不覆盖 pi-manager.json 其它字段。"""
+
+    def _apply(cfg: dict[str, Any]) -> dict[str, Any]:
+        cfg["failover_fail_counts"] = dict(counts)
+        return cfg
+
+    core.update_manager_config(_apply)
 
 
 def record_model_success(provider: str, model: str) -> None:
@@ -136,10 +162,16 @@ def record_model_success(provider: str, model: str) -> None:
     if not key:
         return
     with _fail_counts_lock:
-        counts = _fail_counts()
-        if key in counts:
+
+        def _apply(cfg: dict[str, Any]) -> dict[str, Any]:
+            counts = _parse_fail_counts(cfg.get("failover_fail_counts"))
+            if key not in counts:
+                return cfg
             counts[key] = 0
-            _save_fail_counts(counts)
+            cfg["failover_fail_counts"] = counts
+            return cfg
+
+        core.update_manager_config(_apply)
 
 
 def record_model_failure(provider: str, model: str) -> int:
@@ -147,11 +179,19 @@ def record_model_failure(provider: str, model: str) -> int:
     key = _model_pair_key(provider, model)
     if not key:
         return 0
+    new_count = 0
     with _fail_counts_lock:
-        counts = _fail_counts()
-        counts[key] = int(counts.get(key) or 0) + 1
-        _save_fail_counts(counts)
-        return counts[key]
+
+        def _apply(cfg: dict[str, Any]) -> dict[str, Any]:
+            nonlocal new_count
+            counts = _parse_fail_counts(cfg.get("failover_fail_counts"))
+            new_count = int(counts.get(key) or 0) + 1
+            counts[key] = new_count
+            cfg["failover_fail_counts"] = counts
+            return cfg
+
+        core.update_manager_config(_apply)
+        return new_count
 
 
 def should_failover(provider: str, model: str) -> bool:
@@ -172,6 +212,7 @@ def _chat_attempt(
     workdir: str | None,
     timeout: float,
     thinking: str | None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """One chat attempt: persistent RPC session when available, else one-shot.
 
@@ -196,6 +237,7 @@ def _chat_attempt(
                 workdir=workdir,
                 timeout=timeout,
                 thinking=thinking,
+                is_cancelled=is_cancelled,
             )
             if result.get("ok") or rpc_session.rpc_chat_enabled():
                 return result
@@ -207,12 +249,30 @@ def _chat_attempt(
             workdir=workdir,
             timeout=timeout,
             thinking=thinking,
+            is_cancelled=is_cancelled,
         )
 
+    if _cancelled(is_cancelled):
+        return {
+            "ok": False,
+            "returncode": -1,
+            "stdout": "",
+            "stderr": "已停止生成",
+            "latency_ms": 0,
+            "provider": provider,
+            "model": model,
+            "error": "已停止生成",
+            "cancelled": True,
+        }
     last = _once()
     max_attempts = core.TRANSIENT_HTTP_MAX_ATTEMPTS
     for attempt in range(max_attempts - 1):
-        if last.get("ok"):
+        if last.get("ok") or last.get("cancelled"):
+            return last
+        if _cancelled(is_cancelled):
+            last = dict(last)
+            last["cancelled"] = True
+            last["error"] = last.get("error") or "已停止生成"
             return last
         blob = "\n".join(
             str(last.get(key) or "") for key in ("error", "stderr", "stdout")
@@ -233,6 +293,7 @@ def chat_with_failover(
     timeout: float = 180,
     thinking: str | None = "off",
     set_as_default_on_switch: bool = True,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """快速提问 + 连续失败自动切换下一个模型。
 
@@ -296,6 +357,24 @@ def chat_with_failover(
     switched_from: str | None = None
 
     for idx in range(start_idx, len(chain)):
+        if _cancelled(is_cancelled):
+            last = last or {
+                "ok": False,
+                "returncode": -1,
+                "stdout": "",
+                "stderr": "已停止生成",
+                "latency_ms": 0,
+                "provider": provider,
+                "model": model,
+                "error": "已停止生成",
+            }
+            last = dict(last)
+            last["cancelled"] = True
+            last["switched"] = bool(switched_from)
+            last["switched_from"] = switched_from
+            last["attempts"] = attempts
+            last["error"] = last.get("error") or "已停止生成"
+            return last
         p, m = chain[idx]
         # 若该模型已达阈值且不是链尾唯一选择，跳过
         if enabled and idx > start_idx and should_failover(p, m) and idx < len(chain) - 1:
@@ -309,6 +388,7 @@ def chat_with_failover(
             workdir=workdir,
             timeout=timeout,
             thinking=thinking,
+            is_cancelled=is_cancelled,
         )
         result = dict(result)
         result["attempt_index"] = idx
@@ -323,6 +403,14 @@ def chat_with_failover(
             }
         )
         last = result
+        if result.get("cancelled"):
+            last["switched"] = bool(switched_from)
+            last["switched_from"] = switched_from
+            last["attempts"] = attempts
+            last["silent"] = silent
+            last["failover_enabled"] = enabled
+            last["notice"] = ""
+            return last
 
         if result.get("ok"):
             record_model_success(p, m)

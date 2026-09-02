@@ -30,7 +30,7 @@ QToolTip {{
     background: {c.surface_raised};
     color: {c.text};
     border: 1px solid {c.border_strong};
-    border-radius: 7px;
+    border-radius: 6px;
     padding: 6px 9px;
 }}
 QDialogButtonBox, QMessageBox QLabel, QFileDialog QLabel {{
@@ -74,9 +74,10 @@ QLabel#navSection {{
 QToolButton#navButton {{
     background: transparent;
     color: {c.text_secondary};
-    border: none;
-    border-radius: 8px;
-    padding: 8px 10px;
+    border: 1px solid transparent;
+    border-left: 3px solid transparent;
+    border-radius: 6px;
+    padding: 8px 10px 8px 7px;
     text-align: left;
     font-size: 13px;
     font-weight: 500;
@@ -88,13 +89,18 @@ QToolButton#navButton:hover {{
 QToolButton#navButton:checked {{
     background: {c.accent_soft};
     color: {c.accent_text};
-    font-weight: 650;
+    border-left: 3px solid {c.accent};
+    font-weight: 700;
+}}
+QToolButton#navButton:focus {{
+    border: 1px solid {c.accent};
+    border-left: 3px solid {c.accent};
 }}
 QToolButton#navToggle, QToolButton#iconButton, QToolButton#updateIndicator {{
     background: transparent;
     color: {c.text_secondary};
     border: 1px solid transparent;
-    border-radius: 8px;
+    border-radius: 6px;
     padding: 7px;
 }}
 QToolButton#navToggle:hover, QToolButton#iconButton:hover, QToolButton#updateIndicator:hover {{
@@ -129,7 +135,7 @@ QLabel#pageEyebrow {{
 }}
 QLabel#pageTitle {{
     color: {c.text};
-    font-size: 23px;
+    font-size: 22px;
     font-weight: 720;
 }}
 QLabel#pageDescription, QLabel#subtitle, QLabel#muted {{
@@ -137,6 +143,7 @@ QLabel#pageDescription, QLabel#subtitle, QLabel#muted {{
 }}
 QLabel#pageDescription {{
     font-size: 12px;
+    max-height: 40px;
 }}
 QFrame#pageBody {{
     background: transparent;
@@ -146,21 +153,33 @@ QFrame#pageBody {{
 QFrame#surfaceCard {{
     background: {c.surface};
     border: 1px solid {c.border};
-    border-radius: 12px;
+    border-radius: 10px;
 }}
 QFrame#surfaceCard[elevated="true"] {{
     background: {c.surface_raised};
     border-color: {c.border_strong};
 }}
-QFrame#metricCard {{
+QFrame#metricCard, QFrame#summaryStrip QFrame#metricCard {{
     background: {c.surface};
     border: 1px solid {c.border};
     border-radius: 10px;
+}}
+QFrame#summaryStrip {{
+    background: transparent;
+    border: none;
 }}
 QFrame#updateBanner {{
     background: {c.warning_soft};
     border: 1px solid {c.warning};
     border-radius: 10px;
+}}
+QFrame#updateBanner[status="danger"] {{
+    background: {c.danger_soft};
+    border: 1px solid {c.danger};
+}}
+QFrame#updateBanner[status="info"] {{
+    background: {c.info_soft};
+    border: 1px solid {c.info};
 }}
 QLabel#bannerText {{
     color: {c.text};
@@ -169,6 +188,57 @@ QLabel#bannerText {{
 }}
 QLabel#bannerText[state="danger"] {{
     color: {c.danger};
+}}
+QFrame#feedbackToast {{
+    background: {c.success_soft};
+    border: 1px solid {c.success};
+    border-radius: 10px;
+}}
+QFrame#feedbackToast[status="warning"] {{
+    background: {c.warning_soft};
+    border: 1px solid {c.warning};
+}}
+QFrame#feedbackToast[status="danger"] {{
+    background: {c.danger_soft};
+    border: 1px solid {c.danger};
+}}
+QFrame#feedbackToast[status="info"] {{
+    background: {c.info_soft};
+    border: 1px solid {c.info};
+}}
+QLabel#toastText {{
+    color: {c.text};
+    font-size: 13px;
+    font-weight: 600;
+}}
+QFrame#resultSheet {{
+    background: {c.success_soft};
+    border: none;
+    border-bottom: 1px solid {c.success};
+}}
+QFrame#resultSheet[status="warning"] {{
+    background: {c.warning_soft};
+    border-bottom-color: {c.warning};
+}}
+QFrame#resultSheet[status="danger"] {{
+    background: {c.danger_soft};
+    border-bottom-color: {c.danger};
+}}
+QFrame#resultSheet[status="info"] {{
+    background: {c.info_soft};
+    border-bottom-color: {c.info};
+}}
+QLabel#resultSheetTitle {{
+    color: {c.text};
+    font-size: 13px;
+    font-weight: 700;
+}}
+QPlainTextEdit#resultSheetBody {{
+    background: transparent;
+    color: {c.text_secondary};
+    border: none;
+    font-size: 12px;
+    padding: 0;
 }}
 QLabel#sectionTitle {{
     color: {c.text};
@@ -246,13 +316,13 @@ QFrame#divider {{
 QFrame#collapsibleSection {{
     background: {c.surface};
     border: 1px solid {c.border};
-    border-radius: 12px;
+    border-radius: 10px;
 }}
 QToolButton#collapsibleHeader {{
     background: transparent;
     color: {c.text};
     border: none;
-    border-radius: 11px;
+    border-radius: 10px;
     padding: 13px 15px;
     text-align: left;
     font-size: 14px;
@@ -268,7 +338,7 @@ QLabel#collapsibleDescription {{
 QGroupBox {{
     background: {c.surface};
     border: 1px solid {c.border};
-    border-radius: 12px;
+    border-radius: 10px;
     margin-top: 13px;
     padding: 13px 13px 11px 13px;
     font-weight: 650;
@@ -284,12 +354,17 @@ QGroupBox::title {{
 /* Badges */
 QLabel#statusBadge {{
     border: 1px solid {c.border};
-    border-radius: 9px;
+    border-radius: 6px;
     padding: 3px 8px;
     color: {c.text_secondary};
     background: {c.surface_hover};
     font-size: 11px;
     font-weight: 650;
+}}
+QLabel#statusBadge[status="neutral"] {{
+    color: {c.text_muted};
+    background: {c.surface};
+    border-color: {c.border};
 }}
 QLabel#statusBadge[status="success"] {{
     color: {c.success};
@@ -320,7 +395,7 @@ QPushButton {{
     background: {c.accent};
     color: #FFFFFF;
     border: 1px solid {c.accent};
-    border-radius: 8px;
+    border-radius: 6px;
     padding: 0 13px;
     font-weight: 620;
 }}
@@ -381,7 +456,7 @@ QPushButton[large="true"] {{
     padding: 0 17px;
 }}
 QToolButton[secondary="true"] {{
-    border-radius: 8px;
+    border-radius: 6px;
     padding: 0 11px;
 }}
 QToolButton::menu-indicator {{
@@ -393,7 +468,7 @@ QLineEdit, QPlainTextEdit, QTextEdit, QTextBrowser, QComboBox, QSpinBox, QDouble
     background: {c.input};
     color: {c.text};
     border: 1px solid {c.border};
-    border-radius: 8px;
+    border-radius: 6px;
     selection-background-color: {c.accent};
     selection-color: {c.selection_text};
 }}
@@ -472,9 +547,12 @@ QAbstractItemView, QListWidget, QListView, QTreeWidget, QTreeView, QTableWidget,
     color: {c.text_secondary};
     border: 1px solid {c.border};
     border-radius: 10px;
-    outline: none;
+    outline: 1px solid transparent;
     alternate-background-color: {c.surface_raised};
     gridline-color: transparent;
+}}
+QAbstractItemView:focus, QListWidget:focus, QTreeWidget:focus, QTableWidget:focus {{
+    border: 1px solid {c.accent};
 }}
 QAbstractItemView::item {{
     color: {c.text_secondary};
@@ -523,12 +601,12 @@ QMenu {{
     background: {c.surface_raised};
     color: {c.text};
     border: 1px solid {c.border_strong};
-    border-radius: 8px;
+    border-radius: 10px;
     padding: 5px;
 }}
 QMenu::item {{
     padding: 7px 24px 7px 10px;
-    border-radius: 5px;
+    border-radius: 6px;
 }}
 QMenu::item:selected {{
     background: {c.accent_soft};
@@ -646,6 +724,62 @@ QStatusBar::item {{
 }}
 QLabel#mono, QPlainTextEdit#mono {{
     font-family: {mono};
+}}
+QLabel#propKey {{
+    color: {c.text_muted};
+    font-size: 12px;
+}}
+QLabel#propValue {{
+    color: {c.text};
+    font-size: 13px;
+    font-weight: 550;
+}}
+QFrame#emptyState {{
+    background: transparent;
+    border: 1px dashed {c.border};
+    border-radius: 10px;
+}}
+QLabel#emptyTitle {{
+    color: {c.text};
+    font-size: 15px;
+    font-weight: 650;
+}}
+QLabel#emptyReason {{
+    color: {c.text_muted};
+    font-size: 12px;
+}}
+QFrame#errorPanel {{
+    background: {c.danger_soft};
+    border: 1px solid {c.danger};
+    border-radius: 10px;
+}}
+QLabel#errorTitle {{
+    color: {c.danger};
+    font-size: 13px;
+    font-weight: 700;
+}}
+QLabel#errorReason, QLabel#errorDetail {{
+    color: {c.text};
+    font-size: 12px;
+}}
+QWidget#chatPage QFrame#surfaceCard {{
+    background: transparent;
+    border: none;
+}}
+QWidget#chatPage QFrame#surfaceCard[elevated="true"] {{
+    background: {c.surface};
+    border: 1px solid {c.border};
+    border-radius: 14px;
+}}
+QFrame#wizardStepHint {{
+    background: {c.accent_soft};
+    border: 1px solid {c.border};
+    border-radius: 10px;
+}}
+QLabel#wizardStepIndex {{
+    color: {c.accent_text};
+    font-size: 11px;
+    font-weight: 700;
 }}
 """
 

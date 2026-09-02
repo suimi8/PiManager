@@ -13,6 +13,8 @@ import signal
 import subprocess
 import sys
 import threading
+import time
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -451,6 +453,7 @@ def run_pi(
     cwd: str | None = None,
     timeout: float | None = 60,
     env: dict[str, str] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run Pi with real-time 8 MiB limits for stdout and stderr."""
     from . import proc
@@ -507,8 +510,27 @@ def run_pi(
     ]
     for reader in readers:
         reader.start()
+    cancelled = False
+    deadline = None if timeout is None else time.monotonic() + max(0.05, float(timeout))
     try:
-        returncode = process.wait(timeout=timeout)
+        while True:
+            if is_cancelled and is_cancelled():
+                cancelled = True
+                _terminate_process_tree(process)
+                break
+            slice_timeout = 0.15
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                slice_timeout = min(0.15, remaining)
+            try:
+                returncode = process.wait(timeout=slice_timeout)
+                break
+            except subprocess.TimeoutExpired:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise
+                continue
     except subprocess.TimeoutExpired:
         _terminate_process_tree(process)
         for reader in readers:
@@ -520,6 +542,11 @@ def run_pi(
     # bytearray 被并发追加。
     stdout = bytes(buffers["stdout"]).decode("utf-8", errors="replace")
     stderr = bytes(buffers["stderr"]).decode("utf-8", errors="replace")
+    if cancelled:
+        extra = "已停止生成"
+        return subprocess.CompletedProcess(
+            cmd, -1, stdout, f"{stderr}\n{extra}".strip() if stderr else extra
+        )
     if limit_exceeded.is_set():
         return subprocess.CompletedProcess(
             cmd, -1, stdout, "process output limit exceeded\n" + stderr

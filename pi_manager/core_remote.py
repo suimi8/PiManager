@@ -213,6 +213,10 @@ def fetch_remote_models(
                 }
             )
         )
+    else:
+        # 与 ``_http_json_request`` 一致：显式空 ProxyHandler，避免 urllib
+        # 再去读环境变量或 Windows 系统代理，把本机 HTTP 桩变成 502。
+        handlers.append(urllib.request.ProxyHandler({}))
     # Provider credentials must never be replayed by urllib across redirects.
     handlers.append(http_client.DenyRedirectHandler())
     handlers.append(urllib.request.HTTPSHandler(context=_ssl_context(insecure_ssl)))

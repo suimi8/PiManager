@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from .... import builtin_plugins
+from ...components import EmptyState
 from ...workers import Worker
 from . import cards
 from .format import (
@@ -43,8 +44,19 @@ def _clear_list(window) -> None:
         if widget is not None:
             widget.deleteLater()
 
-def _collect_plugin_rows() -> dict[str, Any]:
+def _collect_plugin_rows(is_cancelled=None) -> dict[str, Any]:
     """在 Worker 中读取内置和自定义插件的状态。"""
+    def cancelled() -> bool:
+        return bool(is_cancelled and is_cancelled())
+
+    if cancelled():
+        return {
+            "plugins": [],
+            "builtin_error": "",
+            "backend_error": "扫描已取消",
+            "cancelled": True,
+        }
+
     builtin_error = ""
     builtin_statuses: list[dict[str, Any]] = []
     builtin_meta: dict[str, dict[str, Any]] = {}
@@ -73,6 +85,14 @@ def _collect_plugin_rows() -> dict[str, Any]:
         row["install_path"] = _first(row, "install_path", "target", default="")
         builtin_rows.append(row)
         builtin_ids.add(name)
+
+    if cancelled():
+        return {
+            "plugins": builtin_rows,
+            "builtin_error": builtin_error,
+            "backend_error": "扫描已取消",
+            "cancelled": True,
+        }
 
     backend_error = ""
     custom_rows: list[dict[str, Any]] = []
@@ -153,22 +173,25 @@ def _refresh(window, after=None) -> None:
             pending.append(after)
         return
     window._plugin_refreshing = True
-    window.plugins_refresh_btn.setEnabled(False)
+    _set_refresh_busy(window, True)
     window.plugins_global_status.setText("正在扫描插件状态…")
     window.plugins_backend_status.setVisible(False)
 
     worker = Worker(_collect_plugin_rows)
+    window._plugin_scan_worker = worker
     _track_worker(window, worker)
 
     def on_done(result: dict[str, Any]) -> None:
         window._plugin_refreshing = False
-        window.plugins_refresh_btn.setEnabled(True)
+        window._plugin_scan_worker = None
+        _set_refresh_busy(window, False)
         _render_plugin_rows(window, result or {})
         _run_pending_after(window, after)
 
     def on_failed(error: str) -> None:
         window._plugin_refreshing = False
-        window.plugins_refresh_btn.setEnabled(True)
+        window._plugin_scan_worker = None
+        _set_refresh_busy(window, False)
         _clear_list(window)
         window._plugin_cards = {}
         _set_label_error(window.plugins_global_status, f"扫描插件失败：{error}")
@@ -180,6 +203,30 @@ def _refresh(window, after=None) -> None:
     worker.done.connect(on_done)
     worker.failed.connect(on_failed)
     worker.start()
+
+
+def _set_refresh_busy(window, busy: bool) -> None:
+    refresh = getattr(window, "plugins_refresh_btn", None)
+    if refresh is not None:
+        refresh.setEnabled(not busy)
+        refresh.setText("正在扫描…" if busy else "刷新状态")
+    cancel = getattr(window, "plugins_cancel_btn", None)
+    if cancel is not None:
+        cancel.setEnabled(bool(busy))
+
+
+def _cancel_refresh(window) -> None:
+    worker = getattr(window, "_plugin_scan_worker", None)
+    try:
+        if worker is None or not worker.isRunning():
+            _set_refresh_busy(window, False)
+            return
+        worker.requestInterruption()
+    except RuntimeError:
+        _set_refresh_busy(window, False)
+        return
+    window.plugins_global_status.setText("正在取消扫描…")
+
 
 def _render_plugin_rows(window, result: Mapping[str, Any]) -> None:
     _clear_list(window)
@@ -193,9 +240,10 @@ def _render_plugin_rows(window, result: Mapping[str, Any]) -> None:
         window._plugin_cards[key] = card
 
     if not rows:
-        empty = QLabel("暂无可显示的插件。可点击“添加插件”导入本地目录或 ZIP。")
-        empty.setObjectName("subtitle")
-        empty.setWordWrap(True)
+        empty = EmptyState(
+            "暂无插件",
+            "可点击「添加插件」导入本地目录或 ZIP。内置插件会在扫描后出现在这里。",
+        )
         window.plugins_list_container.addWidget(empty)
 
     builtin_count = sum(1 for row in rows if row.get("_origin") == "builtin")

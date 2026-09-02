@@ -37,15 +37,15 @@ def drain_pending_connections(server) -> int:
 
 
 NAV_PAGES = [
-    ("simple", "简化配置", "默认模型 / 快速接入 / 启动"),
-    ("models", "模型列表", "切换、收藏、批量测试"),
+    ("simple", "概览", "默认模型 / 可用性 / 启动"),
     ("providers", "Provider", "自定义与密钥管理"),
+    ("models", "模型列表", "切换、收藏、批量测试"),
+    ("tools", "工具", "导入导出 / 自检"),
+    ("plugins", "插件", "内置 skills / extensions 一键安装"),
     ("chat", "快速提问", "轻量多轮问答"),
     ("sessions", "会话", "继续历史会话"),
     ("health", "健康监控", "可用性巡检"),
     ("history", "测试历史", "延迟记录"),
-    ("tools", "工具", "导入导出 / 自检"),
-    ("plugins", "插件", "内置 skills / extensions 一键安装"),
     ("settings", "设置", "语言 / 主题 / 代理"),
     ("help", "使用教程", "教程与常见问题"),
 ]

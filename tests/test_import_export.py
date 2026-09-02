@@ -543,6 +543,21 @@ def test_secure_existing_keys_leaves_no_plaintext_residue(isolated_home):
     assert active is not None and active["value"] == PLAINTEXT_LEGACY_KEY
 
 
+def test_secure_existing_keys_preserves_existing_last_workdir(isolated_home):
+    """迁移密钥时不得整份覆盖 pi-manager.json（例如抹掉 last_workdir）。"""
+    _seed_legacy_plaintext_models()
+    keep = str(isolated_home / "keep-workdir")
+
+    def _seed(cfg):
+        cfg["last_workdir"] = keep
+        return cfg
+
+    core.update_manager_config(_seed)
+    result = extras.secure_existing_keys()
+    assert result["ok"] is True
+    assert core.load_manager_config()["last_workdir"] == keep
+
+
 def test_purge_keeps_backups_that_hold_no_plaintext(isolated_home):
     core.ensure_agent_dir()
     safe = {

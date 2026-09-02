@@ -190,6 +190,12 @@ def _build_custom_card(window, plugin: dict[str, Any]) -> QWidget:
     path_lbl.setWordWrap(True)
     card.content.addWidget(path_lbl)
 
+    if not trusted:
+        trust_note = QLabel("此插件尚未被信任，启用前请确认其来源。")
+        trust_note.setObjectName("subtitle")
+        trust_note.setWordWrap(True)
+        card.content.addWidget(trust_note)
+
     btn_row = QHBoxLayout()
     btn_row.setSpacing(8)
     btn_row.addStretch(1)

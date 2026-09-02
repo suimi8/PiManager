@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,12 +45,22 @@ class ModelInfo:
 
 
 
-def list_models(search: str | None = None) -> list[ModelInfo]:
+def list_models(
+    search: str | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
+) -> list[ModelInfo]:
     args = ["--list-models"]
     if search:
         args.append(search)
     try:
-        p = _core().run_pi(args, timeout=45, env=_core().all_provider_runtime_env(strict=False))
+        p = _core().run_pi(
+            args,
+            timeout=45,
+            env=_core().all_provider_runtime_env(strict=False),
+            is_cancelled=is_cancelled,
+        )
+        if (is_cancelled and is_cancelled()) or "已停止生成" in (p.stderr or ""):
+            return []
     except Exception:
         return []
     text = (p.stdout or "") + "\n" + (p.stderr or "")

@@ -113,18 +113,31 @@ def secure_existing_keys() -> dict[str, Any]:
     providers = cfg.get("providers") or {}
     if not isinstance(providers, dict):
         return {"ok": False, "count": 0}
-    new_providers = secretstore.migrate_plaintext_keys(providers)
-    cfg["providers"] = new_providers
-    core.save_models_config(cfg)
-    mgr = core.load_manager_config()
-    mgr["secure_keys"] = True
-    core.save_manager_config(mgr)
+    count = 0
+
+    def _apply_models(current: dict[str, Any]) -> dict[str, Any]:
+        nonlocal count
+        raw = current.get("providers") or {}
+        if not isinstance(raw, dict):
+            return current
+        new_providers = secretstore.migrate_plaintext_keys(raw)
+        current["providers"] = new_providers
+        count = len(new_providers)
+        return current
+
+    core.update_models_config(_apply_models)
+
+    def _apply_mgr(mgr: dict[str, Any]) -> dict[str, Any]:
+        mgr["secure_keys"] = True
+        return mgr
+
+    core.update_manager_config(_apply_mgr)
     # 迁移刚刚把明文原文轮转进 models.json.bak.1：不擦除的话「安全迁移」等于
     # 把明文永久留在同目录下（P1-3）。
     purged = _extras().purge_plaintext_key_backups()
     return {
         "ok": True,
-        "count": len(new_providers),
+        "count": count,
         "secrets": secretstore.list_secret_names(),
         "purged_backups": purged,
     }

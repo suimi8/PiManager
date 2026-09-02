@@ -51,7 +51,11 @@ def build_settings_page(window) -> QWidget:
     intro = SurfaceCard(elevated=True, margins=(16, 14, 16, 14), spacing=8)
     intro_row = QHBoxLayout()
     intro_row.addWidget(SectionHeading("偏好设置", "常用配置保持展开，高级网络、故障切换和系统行为默认折叠。"), 1)
-    intro_row.addWidget(StatusBadge("自动保存到本地", "info"), 0, Qt.AlignTop)
+    window.settings_dirty_badge = StatusBadge("已保存", "success")
+    window.settings_saved_label = QLabel("")
+    window.settings_saved_label.setObjectName("subtitle")
+    intro_row.addWidget(window.settings_saved_label, 0, Qt.AlignTop)
+    intro_row.addWidget(window.settings_dirty_badge, 0, Qt.AlignTop)
     intro.content.addLayout(intro_row)
     layout.addWidget(intro)
 
@@ -212,7 +216,7 @@ def build_settings_page(window) -> QWidget:
     window.settings_raw = QPlainTextEdit()
     window.settings_raw.setReadOnly(True)
     window.settings_raw.setObjectName("mono")
-    window.settings_raw.setMinimumHeight(190)
+    window.settings_raw.setMinimumHeight(140)
     raw.body_layout.addWidget(window.settings_raw)
     layout.addWidget(raw)
 
@@ -242,6 +246,15 @@ class SettingsPageMixin:
         self.apply_ui_theme(mode, accent)
 
     def settings_load(self):
+        self._settings_loading = True
+        try:
+            self._settings_load_fields()
+        finally:
+            self._settings_loading = False
+            self._bind_settings_dirty()
+            self._clear_settings_dirty()
+
+    def _settings_load_fields(self):
         s = core.load_settings()
         self.set_provider.setText(str(s.get("defaultProvider") or ""))
         self.set_model.setText(str(s.get("defaultModel") or ""))
@@ -343,12 +356,11 @@ class SettingsPageMixin:
             json.dumps(core.redact_sensitive_config(final_settings), ensure_ascii=False, indent=2)
         )
         self.refresh_dashboard()
-        self.status.showMessage("\u8bbe\u7f6e\u5df2\u4fdd\u5b58\uff0c\u7ba1\u7406\u5668\u4e0e Pi CLI \u5df2\u540c\u6b65\u4e3b\u9898")
-        QMessageBox.information(
-            self,
-            "\u5df2\u4fdd\u5b58",
-            "\u5168\u5c40\u663c\u591c\u4e3b\u9898\u3001settings.json \u4e0e Pi Manager \u504f\u597d\u5df2\u540c\u6b65\u3002",
-        )
+        self._clear_settings_dirty()
+        self.status.showMessage("设置已保存，管理器与 Pi CLI 已同步主题", 5000)
+        notify = getattr(self, "notify_success", None)
+        if callable(notify):
+            notify("设置已保存")
 
     def load_feature_settings_fields(self):
         mgr = core.load_manager_config()
@@ -379,33 +391,119 @@ class SettingsPageMixin:
             self.mgr_version_lbl.setText(f"当前版本：{extras.APP_VERSION}")
 
     def save_feature_settings_fields(self):
+        fields = {}
         if hasattr(self, "proxy_enabled"):
-            self.mgr["proxy_enabled"] = self.proxy_enabled.isChecked()
+            fields["proxy_enabled"] = self.proxy_enabled.isChecked()
         if hasattr(self, "proxy_url"):
-            self.mgr["proxy_url"] = self.proxy_url.text().strip()
+            fields["proxy_url"] = self.proxy_url.text().strip()
         if hasattr(self, "test_concurrency"):
-            self.mgr["test_concurrency"] = int(self.test_concurrency.value())
+            fields["test_concurrency"] = int(self.test_concurrency.value())
         if hasattr(self, "failover_enabled"):
-            self.mgr["failover_enabled"] = self.failover_enabled.isChecked()
+            fields["failover_enabled"] = self.failover_enabled.isChecked()
         if hasattr(self, "failover_threshold"):
-            self.mgr["failover_fail_threshold"] = int(self.failover_threshold.value())
+            fields["failover_fail_threshold"] = int(self.failover_threshold.value())
         if hasattr(self, "failover_silent"):
-            self.mgr["failover_silent"] = self.failover_silent.isChecked()
+            fields["failover_silent"] = self.failover_silent.isChecked()
         if hasattr(self, "chat_persistent_session"):
-            self.mgr["chat_persistent_session"] = self.chat_persistent_session.isChecked()
+            fields["chat_persistent_session"] = (
+                self.chat_persistent_session.isChecked()
+            )
         if hasattr(self, "minimize_to_tray"):
-            self.mgr["minimize_to_tray"] = self.minimize_to_tray.isChecked()
+            fields["minimize_to_tray"] = self.minimize_to_tray.isChecked()
         if hasattr(self, "start_minimized"):
-            self.mgr["start_minimized"] = self.start_minimized.isChecked()
+            fields["start_minimized"] = self.start_minimized.isChecked()
         if hasattr(self, "secure_keys_chk"):
-            self.mgr["secure_keys"] = self.secure_keys_chk.isChecked()
+            fields["secure_keys"] = self.secure_keys_chk.isChecked()
         if hasattr(self, "update_url_edit"):
-            self.mgr["update_manifest_url"] = self.update_url_edit.text().strip()
-        self.persist_mgr()
-        extras.set_proxy_settings(bool(self.mgr.get("proxy_enabled")), str(self.mgr.get("proxy_url") or ""))
+            fields["update_manifest_url"] = self.update_url_edit.text().strip()
+        self.persist_mgr(**fields)
+        extras.set_proxy_settings(
+            bool(self.mgr.get("proxy_enabled")),
+            str(self.mgr.get("proxy_url") or ""),
+        )
         extras.set_test_concurrency(int(self.mgr.get("test_concurrency") or 3))
         self._setup_health_timer()
         self.rebuild_tray_favorites()
+
+    def _bind_settings_dirty(self) -> None:
+        if getattr(self, "_settings_dirty_bound", False):
+            return
+        self._settings_dirty_bound = True
+        for widget in (
+            getattr(self, "set_provider", None),
+            getattr(self, "set_model", None),
+            getattr(self, "set_enabled", None),
+            getattr(self, "proxy_url", None),
+            getattr(self, "zhipu_key_edit", None),
+        ):
+            if widget is not None and hasattr(widget, "textChanged"):
+                widget.textChanged.connect(self._mark_settings_dirty)
+        for widget in (
+            getattr(self, "set_thinking", None),
+            getattr(self, "set_language", None),
+            getattr(self, "set_ui_mode", None),
+            getattr(self, "set_ui_accent", None),
+            getattr(self, "vision_model_combo", None),
+        ):
+            if widget is not None:
+                widget.currentIndexChanged.connect(self._mark_settings_dirty)
+        for widget in (
+            getattr(self, "proxy_enabled", None),
+            getattr(self, "failover_enabled", None),
+            getattr(self, "failover_silent", None),
+            getattr(self, "chat_persistent_session", None),
+            getattr(self, "minimize_to_tray", None),
+            getattr(self, "start_minimized", None),
+            getattr(self, "secure_keys_chk", None),
+        ):
+            if widget is not None:
+                widget.toggled.connect(self._mark_settings_dirty)
+        for widget in (
+            getattr(self, "failover_threshold", None),
+            getattr(self, "test_concurrency", None),
+        ):
+            if widget is not None:
+                widget.valueChanged.connect(self._mark_settings_dirty)
+
+    def _mark_settings_dirty(self, *_args) -> None:
+        if getattr(self, "_settings_loading", False):
+            return
+        self._settings_dirty = True
+        badge = getattr(self, "settings_dirty_badge", None)
+        if badge is not None:
+            badge.set_status("warning", "未保存")
+
+    def _clear_settings_dirty(self) -> None:
+        from datetime import datetime
+
+        self._settings_dirty = False
+        badge = getattr(self, "settings_dirty_badge", None)
+        if badge is not None:
+            badge.set_status("success", "已保存")
+        label = getattr(self, "settings_saved_label", None)
+        if label is not None:
+            label.setText(f"保存于 {datetime.now().strftime('%H:%M:%S')}")
+
+    def confirm_leave_settings(self) -> bool:
+        if not getattr(self, "_settings_dirty", False):
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle("未保存的更改")
+        box.setText("设置页有未保存的更改。离开前要保存吗？")
+        box.setInformativeText("选择「取消」将留在设置页。")
+        save_btn = box.addButton("保存", QMessageBox.AcceptRole)
+        box.addButton("放弃更改", QMessageBox.DestructiveRole)
+        cancel_btn = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(save_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is cancel_btn:
+            return False
+        if clicked is save_btn:
+            self.settings_save()
+        else:
+            self.settings_load()
+        return True
 
     def vision_check_config(self):
         """校验识图配置就绪（设置页的识图模型默认使用，不写入模型列表）。
@@ -433,14 +531,17 @@ class SettingsPageMixin:
                 "（GLM-4.6V-Flash / GLM-4.1V-Thinking-Flash）转文字后交给默认对话模型。"
             )
         self.status.showMessage("识图配置就绪（不写入模型列表）")
-        QMessageBox.information(
-            self,
-            "识图配置就绪",
+        body = (
             "设置中的识图模型（GLM-4.6V-Flash / GLM-4.1V-Thinking-Flash）已默认用于识图管道：\n\n"
             "· 粘贴/拖入图片时，Pi skill 自动调用识图转文字，再交给默认对话模型回答；\n"
             "· 识图模型不会自动出现在模型列表中（除非你在 Provider 管理中手动添加）；\n"
-            "· 可在「设置 → 识图模型」切换识图模型，无需改动模型列表。",
+            "· 可在「设置 → 识图模型」切换识图模型，无需改动模型列表。"
         )
+        show = getattr(self, "show_result", None)
+        if callable(show):
+            show("识图配置就绪", body, tone="info")
+        else:
+            QMessageBox.information(self, "识图配置就绪", body)
 
     def vision_test_run(self):
         key = ""
@@ -481,11 +582,8 @@ class SettingsPageMixin:
             self.vision_test_status.setText(
                 f"识图正常（{model}）：模型返回「{desc[:100]}」"
             )
-            QMessageBox.information(
-                self,
-                "识图测试通过",
-                "红色测试图识别成功，识图模型可用。\n\n"
-                f"使用模型：{model}\n模型回答：{desc}",
+            self.notify_success(
+                f"识图正常（{model}）：{desc[:80]}"
             )
         else:
             err = str(result.get("error") or "未知错误")

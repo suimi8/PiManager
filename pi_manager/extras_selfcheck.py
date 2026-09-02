@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from typing import Any
 
 from . import core
@@ -20,12 +21,26 @@ def _extras():
     return extras
 
 
-def run_self_check() -> list[dict[str, Any]]:
+def run_self_check(
+    is_cancelled: Callable[[], bool] | None = None,
+) -> list[dict[str, Any]]:
     """Return list of {name, ok, detail, level}."""
     checks: list[dict[str, Any]] = []
 
     def add(name: str, ok: bool, detail: str, level: str = "info"):
         checks.append({"name": name, "ok": ok, "detail": detail, "level": level if ok else "warn"})
+
+    def cancelled() -> bool:
+        return bool(is_cancelled and is_cancelled())
+
+    def stop_if_cancelled() -> bool:
+        if not cancelled():
+            return False
+        add("自检进度", False, "已取消，仅显示已完成项", "warn")
+        return True
+
+    if stop_if_cancelled():
+        return checks
 
     # Pi installed
     pi = core.find_pi_command()
@@ -69,7 +84,16 @@ def run_self_check() -> list[dict[str, Any]]:
 
     # secrets
     names = secretstore.list_secret_names()
-    add("安全密钥库", True, f"{len(names)} 条（{secretstore.backend_description()}）")
+    backend = secretstore.backend_description()
+    detail = f"{len(names)} 条（{backend}）"
+    if secretstore.using_os_keyring():
+        add("安全密钥库", True, detail)
+    else:
+        add(
+            "安全密钥库",
+            False,
+            f"{detail}。机密性弱于系统钥匙串，见 SECURITY.md",
+        )
 
     # orphaned provider key pools (provider config no longer in models.json)
     try:
@@ -89,6 +113,8 @@ def run_self_check() -> list[dict[str, Any]]:
         add("孤儿密钥", True, f"跳过：{e}")
 
     # stale settings.enabledModels references (removed providers)
+    if stop_if_cancelled():
+        return checks
     try:
         builtin: set[str] = set()
         if core.find_pi_command():
@@ -158,6 +184,8 @@ def run_self_check() -> list[dict[str, Any]]:
     # network quick (optional lightweight); several endpoints so users outside
     # mainland China are not misreported as offline. Consistent HTTP policy:
     # no redirects, status only, body never read.
+    if stop_if_cancelled():
+        return checks
     import urllib.parse
     import urllib.request
 
@@ -170,6 +198,10 @@ def run_self_check() -> list[dict[str, Any]]:
     )
     probe_error = ""
     for probe_url in probe_urls:
+        if cancelled():
+            add("基础网络", False, "已取消，未完成连通探测", "warn")
+            add("Pi Manager 版本", True, _extras().APP_VERSION)
+            return checks
         try:
             t0 = time.perf_counter()
             req = urllib.request.Request(

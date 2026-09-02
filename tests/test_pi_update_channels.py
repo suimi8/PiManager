@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from types import SimpleNamespace
 
 from pi_manager import core
@@ -74,7 +76,7 @@ def test_registry_failure_is_not_reported_as_ready_and_install_is_not_run(monkey
     monkeypatch.setattr(core, "get_pi_runtime_status", lambda: _runtime(installed="0.80.10"))
     monkeypatch.setattr(core, "get_latest_pi_version", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        core.subprocess,
+        subprocess,
         "run",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("npm install must not run")),
     )
@@ -94,7 +96,7 @@ def test_successful_npm_exit_still_fails_when_pi_runtime_verification_fails(monk
     monkeypatch.setattr(core, "get_npm_version", lambda timeout=20: "11.0.0")
     monkeypatch.setattr(core, "get_latest_pi_version", lambda timeout=20, tag=None: "0.80.10")
     monkeypatch.setattr(
-        core.subprocess,
+        subprocess,
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="installed\n", stderr=""),
     )
@@ -112,7 +114,7 @@ def test_old_pi_shim_in_path_fails_post_install_verification(monkeypatch):
     monkeypatch.setattr(core, "get_npm_version", lambda timeout=20: "11.0.0")
     monkeypatch.setattr(core, "get_latest_pi_version", lambda timeout=20, tag=None: "0.80.10")
     monkeypatch.setattr(
-        core.subprocess,
+        subprocess,
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="installed\n", stderr=""),
     )
@@ -136,7 +138,7 @@ def test_node_20_install_uses_legacy_dist_tag(monkeypatch):
         calls.append(argv)
         return SimpleNamespace(returncode=0, stdout="installed\n", stderr="")
 
-    monkeypatch.setattr(core.subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "run", fake_run)
     monkeypatch.setattr(core, "get_pi_runtime_status", lambda: _runtime(installed="0.74.2"))
 
     code, _stdout, _stderr = core.install_or_update_pi()
@@ -169,6 +171,6 @@ def test_sanitize_proxy_env_is_public_with_private_alias(monkeypatch):
 
 def test_project_name_from_path_is_public_with_private_alias():
     assert core.project_name_from_path("/home/user/app") == "app"
-    if core.sys.platform == "win32":
+    if sys.platform == "win32":
         assert core.project_name_from_path(r"C:\Users\me\app") == "app"
         assert core.project_name_from_path("C:\\") == "C:"

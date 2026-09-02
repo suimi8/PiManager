@@ -195,9 +195,10 @@ def test_session_delete_and_rename_are_confined_to_sessions_dir(isolated_home):
         extras.session_rename(str(renamed), "")
 
 
-def test_proxy_settings_reject_non_http_schemes(isolated_home):
+def test_proxy_settings_reject_non_http_schemes(isolated_home, monkeypatch):
     from pi_manager import extras
 
+    _clear_proxy_environment(monkeypatch)
     with pytest.raises(ValueError, match="代理"):
         extras.set_proxy_settings(True, "file:///etc/passwd")
     with pytest.raises(ValueError, match="代理"):

@@ -54,10 +54,13 @@ def set_proxy_settings(enabled: bool, url: str) -> dict[str, Any]:
         proxy_error = _validate_proxy_url(url)
         if proxy_error:
             raise ValueError(proxy_error)
-    cfg = core.load_manager_config()
-    cfg["proxy_enabled"] = bool(enabled)
-    cfg["proxy_url"] = url
-    core.save_manager_config(cfg)
+
+    def _apply(cfg: dict[str, Any]) -> dict[str, Any]:
+        cfg["proxy_enabled"] = bool(enabled)
+        cfg["proxy_url"] = url
+        return cfg
+
+    core.update_manager_config(_apply)
     # apply to process env for child pi processes when enabled
     apply_proxy_env()
     return get_proxy_settings()
@@ -90,9 +93,13 @@ def get_test_concurrency() -> int:
 
 
 def set_test_concurrency(n: int) -> None:
-    cfg = core.load_manager_config()
-    cfg["test_concurrency"] = max(1, min(int(n), 8))
-    core.save_manager_config(cfg)
+    value = max(1, min(int(n), 8))
+
+    def _apply(cfg: dict[str, Any]) -> dict[str, Any]:
+        cfg["test_concurrency"] = value
+        return cfg
+
+    core.update_manager_config(_apply)
 
 
 def test_models_batch_concurrent(

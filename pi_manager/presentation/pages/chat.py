@@ -10,6 +10,7 @@ from PySide6.QtGui import QImage, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -21,6 +22,14 @@ from PySide6.QtWidgets import (
 
 from ... import core
 from ... import extras
+from ...chat_choices import (
+    config_models_for_provider,
+    merge_model_ids,
+    merge_provider_names,
+    pick_model,
+    pick_provider,
+    providers_from_models_config,
+)
 from ..components import SectionHeading, StatusBadge, SurfaceCard
 from ..workers import Worker
 
@@ -100,12 +109,15 @@ class ImageAttachEdit(QPlainTextEdit):
 
 def build_chat_page(window) -> QWidget:
     page = QWidget()
-    page.setObjectName("pageBody")
+    page.setObjectName("chatPage")
     layout = QVBoxLayout(page)
-    layout.setContentsMargins(26, 22, 26, 24)
-    layout.setSpacing(12)
+    layout.setContentsMargins(24, 22, 24, 24)
+    layout.setSpacing(16)
 
-    context = SurfaceCard(margins=(14, 12, 14, 12), spacing=8)
+    context = QFrame()
+    context_layout = QVBoxLayout(context)
+    context_layout.setContentsMargins(0, 0, 0, 0)
+    context_layout.setSpacing(8)
     model_row = QHBoxLayout()
     model_row.setSpacing(8)
     window.chat_context_badge = StatusBadge("独立上下文", "info")
@@ -114,7 +126,7 @@ def build_chat_page(window) -> QWidget:
     window.chat_provider = QComboBox()
     window.chat_provider.setEditable(True)
     window.chat_provider.setInsertPolicy(QComboBox.NoInsert)
-    window.chat_provider.setMinimumWidth(170)
+    window.chat_provider.setMinimumWidth(120)
     window.chat_provider.setPlaceholderText("选择 Provider")
     window.chat_provider.currentTextChanged.connect(window._on_chat_provider_changed)
     model_row.addWidget(window.chat_provider, 1)
@@ -126,30 +138,47 @@ def build_chat_page(window) -> QWidget:
     model_row.addWidget(window.chat_model, 2)
     model_row.addWidget(window._btn("使用默认模型", window.chat_fill_default, secondary=True))
     model_row.addWidget(window._btn("刷新", window.refresh_chat_model_choices, ghost=True))
-    context.content.addLayout(model_row)
-    context_tip = QLabel("快速提问拥有独立的模型选择与最近 6 轮上下文；切换模型不会修改其他页面的编辑状态。")
-    context_tip.setObjectName("subtitle")
-    context_tip.setWordWrap(True)
-    context.content.addWidget(context_tip)
+    context_layout.addLayout(model_row)
+    meta_row = QHBoxLayout()
+    meta_row.setSpacing(16)
+    window.chat_meta_label = QLabel("Thinking: —  ·  工作目录: —")
+    window.chat_meta_label.setObjectName("subtitle")
+    window.chat_meta_label.setWordWrap(True)
+    meta_row.addWidget(window.chat_meta_label, 1)
+    context_layout.addLayout(meta_row)
     layout.addWidget(context)
 
     splitter = QSplitter(Qt.Vertical)
     splitter.setChildrenCollapsible(False)
-    output = SurfaceCard(margins=(17, 15, 17, 15), spacing=9)
+    output = QWidget()
+    output_layout = QVBoxLayout(output)
+    output_layout.setContentsMargins(0, 0, 0, 0)
+    output_layout.setSpacing(8)
     output_header = QHBoxLayout()
-    output_header.addWidget(SectionHeading("Pi 回复", "适合短问答；代码代理任务建议启动完整 Pi 会话。"), 1)
-    output_header.addWidget(window._btn("清空对话", window.chat_clear_history, ghost=True), 0, Qt.AlignTop)
-    output.content.addLayout(output_header)
+    output_header.addWidget(SectionHeading("Pi 回复"), 1)
+    window.chat_stop_btn = window._btn("停止生成", window.chat_stop, danger=True)
+    window.chat_stop_btn.setEnabled(False)
+    window.chat_stop_btn.setToolTip("停止当前生成；已输出的内容会保留")
+    output_header.addWidget(window.chat_stop_btn, 0, Qt.AlignTop)
+    output_header.addWidget(
+        window._btn("复制结果", window.chat_copy_output, ghost=True), 0, Qt.AlignTop
+    )
+    output_header.addWidget(
+        window._btn("导出会话", window.chat_export_session, ghost=True), 0, Qt.AlignTop
+    )
+    output_header.addWidget(
+        window._btn("清空会话", window.chat_clear_history, ghost=True), 0, Qt.AlignTop
+    )
+    output_layout.addLayout(output_header)
     window.chat_output = QPlainTextEdit()
     window.chat_output.setMaximumBlockCount(10_000)
     window.chat_output.setReadOnly(True)
     window.chat_output.setObjectName("mono")
     window.chat_output.setPlaceholderText("回复将在这里显示")
-    output.content.addWidget(window.chat_output, 1)
+    output_layout.addWidget(window.chat_output, 1)
     splitter.addWidget(output)
 
-    composer = SurfaceCard(elevated=True, margins=(17, 14, 17, 14), spacing=9)
-    composer.content.addWidget(SectionHeading("发送消息"))
+    composer = SurfaceCard(elevated=True, margins=(16, 14, 16, 14), spacing=8)
     attach_row = QHBoxLayout()
     attach_row.setSpacing(8)
     window.chat_attach_bar = QWidget()
@@ -177,9 +206,17 @@ def build_chat_page(window) -> QWidget:
         shortcut.activated.connect(window.chat_send_enhanced)
     send_row = QHBoxLayout()
     send_row.setSpacing(8)
-    send_row.addWidget(window._btn("发送到 Pi", window.chat_send_enhanced, success=True))
-    send_row.addWidget(window._btn("单次发送", window.chat_send, secondary=True))
-    send_hint = QLabel("多轮模式会携带近期上下文（Ctrl+Enter 发送）；单次发送不会读取历史。")
+    window.chat_send_enhanced_btn = window._btn(
+        "发送到 Pi", window.chat_send_enhanced, success=True
+    )
+    window.chat_regenerate_btn = window._btn(
+        "重新生成", window.chat_regenerate, secondary=True
+    )
+    window.chat_send_btn = window._btn("单次发送", window.chat_send, ghost=True)
+    send_row.addWidget(window.chat_send_enhanced_btn)
+    send_row.addWidget(window.chat_regenerate_btn)
+    send_row.addWidget(window.chat_send_btn)
+    send_hint = QLabel("Ctrl+Enter 发送；复杂改代码请启动完整 Pi。")
     send_hint.setObjectName("subtitle")
     send_row.addWidget(send_hint)
     send_row.addStretch(1)
@@ -223,16 +260,14 @@ class ChatPageMixin:
         cur_p = self._chat_combo_text(self.chat_provider)
         cur_m = self._chat_combo_text(self.chat_model)
 
-        providers = sorted({m.provider for m in (self.models or []) if m.provider})
-        # 也并入 models.json 自定义 providers（即使尚未 list-models）
+        listed = [m.provider for m in (self.models or []) if m.provider]
+        cfg_names: list[str] = []
         try:
             cfg = core.load_models_config()
-            for name in (cfg.get("providers") or {}):
-                if name and name not in providers:
-                    providers.append(str(name))
-            providers = sorted(set(providers))
+            cfg_names = providers_from_models_config(cfg)
         except Exception:
             pass
+        providers = merge_provider_names(listed, cfg_names)
 
         self.chat_provider.blockSignals(True)
         self.chat_provider.clear()
@@ -240,57 +275,43 @@ class ChatPageMixin:
             self.chat_provider.addItem(p)
         self.chat_provider.blockSignals(False)
 
-        # 决定要选中的 Provider：当前选择（仍存在）→ 默认 Provider（存在）→ 第一个
         try:
             dp, _, _ = core.get_default_model()
         except Exception:
             dp = ""
-        target = ""
-        if cur_p and cur_p in providers:
-            target = cur_p
-        elif dp and dp in providers:
-            target = dp
-        elif providers:
-            target = providers[0]
+        target = pick_provider(cur_p, providers, dp)
         self._set_chat_combo_text(self.chat_provider, target)
 
-        self._reload_chat_models_for_provider(self._chat_combo_text(self.chat_provider), prefer_model=cur_m)
+        self._reload_chat_models_for_provider(
+            self._chat_combo_text(self.chat_provider), prefer_model=cur_m
+        )
+        self._refresh_chat_context()
 
     def _on_chat_provider_changed(self, _text: str = "") -> None:
         if not hasattr(self, "chat_model") or not isinstance(self.chat_model, QComboBox):
             return
         prefer = self._chat_combo_text(self.chat_model)
         self._reload_chat_models_for_provider(self._chat_combo_text(self.chat_provider), prefer_model=prefer)
+        self._refresh_chat_context()
 
     def _reload_chat_models_for_provider(self, provider: str, prefer_model: str = "") -> None:
         """填充快速提问的模型下拉：list-models 结果 + models.json 手动添加的模型。"""
         if not hasattr(self, "chat_model") or not isinstance(self.chat_model, QComboBox):
             return
         provider = (provider or "").strip()
-        models: list[str] = []
-        seen: set[str] = set()
-        # 1) pi --list-models 枚举到的模型
+        listed_ids: list[str] = []
         for m in self.models or []:
             if not provider or m.provider == provider:
-                if m.model and m.model not in seen:
-                    seen.add(m.model)
-                    models.append(m.model)
-        # 2) models.json 中该 provider 手动添加的模型（始终合并，保证可选择）
+                if m.model:
+                    listed_ids.append(m.model)
+        config_models: list = []
         if provider:
             try:
                 cfg = core.load_models_config()
-                pdata = (cfg.get("providers") or {}).get(provider) or {}
-                for item in pdata.get("models") or []:
-                    mid = ""
-                    if isinstance(item, dict):
-                        mid = str(item.get("id") or item.get("model") or "")
-                    elif isinstance(item, str):
-                        mid = item
-                    if mid and mid not in seen:
-                        seen.add(mid)
-                        models.append(mid)
+                config_models = config_models_for_provider(cfg, provider)
             except Exception:
                 pass
+        models = merge_model_ids(listed_ids, config_models)
 
         self.chat_model.blockSignals(True)
         self.chat_model.clear()
@@ -298,22 +319,23 @@ class ChatPageMixin:
             self.chat_model.addItem(mid)
         self.chat_model.blockSignals(False)
 
-        if prefer_model and prefer_model in models:
-            self._set_chat_combo_text(self.chat_model, prefer_model)
-        elif models:
-            try:
-                dp, dm, _ = core.get_default_model()
-            except Exception:
-                dp, dm = "", ""
-            if provider and dp == provider and dm in models:
-                self._set_chat_combo_text(self.chat_model, dm)
-            else:
-                self._set_chat_combo_text(self.chat_model, models[0])
-        else:
-            # 无可用模型：清空，不残留不存在的模型文本
+        if not models:
             self.chat_model.setCurrentIndex(-1)
             self.chat_model.setEditText("")
             self.chat_model.setPlaceholderText("该 Provider 暂无可用模型")
+            return
+        try:
+            dp, dm, _ = core.get_default_model()
+        except Exception:
+            dp, dm = "", ""
+        target = pick_model(
+            prefer_model,
+            models,
+            provider=provider,
+            default_provider=dp,
+            default_model=dm,
+        )
+        self._set_chat_combo_text(self.chat_model, target)
 
     def chat_fill_default(self):
         p, m, t = core.get_default_model()
@@ -341,6 +363,7 @@ class ChatPageMixin:
                 self.chat_model.setText(m)
             except Exception:
                 pass
+        self._refresh_chat_context()
 
     def _on_chat_attachments_changed(self):
         bar = getattr(self, "chat_attach_bar", None)
@@ -420,6 +443,104 @@ class ChatPageMixin:
         except Exception as e:
             logger.warning("reset chat session failed: %s", e)
         self.status.showMessage("已清空对话历史")
+
+    def _refresh_chat_context(self) -> None:
+        label = getattr(self, "chat_meta_label", None)
+        if label is None:
+            return
+        thinking = "—"
+        try:
+            thinking = self.thinking_combo.currentText() or "—"
+        except Exception:
+            pass
+        workdir = "—"
+        try:
+            workdir = self.workdir_edit.text().strip() or str(core.user_home())
+        except Exception:
+            pass
+        provider = self._chat_combo_text(self.chat_provider) or "—"
+        model = self._chat_combo_text(self.chat_model) or "—"
+        label.setText(
+            f"Provider: {provider}  ·  Model: {model}  ·  "
+            f"Thinking: {thinking}  ·  工作目录: {workdir}"
+        )
+
+    def _set_chat_busy(self, busy: bool) -> None:
+        if hasattr(self, "chat_input"):
+            self.chat_input.setEnabled(not busy)
+        button = getattr(self, "chat_stop_btn", None)
+        if button is not None:
+            button.setEnabled(bool(busy))
+            button.setText("停止生成")
+        setter = getattr(self, "_set_action_busy", None)
+        if callable(setter):
+            setter(
+                getattr(self, "chat_send_enhanced_btn", None),
+                busy,
+                idle="发送到 Pi",
+                busy_text="正在发送…",
+            )
+            setter(
+                getattr(self, "chat_send_btn", None),
+                busy,
+                idle="单次发送",
+                busy_text="正在发送…",
+            )
+            setter(
+                getattr(self, "chat_regenerate_btn", None),
+                busy,
+                idle="重新生成",
+                busy_text="正在生成…",
+            )
+
+    def chat_stop(self) -> None:
+        worker = getattr(self, "_chat_worker", None)
+        if worker is None:
+            self._set_chat_busy(False)
+            return
+        try:
+            if worker.isRunning():
+                worker.requestInterruption()
+        except RuntimeError:
+            pass
+        self._chat_worker = None
+        self._set_chat_busy(False)
+        self.status.showMessage("已请求停止生成", 4000)
+        if hasattr(self, "chat_output"):
+            self.chat_output.appendPlainText("[已停止]")
+        notify = getattr(self, "notify_warning", None)
+        if callable(notify):
+            notify("已请求停止生成")
+
+    def chat_copy_output(self) -> None:
+        if not hasattr(self, "chat_output"):
+            return
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.clipboard().setText(self.chat_output.toPlainText())
+        self.status.showMessage("已复制对话", 4000)
+        notify = getattr(self, "notify_success", None)
+        if callable(notify):
+            notify("已复制对话")
+
+    def chat_export_session(self) -> None:
+        if not hasattr(self, "chat_output"):
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出会话", str(Path.home() / "pi-chat.md"), "Markdown (*.md)"
+        )
+        if not path:
+            return
+        Path(path).write_text(self.chat_output.toPlainText(), encoding="utf-8")
+        self.notify_success(f"已导出：{path}")
+
+    def chat_regenerate(self) -> None:
+        prompt = str(getattr(self, "_last_chat_prompt", "") or "").strip()
+        if not prompt:
+            self.notify_warning("还没有可以重新生成的上一条消息")
+            return
+        self.chat_input.setPlainText(prompt)
+        self.chat_send_enhanced()
 
     def _describe_attachments(
         self,
@@ -501,7 +622,7 @@ class ChatPageMixin:
             self.chat_output.appendPlainText(f"\n>>> {prompt}\n…请求中，请稍候…\n")
         self.status.showMessage("Pi 快速提问运行中…")
 
-        def job():
+        def job(is_cancelled=None):
             full_prompt = prompt
             if attachments:
                 description, error = self._describe_attachments(attachments, prompt)
@@ -521,19 +642,22 @@ class ChatPageMixin:
                 model=model,
                 workdir=workdir,
                 thinking=thinking,
+                is_cancelled=is_cancelled,
             )
             if attachments:
                 result["vision_text"] = description or ""
             return result
 
         w = self._track(Worker(job))
-        self.chat_input.setEnabled(False)
+        self._chat_worker = w
+        self._set_chat_busy(True)
         w.done.connect(self._on_basic_chat_done)
         w.failed.connect(self._on_basic_chat_fail)
         w.start()
 
     def _on_basic_chat_done(self, result):
-        self.chat_input.setEnabled(True)
+        self._chat_worker = None
+        self._set_chat_busy(False)
         if isinstance(result, dict):
             p = result.get("provider") or ""
             m = result.get("model") or ""
@@ -585,7 +709,8 @@ class ChatPageMixin:
         self.status.showMessage("快速提问完成")
 
     def _on_basic_chat_fail(self, e: str):
-        self.chat_input.setEnabled(True)
+        self._chat_worker = None
+        self._set_chat_busy(False)
         self.chat_output.appendPlainText(f"[错误] {e}")
         self.status.showMessage("快速提问失败")
 
@@ -658,7 +783,7 @@ class ChatPageMixin:
             else:
                 self.chat_context_badge.set_status("info", "一次性模式")
         self.chat_output.appendPlainText(f"\n你: {prompt or '[图片]'}\n…思考中…")
-        self.chat_input.setEnabled(False)
+        self._last_chat_prompt = prompt
         workdir = self.workdir_edit.text().strip() or str(core.user_home())
         thinking = "off"
         try:
@@ -666,7 +791,7 @@ class ChatPageMixin:
         except Exception:
             pass
 
-        def job():
+        def job(is_cancelled=None):
             # 连续失败达阈值后自动切换下一个收藏/启用模型并重试（无感）
             full_prompt = prompt
             if attachments:
@@ -687,18 +812,22 @@ class ChatPageMixin:
                 model=model,
                 workdir=workdir,
                 thinking=thinking,
+                is_cancelled=is_cancelled,
             )
             if attachments:
                 result["vision_text"] = description or ""
             return result
 
         w = self._track(self._worker_fn(job))
+        self._chat_worker = w
+        self._set_chat_busy(True)
         w.done.connect(lambda r, u=prompt: self._on_enhanced_chat_done(r, u))
         w.failed.connect(self._on_enhanced_chat_fail)
         w.start()
 
     def _on_enhanced_chat_done(self, result: dict, user_prompt: str):
-        self.chat_input.setEnabled(True)
+        self._chat_worker = None
+        self._set_chat_busy(False)
         text = (result.get("stdout") or "").strip() or (result.get("stderr") or "").strip()
         p = result.get("provider") or ""
         m = result.get("model") or ""
@@ -741,5 +870,6 @@ class ChatPageMixin:
         self.chat_output.appendPlainText(f"Pi ({tag}):\n{text}\n")
 
     def _on_enhanced_chat_fail(self, err: str):
-        self.chat_input.setEnabled(True)
+        self._chat_worker = None
+        self._set_chat_busy(False)
         self.chat_output.appendPlainText(f"错误: {err}")

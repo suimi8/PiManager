@@ -8,7 +8,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
-    QMessageBox,
     QTabWidget,
     QTextBrowser,
     QVBoxLayout,
@@ -98,5 +97,5 @@ class HelpPageMixin:
         if not path:
             return
         Path(path).write_text(help_docs.HELP_MARKDOWN, encoding="utf-8")
-        QMessageBox.information(self, "已导出", path)
+        self.notify_success(f"已导出：{path}")
 

@@ -9,7 +9,15 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 
 from .. import core
+from .. import extras
 from .design import tokens_for
+from .status import (
+    classify_test_result,
+    format_capability,
+    format_context_length,
+    format_relative_time,
+    latest_history_entry,
+)
 from .workers import Worker
 
 logger = logging.getLogger(__name__)
@@ -22,13 +30,83 @@ class ViewOverlayMixin:
     # ---- dashboard view model adapters -------------------------------------------
     def refresh_dashboard(self) -> None:
         provider, model, thinking = core.get_default_model()
-        self.lbl_current.setText(f"{provider}/{model}" if provider else "尚未设置默认模型")
-        self.lbl_thinking.setText(f"Thinking level · {thinking or '未设置'}")
-        self.default_status_badge.set_status("success" if provider and model else "warning")
+        has_default = bool(provider and model)
+        self.lbl_current.setText(f"{provider}/{model}" if has_default else "尚未设置")
+        self.lbl_thinking.setText(f"Thinking · {thinking or '未设置'}")
+        result = self.test_results.get(f"{provider}/{model}") if has_default else None
+        try:
+            all_history = extras.load_history()
+        except Exception as e:
+            logger.warning("load test history for dashboard failed: %s", e)
+            all_history = []
+        history_row = latest_history_entry(
+            all_history,
+            provider=provider if has_default else "",
+            model=model if has_default else "",
+        )
+        if result is None and history_row is not None:
+            result = {
+                "available": bool(history_row.get("available")),
+                "error": history_row.get("error") or "",
+                "latency_ms": history_row.get("latency_ms"),
+            }
+        if not has_default:
+            view = classify_test_result(None)
+            view_label = "未设置"
+            view_tone = "warning"
+            view_reason = "先在模型页选择一个默认模型"
+        else:
+            view = classify_test_result(result)
+            view_label = view.label
+            view_tone = view.tone
+            view_reason = view.reason
+        self.default_status_badge.set_status(view_tone, view_label)
+        banner = getattr(self, "availability_banner", None)
+        setter = getattr(banner, "set_message", None)
+        if callable(setter):
+            if not has_default:
+                setter(
+                    "尚未设置默认模型。先配置 Provider，再选择一个默认模型。",
+                    tone="warning",
+                    action_text="去选模型",
+                    action=lambda: self._goto_page("models"),
+                )
+            elif view_tone == "danger":
+                setter(
+                    f"默认模型连接失败：{view_reason or view_label}",
+                    tone="danger",
+                    action_text="查看模型",
+                    action=lambda: self._goto_page("models"),
+                )
+            elif view_tone == "warning":
+                setter(
+                    "当前默认模型尚未完成连接测试。",
+                    tone="warning",
+                    action_text="去测试",
+                    action=lambda: self._goto_page("models"),
+                )
+            else:
+                setter("")
+        if hasattr(self, "dashboard_status_metric"):
+            self.dashboard_status_metric.value_label.setText(view_label)
+            self.dashboard_status_metric.setToolTip(view_reason)
+        last_any = latest_history_entry(all_history)
+        last_stamp = (last_any or {}).get("time")
+        if hasattr(self, "dashboard_tested_metric"):
+            self.dashboard_tested_metric.value_label.setText(format_relative_time(last_stamp))
+            if last_any:
+                self.dashboard_tested_metric.setToolTip(
+                    f"{last_any.get('provider')}/{last_any.get('model')} · "
+                    f"{last_any.get('time')}"
+                )
+            else:
+                self.dashboard_tested_metric.setToolTip("还没有任何连接测试记录")
         if getattr(self, "_background_enabled", True):
             worker = self._track(Worker(core.get_pi_version))
             worker.done.connect(self._set_pi_version)
-            worker.failed.connect(lambda error: self._set_pi_version(f"不可用 · {error}", failed=True))
+            worker.failed.connect(
+                lambda error: self._set_pi_version(f"不可用 · {error}", failed=True)
+            )
             worker.start()
         rows = core.auth_summary()
         self.auth_table.setRowCount(len(rows))
@@ -83,7 +161,7 @@ class ViewOverlayMixin:
             if hasattr(self, "status") and self.status is not None:
                 self.status.showMessage(f"⚠ {invalid} 个 API Key 已失效，可在 Provider 管理中恢复", 8000)
         else:
-            label.setText("自定义 Provider")
+            label.setText("已配置 Provider")
             label.setToolTip("")
 
     def _set_pi_version(self, value: Any, *, failed: bool = False) -> None:
@@ -177,22 +255,47 @@ class ViewOverlayMixin:
         if not hasattr(self, "model_detail_title"):
             return
         info = self.selected_model_row()
+        raw = getattr(self, "model_detail_text", None)
+        props = getattr(self, "model_prop_table", None)
+        error_panel = getattr(self, "model_error_panel", None)
         if not info:
             self.model_detail_title.setText("选择一个模型")
             self.model_detail_provider.setText("—")
             self.model_detail_badge.set_status("neutral", "未选择")
-            self.model_detail_text.setPlainText("选择模型后显示配置与测试状态。")
+            if props is not None:
+                props.set_rows([("提示", "选择模型后显示关键属性")])
+            if error_panel is not None:
+                error_panel.setVisible(False)
+            if raw is not None:
+                raw.setPlainText("选择模型后显示配置与测试状态。")
             return
         provider, model = info.provider, info.model
         self.model_detail_title.setText(model)
         self.model_detail_provider.setText(provider)
-        result = self.test_results.get(f"{provider}/{model}") or {}
-        if result.get("ok"):
-            self.model_detail_badge.set_status("success", "连接正常")
-        elif result:
-            self.model_detail_badge.set_status("danger", "连接失败")
-        else:
-            self.model_detail_badge.set_status("info", "尚未测试")
+        result = self.test_results.get(f"{provider}/{model}")
+        view = classify_test_result(result)
+        self.model_detail_badge.set_status(view.tone, view.label)
+        if props is not None:
+            latency = result.get("latency_ms") if result else None
+            latency_text = (
+                f"{latency:.0f} ms" if isinstance(latency, (int, float)) else "—"
+            )
+            props.set_rows(
+                [
+                    ("Provider", provider),
+                    ("模型 ID", model),
+                    ("上下文长度", format_context_length(getattr(info, "context", ""))),
+                    ("Thinking", format_capability(getattr(info, "thinking", ""))),
+                    ("图片输入", format_capability(getattr(info, "images", ""))),
+                    ("最近测试", view.label if result else "尚未测试"),
+                    ("延迟", latency_text),
+                ]
+            )
+        if error_panel is not None:
+            failed = view.tone == "danger"
+            error_panel.setVisible(failed)
+            if failed:
+                error_panel.set_error(view.label, view.reason, view.detail)
         payload = {
             "provider": provider,
             "model": model,
@@ -201,7 +304,8 @@ class ViewOverlayMixin:
             "images": getattr(info, "images", None),
             "test": result or None,
         }
-        self.model_detail_text.setPlainText(json.dumps(payload, ensure_ascii=False, indent=2))
+        if raw is not None:
+            raw.setPlainText(json.dumps(payload, ensure_ascii=False, indent=2))
 
     # ---- health view model adapters ----------------------------------------------
     def _on_health_progress(self, result: dict) -> None:

@@ -6,7 +6,7 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import QApplication, QDialog
 
 from pi_manager import core
@@ -45,7 +45,7 @@ def test_modern_window_builds_without_background_side_effects(qapp, isolated_hom
         assert window.workers == []
         assert window.pages.count() == 11
         assert window.nav.current_key() == "simple"
-        assert window.page_heading.text() == "简化配置"
+        assert window.page_heading.text() == "概览"
         for attribute in (
             "lbl_current",
             "models_table",
@@ -95,6 +95,9 @@ def test_model_catalog_updates_details_panel(qapp, isolated_home):
         assert window.model_detail_title.text() in {"model-one", "model-two"}
         assert window.model_detail_provider.text() in {"provider-a", "provider-b"}
         assert "context" in window.model_detail_text.toPlainText()
+        assert "Provider" in window.model_prop_table.value_text()
+        assert window.model_detail_badge.text() == "尚未测试"
+        assert window.model_error_panel.isVisible() is False
     finally:
         _dispose(window, qapp)
 
@@ -358,7 +361,7 @@ def test_batch_progress_updates_one_row_and_keeps_selection(qapp, isolated_home)
         # 增量路径：同一批 QTreeWidgetItem 仍在，选中集合原样保留
         assert {m.key for m in window.selected_model_rows()} == selected_before
         row = window._model_row_index["p/m3"]
-        assert row.text(3) == "✓"
+        assert row.text(3) == "可用"
         assert row.text(4) == "111ms"
         expected = tokens_for(*window._theme_pair()).success.upper()
         assert row.foreground(3).color().name().upper() == expected
@@ -566,7 +569,16 @@ def test_stylesheet_covers_previously_orphaned_object_names():
 
     for mode in ("day", "night"):
         css = build_stylesheet(mode, "blue")
-        for selector in ("QLabel#cardTitle", "QLabel#chatThumb", "QSplitter::handle"):
+        for selector in (
+            "QLabel#cardTitle",
+            "QLabel#chatThumb",
+            "QSplitter::handle",
+            "QFrame#feedbackToast",
+            "QFrame#updateBanner[status=\"danger\"]",
+            "QFrame#feedbackToast[status=\"info\"]",
+            "QFrame#resultSheet",
+            "QFrame#resultSheet[status=\"warning\"]",
+        ):
             assert selector in css, f"{mode} mode missing {selector}"
         # 迁移遗留的死选择器
         assert "QLabel#pill" not in css
@@ -616,14 +628,14 @@ def test_app_button_swallows_clicked_checked_argument(qapp):
 def test_navigation_shortcuts_and_page_headings(qapp, isolated_home):
     window = ModernMainWindow(start_background=False)
     try:
-        assert len(window._nav_shortcuts) == 11  # Ctrl+1..9 + Ctrl+Tab 双向
+        assert len(window._nav_shortcuts) == 15  # Ctrl+1..9 + Ctrl+Tab 双向 + K/S/F/Enter
         window._goto_page("plugins")
         qapp.processEvents()
         # 页头标题不再依赖两个 pageChanged 槽的连接顺序
         assert window.page_heading.text() == "插件管理"
         window._cycle_page(1)
         qapp.processEvents()
-        assert window.nav.current_key() == "settings"
+        assert window.nav.current_key() == "chat"
         window._cycle_page(-1)
         qapp.processEvents()
         assert window.nav.current_key() == "plugins"
@@ -641,4 +653,210 @@ def test_window_widget_contract_is_complete(qapp, isolated_home):
         missing = [n for n in WINDOW_WIDGET_NAMES if not hasattr(window, n)]
         assert missing == [], f"presentation layer did not inject: {missing}"
     finally:
+        _dispose(window, qapp)
+
+
+def test_persist_mgr_does_not_clobber_failover_fail_counts(qapp, isolated_home):
+    """persist_mgr 只合并当前关心的键，不得把并发写入的失败计数回滚。"""
+    window = ModernMainWindow(start_background=False)
+    try:
+        def _seed(cfg):
+            cfg["failover_fail_counts"] = {"A/m": 9}
+            return cfg
+
+        core.update_manager_config(_seed)
+        window.persist_mgr()
+        mgr = core.load_manager_config()
+        assert mgr.get("failover_fail_counts") == {"A/m": 9}
+    finally:
+        _dispose(window, qapp)
+
+
+def test_dashboard_summary_shows_availability_not_just_config(qapp, isolated_home):
+    core.set_default_model("provider-a", "model-one", "high")
+    window = ModernMainWindow(start_background=False)
+    try:
+        window.test_results = {
+            "provider-a/model-one": {"available": True, "latency_ms": 80}
+        }
+        window.refresh_dashboard()
+        assert "provider-a/model-one" in window.lbl_current.text()
+        assert window.dashboard_status_metric.value_label.text() == "连接正常"
+        assert window.default_status_badge.text() == "连接正常"
+        assert window.dashboard_tested_metric.value_label.text() == "从未测试"
+        assert window.availability_banner.isHidden() is True
+        groups = [label.text() for label in window.nav._group_labels]
+        assert groups == ["概览", "配置", "运行", "系统"]
+    finally:
+        _dispose(window, qapp)
+
+
+def test_dashboard_banner_and_feedback_toast(qapp, isolated_home):
+    window = ModernMainWindow(start_background=False)
+    try:
+        assert window.feedback_toast is not None
+        window.notify_success("已保存")
+        qapp.processEvents()
+        assert window.feedback_toast.isHidden() is False
+        assert "已保存" in window.feedback_toast.message.text()
+        window.notify_info("请先选择模型")
+        qapp.processEvents()
+        assert "请先选择模型" in window.feedback_toast.message.text()
+        window.refresh_dashboard()
+        assert window.availability_banner.isHidden() is False
+        assert "尚未设置默认模型" in window.availability_banner_label.text()
+        assert window.selfcheck_empty.isHidden() is False
+        assert window.selfcheck_table.isHidden() is True
+        assert window.selfcheck_cancel_btn.isEnabled() is False
+        assert window.update_cancel_btn.isEnabled() is False
+        assert window.plugins_cancel_btn.isEnabled() is False
+        assert window.models_refresh_cancel_btn.isEnabled() is False
+        assert window.health_empty.isHidden() is False
+        assert window.chat_send_enhanced_btn.text() == "发送到 Pi"
+        from pi_manager.presentation.pages.plugins import ops
+
+        cancelled = ops._collect_plugin_rows(is_cancelled=lambda: True)
+        assert cancelled.get("cancelled") is True
+        assert cancelled.get("plugins") == []
+        ops._render_plugin_rows(window, {"plugins": []})
+        empty = window.plugins_list_container.itemAt(0).widget()
+        assert "暂无插件" in empty.title.text()
+    finally:
+        _dispose(window, qapp)
+
+
+def test_failed_model_detail_exposes_next_actions(qapp, isolated_home):
+    window = ModernMainWindow(start_background=False)
+    try:
+        window.models = [core.ModelInfo("provider-a", "model-one", context="128000", thinking="yes")]
+        window.test_results = {
+            "provider-a/model-one": {
+                "available": False,
+                "error": "HTTP 401 unauthorized",
+            }
+        }
+        window.fill_models_table()
+        child = window.models_table.topLevelItem(0).child(0)
+        window.models_table.setCurrentItem(child)
+        qapp.processEvents()
+        assert child.text(3) == "失败"
+        # 模型页在 QStackedWidget 里，未切过去时 isVisible() 恒为 False；
+        # isHidden() 才反映 setVisible 的自身状态。
+        assert window.model_error_panel.isHidden() is False
+        assert "401" in window.model_error_panel.reason.text()
+        assert window.model_error_retry_btn.isHidden() is False
+        assert "128K" in window.model_prop_table.value_text()
+        assert window.model_detail_text.isHidden() is True
+        window.toggle_model_raw()
+        assert window.model_detail_text.isHidden() is False
+    finally:
+        _dispose(window, qapp)
+
+
+def test_models_empty_state_and_collapsible_detail(qapp, isolated_home):
+    window = ModernMainWindow(start_background=False)
+    try:
+        window.models = []
+        window.fill_models_table()
+        assert window.models_empty.isHidden() is False
+        assert window.models_table.isHidden() is True
+        assert "尚未发现模型" in window.models_empty.title.text()
+        window.refresh_sessions()
+        window.history_refresh()
+        assert window.sessions_empty.isHidden() is False
+        assert window.history_empty.isHidden() is False
+        assert window.health_cancel_btn.isEnabled() is False
+        assert window.model_detail_panel.isHidden() is False
+        window.toggle_model_detail()
+        assert window.model_detail_panel.isHidden() is True
+        window.nav.set_collapsed(True)
+        button = window.nav._buttons["simple"]
+        assert "概览" in button.toolTip()
+        assert button.accessibleName() == "概览"
+    finally:
+        _dispose(window, qapp)
+
+
+def test_setup_wizard_is_stepped(qapp, isolated_home):
+    from pi_manager.presentation.dialogs.setup import SetupWizardDialog
+
+    dialog = SetupWizardDialog()
+    try:
+        assert dialog.stack.count() == 5
+        assert dialog.STEPS[0] == "工作目录"
+        assert dialog.btn_skip.isHidden() is False
+        dialog._skip()
+        assert dialog.stack.currentIndex() == 1
+        assert hasattr(dialog, "_track")
+        dialog.quick_base.clear()
+        dialog._verify_key()
+        assert "Base URL" in dialog.verify_status.text()
+        assert dialog.btn_verify.isEnabled() is True
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qapp.processEvents()
+
+
+def test_result_sheet_and_compact_day_window(qapp, isolated_home):
+    from pi_manager.presentation.app import NAV_PAGES
+    from pi_manager.presentation.geometry import (
+        MIN_WINDOW_HEIGHT,
+        MIN_WINDOW_WIDTH,
+        clamp_dialog_to_screen,
+    )
+
+    original_font = QFont(qapp.font())
+    window = ModernMainWindow(start_background=False)
+    try:
+        window.apply_ui_theme("day", "blue")
+        assert "#F4F6F8" in qapp.styleSheet()
+        assert window.minimumWidth() <= MIN_WINDOW_WIDTH
+        assert window.minimumHeight() <= MIN_WINDOW_HEIGHT
+        assert window.result_sheet.isHidden() is True
+        window.show_result("导入成功", "已恢复：\n  · models.json", tone="success")
+        qapp.processEvents()
+        assert window.result_sheet.isHidden() is False
+        assert "models.json" in window.result_sheet.body.toPlainText()
+        window.result_sheet.dismiss()
+        qapp.processEvents()
+        assert window.result_sheet.isHidden() is True
+
+        font = QFont(original_font)
+        base = font.pointSizeF() if font.pointSizeF() > 0 else 9.0
+        font.setPointSizeF(base * 1.25)
+        qapp.setFont(font)
+        window.show()
+        qapp.processEvents()
+        window.resize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
+        qapp.processEvents()
+        assert window.width() == MIN_WINDOW_WIDTH
+        assert window.height() == MIN_WINDOW_HEIGHT
+        assert window.nav.is_collapsed() is True
+        assert window.header_health_btn.isHidden() is True
+        assert window.page_header.eyebrow.isHidden() is True
+        assert core.load_manager_config().get("ui_nav_collapsed") in (None, False)
+        window._settings_dirty = False
+        for key, _title, _description in NAV_PAGES:
+            window._goto_page(key)
+            qapp.processEvents()
+            assert window.page_header.title.isHidden() is False
+            assert window.page_header.title.text()
+
+        window.resize(1320, 880)
+        qapp.processEvents()
+        assert window.nav.is_collapsed() is False
+        assert window.header_health_btn.isHidden() is False
+
+        dialog = QDialog()
+        clamp_dialog_to_screen(dialog, 4000, 4000)
+        screen = qapp.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            assert dialog.width() <= avail.width()
+            assert dialog.height() <= avail.height()
+        dialog.close()
+        dialog.deleteLater()
+    finally:
+        qapp.setFont(original_font)
         _dispose(window, qapp)

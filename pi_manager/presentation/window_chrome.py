@@ -17,7 +17,15 @@ from PySide6.QtWidgets import (
 
 from .. import core
 from .app import NAV_PAGES
-from .components import AppButton, CollapsibleSection, NavigationRail, PageHeader
+from .components import (
+    AppButton,
+    CollapsibleSection,
+    FeedbackToast,
+    NavigationRail,
+    PageHeader,
+    ResultSheet,
+)
+from .geometry import COMPACT_WINDOW_WIDTH, clamp_dialog_to_screen
 from .components.navigation import NavPage
 from .design import (
     ACCENT_LABELS,
@@ -44,15 +52,15 @@ from .pages import (
 logger = logging.getLogger(__name__)
 
 _PAGE_META = {
-    "simple": ("home", "工作区"),
-    "models": ("models", "工作区"),
-    "providers": ("providers", "工作区"),
-    "chat": ("chat", "工作区"),
-    "sessions": ("sessions", "运行与诊断"),
-    "health": ("health", "运行与诊断"),
-    "history": ("history", "运行与诊断"),
-    "tools": ("tools", "系统"),
-    "plugins": ("plugins", "系统"),
+    "simple": ("home", "概览"),
+    "providers": ("providers", "配置"),
+    "models": ("models", "配置"),
+    "tools": ("tools", "配置"),
+    "plugins": ("plugins", "配置"),
+    "chat": ("chat", "运行"),
+    "sessions": ("sessions", "运行"),
+    "health": ("health", "运行"),
+    "history": ("history", "运行"),
     "settings": ("settings", "系统"),
     "help": ("help", "系统"),
 }
@@ -62,6 +70,7 @@ _PAGE_META = {
 # 再挂一个 nav.pageChanged 槽来覆盖标题，正确性依赖两个槽的连接顺序（隐式
 # 契约）；改为在 _activate_page 内部一次查表，顺序依赖消失。
 _PAGE_HEADINGS = {
+    "simple": ("概览", "确认当前默认模型是否可用，然后启动 Pi。"),
     "plugins": ("插件管理", "内置 skills / extensions 与用户自定义插件的统一管理。"),
 }
 
@@ -71,6 +80,8 @@ class WindowChromeMixin:
 
 
     def _build_ui(self) -> None:
+        self._compact_layout = False
+        self._nav_auto_collapsed = False
         self.setWindowTitle("Pi Manager")
         central = QWidget()
         central.setObjectName("appRoot")
@@ -106,9 +117,14 @@ class WindowChromeMixin:
         self.header_launch_btn = self._btn("启动 Pi", self.launch_default, success=True)
         self.header_launch_btn.setProperty("large", True)
         self.page_header.actions.addWidget(self.header_launch_btn)
-        self.page_header.actions.addWidget(self._btn("自检", self.self_check_run, secondary=True))
-        self.page_header.actions.addWidget(self._btn("健康检查", self.health_run_now, ghost=True))
+        self.header_selfcheck_btn = self._btn("自检", self.self_check_run, secondary=True)
+        self.page_header.actions.addWidget(self.header_selfcheck_btn)
+        self.header_health_btn = self._btn("健康检查", self.health_run_now, ghost=True)
+        self.page_header.actions.addWidget(self.header_health_btn)
         content_layout.addWidget(self.page_header)
+
+        self.result_sheet = ResultSheet()
+        content_layout.addWidget(self.result_sheet)
 
         self.pages = QStackedWidget()
         self.pages.setObjectName("pages")
@@ -133,6 +149,7 @@ class WindowChromeMixin:
             self._page_index[key] = self.pages.addWidget(widget)
         content_layout.addWidget(self.pages, 1)
         shell.addWidget(content, 1)
+        self.feedback_toast = FeedbackToast(content)
 
         self.status = QStatusBar()
         self.status.setSizeGripEnabled(False)
@@ -152,6 +169,7 @@ class WindowChromeMixin:
         # 所有 widget 已创建，现在应用主题（此前各 widget 已用 _theme_pair 取色构建，
         # 此处统一刷新图标/样式表/状态栏主题文案）。
         self.apply_ui_theme()
+        self._adapt_compact_layout()
         # Initialize quick-chat from the default pair once. Later dashboard/default
         # refreshes must not overwrite an explicit chat-page selection.
         self.chat_fill_default()
@@ -212,6 +230,160 @@ class WindowChromeMixin:
             shortcut = QShortcut(sequence, self)
             shortcut.activated.connect(lambda delta=step: self._cycle_page(delta))
             self._nav_shortcuts.append(shortcut)
+        jump = QShortcut(QKeySequence("Ctrl+K"), self)
+        jump.activated.connect(self._open_jump_dialog)
+        self._nav_shortcuts.append(jump)
+        save = QShortcut(QKeySequence("Ctrl+S"), self)
+        save.activated.connect(self._shortcut_save)
+        self._nav_shortcuts.append(save)
+        find = QShortcut(QKeySequence("Ctrl+F"), self)
+        find.activated.connect(self._shortcut_find)
+        self._nav_shortcuts.append(find)
+        test = QShortcut(QKeySequence("Ctrl+Return"), self)
+        test.activated.connect(self._shortcut_test)
+        self._nav_shortcuts.append(test)
+
+    def _open_jump_dialog(self) -> None:
+        from PySide6.QtWidgets import QDialog, QLineEdit, QListWidget, QVBoxLayout
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("快速跳转")
+        clamp_dialog_to_screen(dialog, 360, 420)
+        root = QVBoxLayout(dialog)
+        search = QLineEdit()
+        search.setPlaceholderText("输入页面名称…")
+        root.addWidget(search)
+        listing = QListWidget()
+        for key, title, description in NAV_PAGES:
+            listing.addItem(f"{title}  ·  {description}")
+            listing.item(listing.count() - 1).setData(Qt.UserRole, key)
+        root.addWidget(listing, 1)
+
+        def apply_filter(text: str) -> None:
+            needle = (text or "").strip().lower()
+            for row in range(listing.count()):
+                item = listing.item(row)
+                item.setHidden(bool(needle) and needle not in item.text().lower())
+
+        def jump_current() -> None:
+            item = listing.currentItem()
+            if item is None:
+                for row in range(listing.count()):
+                    candidate = listing.item(row)
+                    if candidate is not None and not candidate.isHidden():
+                        item = candidate
+                        break
+            if item is None:
+                return
+            key = str(item.data(Qt.UserRole) or "")
+            dialog.accept()
+            if key:
+                self._goto_page(key)
+
+        search.textChanged.connect(apply_filter)
+        search.returnPressed.connect(jump_current)
+        listing.itemActivated.connect(lambda _item: jump_current())
+        listing.setCurrentRow(0)
+        search.setFocus()
+        dialog.exec()
+
+    def notify_success(self, text: str, *, ms: int = 3500) -> None:
+        self.status.showMessage(text, ms)
+        toast = getattr(self, "feedback_toast", None)
+        if toast is not None:
+            toast.show_message(text, "success", ms)
+
+    def notify_warning(self, text: str, *, ms: int = 5000) -> None:
+        self.status.showMessage(text, ms)
+        toast = getattr(self, "feedback_toast", None)
+        if toast is not None:
+            toast.show_message(text, "warning", ms)
+
+    def notify_error(self, text: str, *, ms: int = 7000) -> None:
+        self.status.showMessage(text, ms)
+        toast = getattr(self, "feedback_toast", None)
+        if toast is not None:
+            toast.show_message(text, "danger", ms)
+
+    def notify_info(self, text: str, *, ms: int = 4000) -> None:
+        self.status.showMessage(text, ms)
+        toast = getattr(self, "feedback_toast", None)
+        if toast is not None:
+            toast.show_message(text, "info", ms)
+
+    def show_result(self, title: str, body: str = "", *, tone: str = "success") -> None:
+        """多行操作结果走页内面板，避免挡住当前页的长对话框。"""
+        self.status.showMessage(title)
+        sheet = getattr(self, "result_sheet", None)
+        if sheet is not None:
+            sheet.show_result(title, body or title, tone)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        adapt = getattr(self, "_adapt_compact_layout", None)
+        if callable(adapt):
+            adapt()
+
+    def _adapt_compact_layout(self) -> None:
+        """窄窗口收起侧栏、压缩页头；自动折叠不写入 ui_nav_collapsed。"""
+        if self.width() <= 1:
+            return
+        nav = getattr(self, "nav", None)
+        header = getattr(self, "page_header", None)
+        if nav is None or header is None:
+            return
+        compact = self.width() < COMPACT_WINDOW_WIDTH
+        was_compact = bool(getattr(self, "_compact_layout", False))
+        self._compact_layout = compact
+        header.set_compact(compact)
+        health_btn = getattr(self, "header_health_btn", None)
+        if health_btn is not None:
+            health_btn.setVisible(not compact)
+        if compact and not was_compact:
+            if not nav.is_collapsed():
+                self._nav_auto_collapsed = True
+                nav.set_collapsed(True, emit=False)
+        elif not compact and was_compact:
+            if getattr(self, "_nav_auto_collapsed", False):
+                self._nav_auto_collapsed = False
+                user_pref = bool((getattr(self, "mgr", None) or {}).get("ui_nav_collapsed", False))
+                if not user_pref and nav.is_collapsed():
+                    nav.set_collapsed(False, emit=False)
+
+    def _set_action_busy(
+        self, button, busy: bool, *, idle: str, busy_text: str
+    ) -> None:
+        if button is None:
+            return
+        button.setEnabled(not busy)
+        button.setText(busy_text if busy else idle)
+
+    def _shortcut_save(self) -> None:
+        if getattr(self, "_active_page_key", "") == "settings" or self.nav.current_key() == "settings":
+            self.settings_save()
+        else:
+            try:
+                self.persist_mgr()
+                self.notify_success("当前工作目录与启动选项已保存")
+            except Exception:
+                pass
+
+    def _shortcut_find(self) -> None:
+        key = getattr(self, "_active_page_key", "") or self.nav.current_key()
+        mapping = {
+            "models": "model_filter",
+            "sessions": "session_filter_wd",
+            "history": "history_filter",
+            "simple": "quick_name",
+        }
+        widget = getattr(self, mapping.get(key, ""), None)
+        if widget is not None:
+            widget.setFocus()
+
+    def _shortcut_test(self) -> None:
+        key = getattr(self, "_active_page_key", "") or self.nav.current_key()
+        if key == "models":
+            self.model_test_selected()
 
     def _cycle_page(self, delta: int) -> None:
         keys = getattr(self, "_page_keys", None) or []
@@ -226,6 +398,16 @@ class WindowChromeMixin:
     def _activate_page(self, key: str) -> None:
         if key not in self._page_index:
             return
+        previous = getattr(self, "_active_page_key", "")
+        if (
+            previous == "settings"
+            and key != "settings"
+            and hasattr(self, "confirm_leave_settings")
+            and not self.confirm_leave_settings()
+        ):
+            self.nav.set_current_key("settings", emit=False)
+            return
+        self._active_page_key = key
         self.pages.setCurrentIndex(self._page_index[key])
         title, description = next(
             ((title, desc) for page_key, title, desc in NAV_PAGES if page_key == key),
@@ -244,6 +426,11 @@ class WindowChromeMixin:
                 self.history_refresh()
             except Exception as e:
                 logger.warning("history refresh on page switch failed: %s", e)
+        elif key == "chat":
+            try:
+                self._refresh_chat_context()
+            except Exception:
+                pass
         elif key == "plugins" and getattr(self, "_background_enabled", True):
             # 构造期不再扫描插件（start_background 契约）；首次进入该页时补扫。
             try:
@@ -262,9 +449,8 @@ class WindowChromeMixin:
             self.nav.set_current_key(key)
 
     def _persist_navigation_state(self, collapsed: bool) -> None:
-        self.mgr["ui_nav_collapsed"] = bool(collapsed)
         try:
-            self.persist_mgr()
+            self.persist_mgr(ui_nav_collapsed=bool(collapsed))
         except Exception:
             pass
 

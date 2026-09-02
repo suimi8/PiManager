@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 
 from ... import core
 from ... import provider_presets
+from ..geometry import clamp_dialog_to_screen
 from ..workers import Worker, WorkerTrackerMixin
 
 
@@ -40,7 +41,7 @@ class ProviderEditorDialog(WorkerTrackerMixin, QDialog):
     def __init__(self, parent=None, existing: dict[str, Any] | None = None, name: str = ""):
         super().__init__(parent)
         self.setWindowTitle("编辑自定义 Provider" if existing else "添加自定义 Provider")
-        self.resize(680, 640)
+        clamp_dialog_to_screen(self, 680, 640)
         self.existing = existing or {}
         self._worker = None
         self._init_workers()
@@ -302,7 +303,7 @@ class ProviderKeysDialog(QDialog):
         self.provider = provider
         self._reveal = False
         self.setWindowTitle(f"API Keys · {provider}")
-        self.resize(760, 460)
+        clamp_dialog_to_screen(self, 760, 460)
 
         layout = QVBoxLayout(self)
         title = QLabel(f"Provider「{provider}」的 API Key 池")
@@ -436,7 +437,12 @@ class ProviderKeysDialog(QDialog):
         if not key_id:
             QMessageBox.information(self, "提示", "请先选择一把 Key")
             return
-        if QMessageBox.question(self, "确认删除", "确定从 Key 池中永久删除选中的 Key？") != QMessageBox.Yes:
+        if QMessageBox.question(
+            self,
+            "删除 API Key",
+            f"将从「{self.provider}」的密钥池中永久删除选中的 Key。\n\n"
+            "该 Provider 将无法再用这把 Key 发起请求；不会删除 models.json 里的模型列表。确定删除？",
+        ) != QMessageBox.Yes:
             return
         core.remove_provider_api_key(self.provider, key_id)
         self.refresh()
@@ -461,7 +467,7 @@ class FetchModelsDialog(WorkerTrackerMixin, QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("从 BaseURL + API Key 获取模型")
-        self.resize(720, 620)
+        clamp_dialog_to_screen(self, 720, 620)
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.name_edit = QLineEdit("custom")

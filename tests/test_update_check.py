@@ -44,6 +44,19 @@ def test_check_update_has_update_via_manifest(isolated_home, monkeypatch):
     assert result["url"] == "https://example.com/dl"
 
 
+def test_check_update_cancelled_skips_http(isolated_home, monkeypatch):
+    _manager_config_with_manifest(isolated_home)
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("cancelled update check must not fetch")
+
+    monkeypatch.setattr(extras, "_http_get_json", boom)
+    result = extras.check_manager_update(is_cancelled=lambda: True)
+    assert result["ok"] is False
+    assert result.get("cancelled") is True
+    assert "取消" in result["message"]
+
+
 def test_check_update_no_update_via_manifest(isolated_home, monkeypatch):
     _manager_config_with_manifest(isolated_home)
     monkeypatch.setattr(extras, "_http_get_json", lambda url, **kw: {"version": "1.0.0"})

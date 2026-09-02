@@ -5,10 +5,6 @@ providers/models/settings and launches full Pi sessions.
 """
 from __future__ import annotations
 
-import shutil
-import subprocess
-import sys
-
 # ── 以下分组是 core_* 子模块的**重新导出**。
 # 它们在 core.py 内部一个都没被使用，纯转发，但**不能删**：
 #   1. 下游按 `core.xxx` 调用；

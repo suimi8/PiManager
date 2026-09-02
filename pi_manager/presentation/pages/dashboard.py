@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
@@ -27,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from ... import core
-from ..components import MetricCard, SectionHeading, StatusBadge, SurfaceCard
+from ..components import InlineBanner, MetricCard, SectionHeading, StatusBadge, SurfaceCard
 from ..workers import Worker
 
 logger = logging.getLogger(__name__)
@@ -44,8 +45,8 @@ def build_dashboard_page(window) -> QWidget:
     scroll.setFrameShape(QFrame.NoFrame)
     body = QWidget()
     layout = QVBoxLayout(body)
-    layout.setContentsMargins(26, 22, 26, 26)
-    layout.setSpacing(14)
+    layout.setContentsMargins(24, 22, 24, 24)
+    layout.setSpacing(24)
 
     banner = QFrame()
     banner.setObjectName("updateBanner")
@@ -82,77 +83,73 @@ def build_dashboard_page(window) -> QWidget:
     banner_layout.addLayout(mgr_row)
     layout.addWidget(banner, 0)
 
-    overview = QHBoxLayout()
-    overview.setSpacing(14)
+    summary = QFrame()
+    summary.setObjectName("summaryStrip")
+    overview = QHBoxLayout(summary)
+    overview.setContentsMargins(0, 0, 0, 0)
+    overview.setSpacing(8)
 
-    hero = SurfaceCard(elevated=True, object_name="heroCard", margins=(20, 18, 20, 18), spacing=9)
-    hero_top = QHBoxLayout()
-    hero_top.setSpacing(8)
-    kicker = QLabel("CURRENT WORKSPACE")
-    kicker.setObjectName("sectionKicker")
-    hero_top.addWidget(kicker)
-    hero_top.addStretch(1)
-    window.default_status_badge = StatusBadge("默认模型", "info")
-    hero_top.addWidget(window.default_status_badge)
-    hero.content.addLayout(hero_top)
-    window.lbl_current = QLabel("—")
-    window.lbl_current.setObjectName("heroValue")
+    window.dashboard_model_metric = MetricCard("默认模型")
+    window.lbl_current = window.dashboard_model_metric.value_label
+    window.lbl_current.setObjectName("metricValue")
     window.lbl_current.setWordWrap(True)
-    hero.content.addWidget(window.lbl_current)
     window.lbl_thinking = QLabel("Thinking: —")
     window.lbl_thinking.setObjectName("subtitle")
-    hero.content.addWidget(window.lbl_thinking)
-    hero.content.addStretch(1)
+    window.lbl_thinking.setWordWrap(True)
+    window.dashboard_model_metric.content.addWidget(window.lbl_thinking)
+
+    window.dashboard_status_metric = MetricCard("连接状态", "尚未测试")
+    window.default_status_badge = StatusBadge("尚未测试", "warning")
+    window.dashboard_status_metric.content.addWidget(window.default_status_badge, 0, Qt.AlignLeft)
+
+    window.dashboard_provider_metric = MetricCard("已配置 Provider", "0")
+    window.dashboard_tested_metric = MetricCard("最近测试", "从未测试")
+
+    overview.addWidget(window.dashboard_model_metric)
+    overview.addWidget(window.dashboard_status_metric)
+    overview.addWidget(window.dashboard_provider_metric)
+    overview.addWidget(window.dashboard_tested_metric)
+    layout.addWidget(summary)
+
+    window.availability_banner = InlineBanner()
+    window.availability_banner_label = window.availability_banner.message
+    window.availability_banner_btn = window.availability_banner.action_btn
+    layout.addWidget(window.availability_banner)
+
     hero_actions = QHBoxLayout()
     hero_actions.setSpacing(8)
     launch = window._btn("启动完整 Pi", window.launch_default, success=True)
     launch.setProperty("large", True)
     hero_actions.addWidget(launch)
-    hero_actions.addWidget(window._btn("选择模型", lambda: window._goto_page("models"), secondary=True))
-    hero_actions.addWidget(window._btn("刷新状态", window.refresh_dashboard, ghost=True))
-    hero_actions.addStretch(1)
-    hero.content.addLayout(hero_actions)
-    overview.addWidget(hero, 2)
-
-    metrics = QWidget()
-    metrics_layout = QVBoxLayout(metrics)
-    metrics_layout.setContentsMargins(0, 0, 0, 0)
-    metrics_layout.setSpacing(8)
-    metric_row_1 = QHBoxLayout()
-    metric_row_1.setSpacing(8)
-    version_card = MetricCard("PI CLI 版本", "检查中")
-    window.version_pill = version_card.value_label
-    window.version_pill.setObjectName("metricValue")
-    # 更新提示直接显示在版本卡片内：有新版本 / 未安装 / 需修复时可见
+    hero_actions.addWidget(
+        window._btn("选择模型", lambda: window._goto_page("models"), secondary=True)
+    )
+    hero_actions.addWidget(
+        window._btn("刷新状态", window.refresh_dashboard, ghost=True)
+    )
+    window.version_pill = QLabel("Pi CLI · 检查中")
+    window.version_pill.setObjectName("subtitle")
     window.version_update_label = QLabel("")
     window.version_update_label.setObjectName("versionUpdateLabel")
     window.version_update_label.setWordWrap(True)
     window.version_update_label.setVisible(False)
-    version_card.content.addWidget(window.version_update_label)
-    window.version_update_btn = window._btn("立即更新", window.on_pi_banner_action, success=True)
+    window.version_update_btn = window._btn(
+        "立即更新", window.on_pi_banner_action, success=True
+    )
     window.version_update_btn.setVisible(False)
     window.version_update_btn.setToolTip("打开 Pi 安装 / 升级面板")
-    version_card.content.addWidget(window.version_update_btn)
-    window.dashboard_provider_metric = MetricCard("自定义 Provider", "0")
-    metric_row_1.addWidget(version_card)
-    metric_row_1.addWidget(window.dashboard_provider_metric)
-    metric_row_2 = QHBoxLayout()
-    metric_row_2.setSpacing(8)
-    window.dashboard_favorite_metric = MetricCard("收藏模型", "0")
-    window.dashboard_auth_metric = MetricCard("认证状态", "0")
-    metric_row_2.addWidget(window.dashboard_favorite_metric)
-    metric_row_2.addWidget(window.dashboard_auth_metric)
-    metrics_layout.addLayout(metric_row_1)
-    metrics_layout.addLayout(metric_row_2)
-    overview.addWidget(metrics, 1)
-    layout.addLayout(overview)
+    hero_actions.addWidget(window.version_pill)
+    hero_actions.addWidget(window.version_update_label)
+    hero_actions.addWidget(window.version_update_btn)
+    hero_actions.addStretch(1)
+    layout.addLayout(hero_actions)
 
     middle = QHBoxLayout()
-    middle.setSpacing(14)
+    middle.setSpacing(16)
 
-    quick = SurfaceCard(margins=(18, 17, 18, 17), spacing=11)
+    quick = SurfaceCard(margins=(16, 16, 16, 16), spacing=8)
     quick.content.addWidget(
-        SectionHeading("快速接入 Provider", "使用兼容 API 地址和密钥拉取模型，保存后可立即切换。")
+        SectionHeading("快速接入 Provider")
     )
     form = QFormLayout()
     form.setSpacing(9)
@@ -192,9 +189,9 @@ def build_dashboard_page(window) -> QWidget:
     quick.content.addLayout(quick_actions)
     middle.addWidget(quick, 1)
 
-    workspace = SurfaceCard(margins=(18, 17, 18, 17), spacing=11)
+    workspace = SurfaceCard(margins=(16, 16, 16, 16), spacing=8)
     workspace.content.addWidget(
-        SectionHeading("项目与启动方式", "指定 Pi 的工作目录、终端，并支持拖入项目后直接启动。")
+        SectionHeading("项目与启动方式")
     )
     path_row = QHBoxLayout()
     path_row.setSpacing(8)
@@ -223,7 +220,7 @@ def build_dashboard_page(window) -> QWidget:
 
     window.drop_zone = QFrame()
     window.drop_zone.setObjectName("dropZone")
-    window.drop_zone.setMinimumHeight(112)
+    window.drop_zone.setMinimumHeight(88)
     drop_layout = QVBoxLayout(window.drop_zone)
     drop_layout.setContentsMargins(16, 14, 16, 14)
     drop_layout.setSpacing(5)
@@ -247,11 +244,16 @@ def build_dashboard_page(window) -> QWidget:
     layout.addLayout(middle)
 
     lower = QHBoxLayout()
-    lower.setSpacing(14)
-    favorites = SurfaceCard(margins=(18, 17, 18, 17), spacing=10)
-    favorites.content.addWidget(SectionHeading("收藏模型", "双击设为默认，或对收藏模型执行批量健康测试。"))
+    lower.setSpacing(16)
+    favorites = SurfaceCard(margins=(16, 16, 16, 16), spacing=8)
+    fav_header = QHBoxLayout()
+    fav_header.addWidget(SectionHeading("收藏模型"), 1)
+    window.dashboard_favorite_metric = MetricCard("收藏")
+    window.dashboard_favorite_metric.setMaximumWidth(140)
+    fav_header.addWidget(window.dashboard_favorite_metric)
+    favorites.content.addLayout(fav_header)
     window.fav_list = QListWidget()
-    window.fav_list.setMinimumHeight(155)
+    window.fav_list.setMinimumHeight(120)
     window.fav_list.itemDoubleClicked.connect(window.on_fav_double)
     favorites.content.addWidget(window.fav_list, 1)
     fav_actions = QHBoxLayout()
@@ -264,13 +266,18 @@ def build_dashboard_page(window) -> QWidget:
     favorites.content.addLayout(fav_actions)
     lower.addWidget(favorites, 1)
 
-    auth = SurfaceCard(margins=(18, 17, 18, 17), spacing=10)
-    auth.content.addWidget(SectionHeading("认证状态", "OAuth 与本机登录态概览，不展示任何敏感凭据。"))
+    auth = SurfaceCard(margins=(16, 16, 16, 16), spacing=8)
+    auth_header = QHBoxLayout()
+    auth_header.addWidget(SectionHeading("认证状态"), 1)
+    window.dashboard_auth_metric = MetricCard("登录态")
+    window.dashboard_auth_metric.setMaximumWidth(140)
+    auth_header.addWidget(window.dashboard_auth_metric)
+    auth.content.addLayout(auth_header)
     window.auth_table = QTableWidget(0, 2)
     window.auth_table.setHorizontalHeaderLabels(["Provider", "状态"])
     window.auth_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
     window._polish_table(window.auth_table)
-    window.auth_table.setMinimumHeight(155)
+    window.auth_table.setMinimumHeight(120)
     auth.content.addWidget(window.auth_table, 1)
     auth_actions = QHBoxLayout()
     auth_actions.setSpacing(8)
@@ -332,7 +339,7 @@ class DashboardPageMixin:
         models = result.get("models") or []
         if not models:
             self.quick_status.setText("成功但模型列表为空")
-            QMessageBox.information(self, "提示", "接口返回空模型列表，请检查 Base URL 是否正确")
+            self.notify_warning("接口返回空模型列表，请检查 Base URL 是否正确")
             return
         try:
             core.upsert_custom_provider(
@@ -360,25 +367,39 @@ class DashboardPageMixin:
                     self.refresh_dashboard()
         except Exception as e:
             logger.warning("auto set default model failed: %s", e)
-        QMessageBox.information(
-            self,
-            "已接入",
-            f"Provider「{name}」已写入，共 {len(models)} 个模型。\n"
-            f"可在「模型列表」设为默认，或直接启动完整 Pi。",
-        )
+        self.notify_success(f"Provider「{name}」已写入，共 {len(models)} 个模型")
 
     def _on_quick_fetch_fail(self, err: str):
         self.quick_status.setText(f"失败：{err}")
         QMessageBox.warning(self, "拉取失败", err)
 
-    def persist_mgr(self):
-        self.mgr["last_workdir"] = self.workdir_edit.text().strip()
-        self.mgr["terminal"] = self.terminal_combo.currentData() or self.terminal_combo.currentText()
-        core.save_manager_config(self.mgr)
+    def persist_mgr(self, **fields: Any) -> dict[str, Any]:
+        """原子合并写入 pi-manager.json。
+
+        只改本次关心的键，外加仪表盘工作目录/终端控件当前值。
+        """
+        last_workdir = None
+        workdir_edit = getattr(self, "workdir_edit", None)
+        if workdir_edit is not None:
+            last_workdir = workdir_edit.text().strip()
+        terminal = None
+        terminal_combo = getattr(self, "terminal_combo", None)
+        if terminal_combo is not None:
+            terminal = terminal_combo.currentData() or terminal_combo.currentText()
+
+        def _apply(cfg: dict[str, Any]) -> dict[str, Any]:
+            if last_workdir is not None:
+                cfg["last_workdir"] = last_workdir
+            if terminal is not None:
+                cfg["terminal"] = terminal
+            cfg.update(fields)
+            return cfg
+
+        self.mgr = core.update_manager_config(_apply)
+        return self.mgr
 
     def _on_drop_auto_launch_toggled(self, checked: bool):
-        self.mgr["drop_auto_launch"] = bool(checked)
-        self.persist_mgr()
+        self.persist_mgr(drop_auto_launch=bool(checked))
 
     def _set_drop_active(self, active: bool):
         if hasattr(self, "drop_zone"):
@@ -471,11 +492,7 @@ class DashboardPageMixin:
         if not auto_launch:
             return
         if not provider or not model:
-            QMessageBox.information(
-                self,
-                "未设置默认模型",
-                "工作目录已更新，但尚未设置 defaultProvider/defaultModel。\n请先在「模型切换」中设为默认。",
-            )
+            self.notify_warning("工作目录已更新，但尚未设置默认模型。请先在「模型列表」中设为默认。")
             return
         self._launch(provider, model, thinking or None)
 
@@ -567,8 +584,8 @@ class DashboardPageMixin:
             else:
                 self.status.showMessage(f"已移除收藏 {key}")
             return
-        self.mgr["favorites"] = [x for x in (self.mgr.get("favorites") or []) if x != key]
-        self.persist_mgr()
+        filtered = [x for x in (self.mgr.get("favorites") or []) if x != key]
+        self.persist_mgr(favorites=filtered)
         self.fill_favorites()
         self.fill_models_table()
 
@@ -592,7 +609,7 @@ class DashboardPageMixin:
             return
         rows = sm.selectedRows()
         if not rows:
-            QMessageBox.information(self, "提示", "请先在认证状态表中选择一个 Provider")
+            self.notify_warning("请先在认证状态表中选择一个 Provider")
             return
         providers = []
         for idx in rows:
@@ -628,5 +645,12 @@ class DashboardPageMixin:
             msg += f"\n失败：{'；'.join(errors)}"
         if ok_n:
             msg += "\nPi 的模型列表已刷新，登出的内置 Provider 将不再显示。"
-        QMessageBox.information(self, "完成", msg)
+        if errors:
+            show = getattr(self, "show_result", None)
+            if callable(show):
+                show("登出完成", msg, tone="warning")
+            else:
+                QMessageBox.information(self, "完成", msg)
+        else:
+            self.notify_success(msg.split("\n")[0])
 

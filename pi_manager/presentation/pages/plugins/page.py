@@ -35,11 +35,17 @@ def build_plugins_page(window) -> QWidget:
     window.plugins_refresh_btn = window._btn(
         "刷新状态", lambda checked=False: ops._refresh(window), secondary=True
     )
+    window.plugins_cancel_btn = window._btn(
+        "取消扫描", lambda checked=False: ops._cancel_refresh(window), ghost=True
+    )
+    window.plugins_cancel_btn.setEnabled(False)
+    window.plugins_cancel_btn.setToolTip("停止尚未完成的扫描；已读到的插件会保留")
     window.plugins_install_all_btn = window._btn(
         "全部安装", lambda checked=False: ops._install_all(window), success=True
     )
     header_row.addWidget(window.plugins_add_btn, 0, Qt.AlignTop)
     header_row.addWidget(window.plugins_refresh_btn, 0, Qt.AlignTop)
+    header_row.addWidget(window.plugins_cancel_btn, 0, Qt.AlignTop)
     header_row.addWidget(window.plugins_install_all_btn, 0, Qt.AlignTop)
     header.content.addLayout(header_row)
 

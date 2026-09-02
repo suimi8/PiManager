@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -299,7 +301,7 @@ def test_open_path_windows_opens_existing_dir(monkeypatch, tmp_path):
 
 
 def test_decode_session_folder_slug_windows_drive_styles(monkeypatch):
-    monkeypatch.setattr(core.sys, "platform", "win32")
+    monkeypatch.setattr(sys, "platform", "win32")
     # 旧版 Pi：盘符冒号编码为 --，如 --C--Users-suimi-Desktop-app--
     assert (
         core._decode_session_folder_slug("--C--Users-suimi-Desktop-app--")
@@ -318,7 +320,7 @@ def test_decode_session_folder_slug_windows_drive_styles(monkeypatch):
 
 
 def test_decode_session_folder_slug_posix_does_not_use_drive_rule(monkeypatch):
-    monkeypatch.setattr(core.sys, "platform", "linux")
+    monkeypatch.setattr(sys, "platform", "linux")
     assert core._decode_session_folder_slug("--home-suimi-my-app--") == "/home/suimi/my/app"
     assert core._decode_session_folder_slug("--C-Users-x--") == "/C/Users/x"
 
@@ -327,6 +329,34 @@ def test_decode_session_folder_slug_passthrough():
     assert core._decode_session_folder_slug("plain") == "plain"
     assert core._decode_session_folder_slug("") == ""
     assert core._decode_session_folder_slug("--") == "--"
+
+
+def test_pi_cli_js_candidates_are_unique_and_complete():
+    """候选恰好两条且无重复：node_modules 与 lib/node_modules。"""
+    root = Path("prefix")
+    cands = platform_util._pi_cli_js_candidates(root, "@scope", "name")
+    assert len(cands) == len(set(cands))
+    assert cands == [
+        root / "node_modules" / "@scope" / "name" / "dist" / "cli.js",
+        root / "lib" / "node_modules" / "@scope" / "name" / "dist" / "cli.js",
+    ]
+
+
+def test_find_pi_cli_js_finds_lib_node_modules_layout(monkeypatch, tmp_path):
+    """仅存在 lib/node_modules 布局时也能定位 cli.js，且不扫系统 npm。"""
+    cli = (
+        tmp_path
+        / "lib"
+        / "node_modules"
+        / "@earendil-works"
+        / "pi-coding-agent"
+        / "dist"
+        / "cli.js"
+    )
+    cli.parent.mkdir(parents=True)
+    cli.write_text("// cli\n", encoding="utf-8")
+    monkeypatch.setattr(platform_util, "npm_global_roots", lambda: [tmp_path])
+    assert platform_util.find_pi_cli_js() == cli
 
 
 # ---------------------------------------------------------------------------

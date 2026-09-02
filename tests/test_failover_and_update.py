@@ -75,7 +75,7 @@ def test_chat_with_failover_switches_complete_model_pair(isolated_home, monkeypa
 
     calls: list[tuple[str, str]] = []
 
-    def fake_chat_once(prompt, *, provider=None, model=None, workdir=None, timeout=180, thinking="off"):
+    def fake_chat_once(prompt, *, provider=None, model=None, workdir=None, timeout=180, thinking="off", is_cancelled=None, **_kwargs):
         calls.append((provider, model))
         if provider == "Bad":
             return {
@@ -135,7 +135,7 @@ def test_chat_with_failover_no_switch_before_threshold(isolated_home, monkeypatc
 
     calls: list[tuple[str, str]] = []
 
-    def fake_chat_once(prompt, *, provider=None, model=None, workdir=None, timeout=180, thinking="off"):
+    def fake_chat_once(prompt, *, provider=None, model=None, workdir=None, timeout=180, thinking="off", is_cancelled=None, **_kwargs):
         calls.append((provider, model))
         return {
             "ok": False,
@@ -239,3 +239,35 @@ def test_two_failed_keys_count_as_one_model_failure_before_switch(
         "invalid",
         "invalid",
     ]
+
+
+def test_chat_with_failover_stops_immediately_when_cancelled(isolated_home, monkeypatch):
+    mgr = core.load_manager_config()
+    mgr["favorites"] = ["A/m1", "B/m2"]
+    mgr["failover_enabled"] = True
+    core.save_manager_config(mgr)
+
+    calls: list[tuple[str, str]] = []
+
+    def fake_attempt(*_args, **kwargs):
+        calls.append((kwargs.get("provider"), kwargs.get("model")))
+        return {"ok": True, "stdout": "nope", "error": ""}
+
+    monkeypatch.setattr("pi_manager.extras_chat._chat_attempt", fake_attempt)
+    result = extras.chat_with_failover(
+        "hi", provider="A", model="m1", is_cancelled=lambda: True
+    )
+    assert result.get("cancelled") is True
+    assert "停止" in str(result.get("error") or "")
+    assert calls == []
+
+
+def test_chat_once_cancelled_skips_run_pi_print(isolated_home, monkeypatch):
+    def boom(*_args, **_kwargs):
+        raise AssertionError("cancelled chat_once must not launch pi")
+
+    monkeypatch.setattr(core, "run_pi_print", boom)
+    result = extras.chat_once("hi", provider="A", model="m", is_cancelled=lambda: True)
+    assert result.get("cancelled") is True
+    assert result["ok"] is False
+    assert "停止" in str(result.get("error") or "")

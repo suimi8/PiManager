@@ -27,4 +27,8 @@ def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setattr(secretstore, "_KEYRING", None)
     monkeypatch.setattr(secretstore, "_KEYRING_TRIED", True)
     monkeypatch.setattr(secretstore, "_KEYRING_TRIED_AT", time.monotonic())
+    # 默认 60s 冷却后 _get_keyring 会再次探测真实 OS keyring。
+    # 自检 / UI 用例若超过这个窗口，会把「无 keyring」断言打成偶发失败。
+    monkeypatch.setattr(secretstore, "_KEYRING_RETRY_COOLDOWN", 10**9)
+    secretstore._clear_runtime_caches()
     return tmp_path

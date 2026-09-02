@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 
 from .. import core
 from .design import normalize_mode
+from .geometry import MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH
 from .dialogs.setup import InstallPiDialog, SetupWizardDialog
 from .lifecycle import FeatureMixin, app_icon
 from .pages.chat import ChatPageMixin
@@ -80,8 +81,12 @@ class ShellMixin:
             geometry = bytes(self.saveGeometry().toHex()).decode("ascii")
             if geometry == str((self.mgr or {}).get("ui_geometry") or ""):
                 return  # 未变化：不必重写配置
-            self.mgr["ui_geometry"] = geometry
-            core.save_manager_config(self.mgr)
+
+            def _apply(cfg: dict[str, Any]) -> dict[str, Any]:
+                cfg["ui_geometry"] = geometry
+                return cfg
+
+            self.mgr = core.update_manager_config(_apply)
         except Exception as e:
             logger.warning("save window geometry failed: %s", e)
 
@@ -157,13 +162,13 @@ class ShellMixin:
     def open_models_json(self):
         core.ensure_agent_dir()
         if not core.models_path().exists():
-            core.save_models_config({"providers": {}})
+            core.update_models_config(lambda cfg: cfg)
         core.open_path(str(core.models_path()))
 
     def open_settings_json(self):
         core.ensure_agent_dir()
         if not core.settings_path().exists():
-            core.save_settings({})
+            core.update_settings(lambda cfg: cfg)
         core.open_path(str(core.settings_path()))
 
     def refresh_all(self):
@@ -183,6 +188,21 @@ class ShellMixin:
         except Exception as e:
             logger.warning("history refresh failed: %s", e)
         self.status.showMessage("已刷新（含健康监控与测试历史）")
+
+    def notify_success(self, text: str, *, ms: int = 3500) -> None:
+        self.status.showMessage(text, ms)
+
+    def notify_warning(self, text: str, *, ms: int = 5000) -> None:
+        self.status.showMessage(text, ms)
+
+    def notify_error(self, text: str, *, ms: int = 7000) -> None:
+        self.status.showMessage(text, ms)
+
+    def notify_info(self, text: str, *, ms: int = 4000) -> None:
+        self.status.showMessage(text, ms)
+
+    def show_result(self, title: str, body: str = "", *, tone: str = "success") -> None:
+        self.status.showMessage(title)
 
     def toggle_ui_mode(self):
         ut = core.get_ui_theme()
@@ -280,7 +300,7 @@ class ShellMixin:
             QMessageBox.warning(self, "Pi \u66f4\u65b0\u73af\u5883\u4e0d\u517c\u5bb9", message)
             return
         if st.get("ok"):
-            QMessageBox.information(self, "Pi \u72b6\u6001", message or "\u5df2\u662f\u517c\u5bb9\u901a\u9053\u6700\u65b0\u7248")
+            self.notify_success(message or "已是兼容通道最新版")
             return
         needs_action = st.get("missing") or st.get("outdated") or st.get("repair_required")
         if needs_action and st.get("installable"):
@@ -304,17 +324,15 @@ class MainWindow(WorkerTrackerMixin, FeatureMixin, ShellMixin, SessionsPageMixin
         update prompt, or startup timer side effects.
         """
         super().__init__()
-        self.setWindowTitle("Pi Manager — 简化配置 · 跨平台 Pi 启动器")
+        self.setWindowTitle("Pi Manager — 概览 · 跨平台 Pi 启动器")
         try:
             self.setWindowIcon(app_icon())
         except Exception:
             pass
         self.resize(1320, 880)
-        # 1080×720 的最小尺寸在常见笔记本上不可用：1366×768 @125% 的可用逻辑
-        # 高度约 614 px（PassThrough 舍入策略下逻辑尺寸直接受缩放影响），窗口
-        # 无法缩到屏幕内，底部状态栏与页面底部按钮会被推到屏幕外且无法找回。
-        # 多数页面已用 QScrollArea 承担内容溢出，故下调下限。
-        self.setMinimumSize(960, 600)
+        # 常见笔记本 1366×768 @125% 逻辑高度约 614；再下调到 800×600 以覆盖
+        # 更小窗口与系统字体放大。多数页面已用 QScrollArea 承担内容溢出。
+        self.setMinimumSize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
         self.models: list[core.ModelInfo] = []
         self._init_workers()
         self.workers = self._workers  # 公共别名，兼容现有测试与外部引用
