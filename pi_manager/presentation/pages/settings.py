@@ -1,6 +1,9 @@
 """Modern settings page with advanced groups folded by default."""
 from __future__ import annotations
 
+import json
+import logging
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -9,6 +12,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
     QScrollArea,
     QSpinBox,
@@ -16,8 +20,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ... import core
+from ... import extras
 from ..design import ACCENT_LABELS
 from ..components import CollapsibleSection, SectionHeading, StatusBadge, SurfaceCard
+
+logger = logging.getLogger(__name__)
 
 
 def _form() -> QFormLayout:
@@ -222,3 +230,271 @@ def build_settings_page(window) -> QWidget:
     scroll.setWidget(body)
     outer.addWidget(scroll)
     return page
+
+
+class SettingsPageMixin:
+    """设置页行为：settings.json、主题与代理等偏好。从 ``ui.py`` / ``ui_features.py`` 下沉。"""
+
+    def apply_ui_theme_from_settings(self):
+        mode = self.set_ui_mode.currentData() if hasattr(self, "set_ui_mode") else "night"
+        accent = self.set_ui_accent.currentData() if hasattr(self, "set_ui_accent") else "blue"
+        core.set_ui_theme(mode=mode, accent=accent)
+        self.apply_ui_theme(mode, accent)
+
+    def settings_load(self):
+        s = core.load_settings()
+        self.set_provider.setText(str(s.get("defaultProvider") or ""))
+        self.set_model.setText(str(s.get("defaultModel") or ""))
+        th = str(s.get("defaultThinkingLevel") or core.DEFAULT_THINKING_LEVEL)
+        i = self.set_thinking.findText(th)
+        if i >= 0:
+            self.set_thinking.setCurrentIndex(i)
+        # The Pi CLI theme is derived from the global day/night mode and has
+        # no independent setting control.
+        if hasattr(self, "set_language"):
+            lang = core.get_language()
+            for i in range(self.set_language.count()):
+                if self.set_language.itemData(i) == lang:
+                    self.set_language.setCurrentIndex(i)
+                    break
+        enabled = s.get("enabledModels") or []
+        if isinstance(enabled, list):
+            self.set_enabled.setPlainText("\n".join(str(x) for x in enabled))
+        else:
+            self.set_enabled.setPlainText(str(enabled))
+
+        if hasattr(self, "zhipu_key_edit"):
+            self.zhipu_key_edit.setText(core.zhipu_api_key())
+        if hasattr(self, "vision_model_combo"):
+            chosen = core.vision_model_choice()
+            index = self.vision_model_combo.findData(chosen)
+            if index >= 0:
+                self.vision_model_combo.setCurrentIndex(index)
+            else:
+                self.vision_model_combo.setCurrentIndex(0)
+        if hasattr(self, "set_ui_mode"):
+            ut = core.get_ui_theme()
+            for i in range(self.set_ui_mode.count()):
+                if self.set_ui_mode.itemData(i) == ut.get("mode"):
+                    self.set_ui_mode.setCurrentIndex(i)
+                    break
+            for i in range(self.set_ui_accent.count()):
+                if self.set_ui_accent.itemData(i) == ut.get("accent"):
+                    self.set_ui_accent.setCurrentIndex(i)
+                    break
+        self.settings_raw.setPlainText(
+            json.dumps(core.redact_sensitive_config(s), ensure_ascii=False, indent=2)
+        )
+        self.load_feature_settings_fields()
+
+    def settings_save(self):
+        current_theme = core.get_ui_theme()
+        mode = (
+            self.set_ui_mode.currentData()
+            if hasattr(self, "set_ui_mode")
+            else current_theme.get("mode")
+        ) or "night"
+        accent = (
+            self.set_ui_accent.currentData()
+            if hasattr(self, "set_ui_accent")
+            else current_theme.get("accent")
+        ) or "blue"
+        core.set_ui_theme(mode=mode, accent=accent)
+        # 先把界面上的值全部取出来，再在锁内一次性套用：updater 可能被
+        # _update_config 重试调用，闭包里不能再去读 widget（那是主线程状态，
+        # 且重试期间用户可能已经改动）。
+        new_provider = self.set_provider.text().strip()
+        new_model = self.set_model.text().strip()
+        new_thinking = self.set_thinking.currentText()
+        # Keep the model-page Thinking dropdown in sync with the global default
+        # so chat/test/launch use the configured level instead of a stale value.
+        if hasattr(self, "thinking_combo"):
+            saved_thinking = self.set_thinking.currentText()
+            current_index = self.thinking_combo.findText(saved_thinking)
+            if current_index >= 0:
+                self.thinking_combo.setCurrentIndex(current_index)
+        new_theme = core.cli_theme_for_ui_mode(mode)
+        if hasattr(self, "set_language"):
+            core.set_language(self.set_language.currentData() or "zh-CN")
+        lines = [x.strip() for x in self.set_enabled.toPlainText().splitlines() if x.strip()]
+
+        def _apply_settings(settings: dict) -> dict:
+            settings["defaultProvider"] = new_provider
+            settings["defaultModel"] = new_model
+            settings["defaultThinkingLevel"] = new_thinking
+            settings["theme"] = new_theme
+            if lines:
+                settings["enabledModels"] = lines
+            elif "enabledModels" in settings:
+                del settings["enabledModels"]
+            return settings
+
+        # 持锁读改写：settings.json 同时被 Pi CLI 与本应用读写，裸的
+        # load → 改 → save 会丢掉并发写入（审查 P1-2）。
+        core.update_settings(_apply_settings)
+        if hasattr(self, "zhipu_key_edit"):
+            core.set_zhipu_api_key(self.zhipu_key_edit.text())
+        if hasattr(self, "vision_model_combo"):
+            core.set_vision_model_choice(self.vision_model_combo.currentData() or "")
+        self.save_feature_settings_fields()
+        self.apply_ui_theme(mode, accent)
+        final_settings = core.load_settings()
+        self.settings_raw.setPlainText(
+            json.dumps(core.redact_sensitive_config(final_settings), ensure_ascii=False, indent=2)
+        )
+        self.refresh_dashboard()
+        self.status.showMessage("\u8bbe\u7f6e\u5df2\u4fdd\u5b58\uff0c\u7ba1\u7406\u5668\u4e0e Pi CLI \u5df2\u540c\u6b65\u4e3b\u9898")
+        QMessageBox.information(
+            self,
+            "\u5df2\u4fdd\u5b58",
+            "\u5168\u5c40\u663c\u591c\u4e3b\u9898\u3001settings.json \u4e0e Pi Manager \u504f\u597d\u5df2\u540c\u6b65\u3002",
+        )
+
+    def load_feature_settings_fields(self):
+        mgr = core.load_manager_config()
+        self.mgr = mgr
+        if hasattr(self, "proxy_enabled"):
+            self.proxy_enabled.setChecked(bool(mgr.get("proxy_enabled")))
+        if hasattr(self, "proxy_url"):
+            self.proxy_url.setText(str(mgr.get("proxy_url") or ""))
+        if hasattr(self, "test_concurrency"):
+            self.test_concurrency.setValue(int(mgr.get("test_concurrency") or 3))
+        if hasattr(self, "failover_enabled"):
+            self.failover_enabled.setChecked(bool(mgr.get("failover_enabled", True)))
+        if hasattr(self, "failover_threshold"):
+            self.failover_threshold.setValue(int(mgr.get("failover_fail_threshold") or 3))
+        if hasattr(self, "failover_silent"):
+            self.failover_silent.setChecked(bool(mgr.get("failover_silent", True)))
+        if hasattr(self, "chat_persistent_session"):
+            self.chat_persistent_session.setChecked(bool(mgr.get("chat_persistent_session", True)))
+        if hasattr(self, "minimize_to_tray"):
+            self.minimize_to_tray.setChecked(bool(mgr.get("minimize_to_tray", True)))
+        if hasattr(self, "start_minimized"):
+            self.start_minimized.setChecked(bool(mgr.get("start_minimized", False)))
+        if hasattr(self, "secure_keys_chk"):
+            self.secure_keys_chk.setChecked(bool(mgr.get("secure_keys", True)))
+        if hasattr(self, "update_url_edit"):
+            self.update_url_edit.setText(str(mgr.get("update_manifest_url") or ""))
+        if hasattr(self, "mgr_version_lbl"):
+            self.mgr_version_lbl.setText(f"当前版本：{extras.APP_VERSION}")
+
+    def save_feature_settings_fields(self):
+        if hasattr(self, "proxy_enabled"):
+            self.mgr["proxy_enabled"] = self.proxy_enabled.isChecked()
+        if hasattr(self, "proxy_url"):
+            self.mgr["proxy_url"] = self.proxy_url.text().strip()
+        if hasattr(self, "test_concurrency"):
+            self.mgr["test_concurrency"] = int(self.test_concurrency.value())
+        if hasattr(self, "failover_enabled"):
+            self.mgr["failover_enabled"] = self.failover_enabled.isChecked()
+        if hasattr(self, "failover_threshold"):
+            self.mgr["failover_fail_threshold"] = int(self.failover_threshold.value())
+        if hasattr(self, "failover_silent"):
+            self.mgr["failover_silent"] = self.failover_silent.isChecked()
+        if hasattr(self, "chat_persistent_session"):
+            self.mgr["chat_persistent_session"] = self.chat_persistent_session.isChecked()
+        if hasattr(self, "minimize_to_tray"):
+            self.mgr["minimize_to_tray"] = self.minimize_to_tray.isChecked()
+        if hasattr(self, "start_minimized"):
+            self.mgr["start_minimized"] = self.start_minimized.isChecked()
+        if hasattr(self, "secure_keys_chk"):
+            self.mgr["secure_keys"] = self.secure_keys_chk.isChecked()
+        if hasattr(self, "update_url_edit"):
+            self.mgr["update_manifest_url"] = self.update_url_edit.text().strip()
+        self.persist_mgr()
+        extras.set_proxy_settings(bool(self.mgr.get("proxy_enabled")), str(self.mgr.get("proxy_url") or ""))
+        extras.set_test_concurrency(int(self.mgr.get("test_concurrency") or 3))
+        self._setup_health_timer()
+        self.rebuild_tray_favorites()
+
+    def vision_check_config(self):
+        """校验识图配置就绪（设置页的识图模型默认使用，不写入模型列表）。
+
+        设置页配置的智谱 API Key 与识图模型选择只用于识图管道：
+        Pi vision skill（--vision-describe）默认调用它们把图片转为文字。
+        这些模型不会自动出现在 provider 模型列表中；如需在列表中使用，
+        请在 Provider 管理中手动添加。
+        """
+        if not core.zhipu_api_key():
+            QMessageBox.warning(
+                self,
+                "未配置识图模型",
+                "请先在「设置 → 识图模型」填入智谱 API Key（免费申请：https://bigmodel.cn）",
+            )
+            return
+        try:
+            core.ensure_zhipu_provider()
+        except Exception as exc:
+            QMessageBox.warning(self, "配置未就绪", str(exc))
+            return
+        if hasattr(self, "vision_test_status"):
+            self.vision_test_status.setText(
+                "识图配置就绪：模型列表不受影响；粘贴/拖入图片时由 Pi skill 默认调用识图模型"
+                "（GLM-4.6V-Flash / GLM-4.1V-Thinking-Flash）转文字后交给默认对话模型。"
+            )
+        self.status.showMessage("识图配置就绪（不写入模型列表）")
+        QMessageBox.information(
+            self,
+            "识图配置就绪",
+            "设置中的识图模型（GLM-4.6V-Flash / GLM-4.1V-Thinking-Flash）已默认用于识图管道：\n\n"
+            "· 粘贴/拖入图片时，Pi skill 自动调用识图转文字，再交给默认对话模型回答；\n"
+            "· 识图模型不会自动出现在模型列表中（除非你在 Provider 管理中手动添加）；\n"
+            "· 可在「设置 → 识图模型」切换识图模型，无需改动模型列表。",
+        )
+
+    def vision_test_run(self):
+        key = ""
+        if hasattr(self, "zhipu_key_edit"):
+            key = self.zhipu_key_edit.text().strip()
+        if key:
+            # 测试前同步输入框中的 Key，避免用户忘记点「保存设置」
+            try:
+                core.set_zhipu_api_key(key)
+            except Exception as e:
+                logger.warning("sync zhipu api key from input failed: %s", e)
+        if not core.zhipu_api_key():
+            QMessageBox.warning(
+                self,
+                "未配置识图模型",
+                "请先在「设置 → 识图模型」填入智谱 API Key（免费申请：https://bigmodel.cn）",
+            )
+            return
+        if hasattr(self, "vision_test_status"):
+            self.vision_test_status.setText("正在生成红色测试图并调用识图模型…")
+        self.status.showMessage("正在验证识图模型可用性…")
+
+        def job():
+            return core.test_vision()
+
+        w = self._track(self._worker_fn(job))
+        w.done.connect(self._on_vision_test_done)
+        w.failed.connect(self._on_vision_test_fail)
+        w.start()
+
+    def _on_vision_test_done(self, result: dict):
+        self.status.showMessage("识图测试完成")
+        if not hasattr(self, "vision_test_status"):
+            return
+        if result.get("ok"):
+            desc = str(result.get("description") or "").strip()
+            model = str(result.get("model") or "") or "自动"
+            self.vision_test_status.setText(
+                f"识图正常（{model}）：模型返回「{desc[:100]}」"
+            )
+            QMessageBox.information(
+                self,
+                "识图测试通过",
+                "红色测试图识别成功，识图模型可用。\n\n"
+                f"使用模型：{model}\n模型回答：{desc}",
+            )
+        else:
+            err = str(result.get("error") or "未知错误")
+            self.vision_test_status.setText(f"识图失败：{err[:140]}")
+            QMessageBox.warning(self, "识图测试失败", err)
+
+    def _on_vision_test_fail(self, err: str):
+        self.status.showMessage("识图测试失败")
+        if hasattr(self, "vision_test_status"):
+            self.vision_test_status.setText(f"识图测试异常：{err[:140]}")
+        QMessageBox.warning(self, "识图测试失败", err)
+

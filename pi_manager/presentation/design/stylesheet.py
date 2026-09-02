@@ -175,14 +175,14 @@ QLabel#sectionTitle {{
     font-size: 14px;
     font-weight: 650;
 }}
-/* 插件卡片标题（plugins.py 用 cardTitle）：以前无选择器，以正文字号/颜色
+/* 插件卡片标题（pages/plugins 用 cardTitle）：以前无选择器，以正文字号/颜色
    渲染，与其他页面用 sectionTitle 的卡片视觉不一致。 */
 QLabel#cardTitle {{
     color: {c.text};
     font-size: 13px;
     font-weight: 640;
 }}
-/* 聊天图片缩略图（ui_features.py 用 chatThumb）：以前无边框/圆角。 */
+/* 聊天图片缩略图（pages/chat.py 用 chatThumb）：以前无边框/圆角。 */
 QLabel#chatThumb {{
     background: {c.surface_hover};
     border: 1px solid {c.border};

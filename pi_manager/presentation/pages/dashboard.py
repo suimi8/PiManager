@@ -1,10 +1,15 @@
 """Modern dashboard page while preserving the legacy behavior contract."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+import logging
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -12,14 +17,20 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
+    QMessageBox,
     QScrollArea,
     QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from ... import core
 from ..components import MetricCard, SectionHeading, StatusBadge, SurfaceCard
+from ..workers import Worker
+
+logger = logging.getLogger(__name__)
 
 
 def build_dashboard_page(window) -> QWidget:
@@ -280,3 +291,342 @@ def build_dashboard_page(window) -> QWidget:
     scroll.setWidget(body)
     outer_layout.addWidget(scroll)
     return outer
+
+
+class DashboardPageMixin:
+    """仪表盘行为：快速接入、工作目录拖放、默认启动与收藏。从 ``ui.py`` 下沉。"""
+
+    def quick_fetch_and_save(self):
+        name = self.quick_name.text().strip()
+        base = self.quick_base.text().strip()
+        key = self.quick_key.text().strip()
+        api = self.quick_api.currentText()
+        if not name:
+            QMessageBox.warning(self, "提示", "请填写 Provider 名称")
+            return
+        if not base:
+            QMessageBox.warning(self, "提示", "请填写 Base URL")
+            return
+        if not key and api != "google-generative-ai":
+            QMessageBox.warning(self, "提示", "请填写 API Key（空密钥会导致 401 Missing bearer）")
+            return
+        self.quick_status.setText("正在拉取模型…")
+        self.status.showMessage("快速接入：拉取模型中…")
+
+        def job():
+            return core.fetch_remote_models(base, key, api=api)
+
+        w = self._track(Worker(job))
+        w.done.connect(lambda result: self._on_quick_fetch_done(result, name, base, key, api))
+        w.failed.connect(self._on_quick_fetch_fail)
+        w.start()
+
+    def _on_quick_fetch_done(self, result: dict, name: str, base: str, key: str, api: str):
+        if not result.get("ok"):
+            err = str(result.get("error") or "unknown")
+            endpoint = result.get("endpoint") or ""
+            msg = err + (f"\nendpoint: {endpoint}" if endpoint else "")
+            self.quick_status.setText(f"失败：{err}")
+            QMessageBox.warning(self, "拉取失败", msg)
+            return
+        models = result.get("models") or []
+        if not models:
+            self.quick_status.setText("成功但模型列表为空")
+            QMessageBox.information(self, "提示", "接口返回空模型列表，请检查 Base URL 是否正确")
+            return
+        try:
+            core.upsert_custom_provider(
+                name,
+                base_url=base,
+                api=api,
+                api_key=key,
+                models=models,
+                compat={"supportsDeveloperRole": False, "supportsReasoningEffort": True},
+            )
+        except Exception as e:
+            self.quick_status.setText(f"保存失败：{e}")
+            QMessageBox.warning(self, "保存失败", str(e))
+            return
+        self.quick_status.setText(f"已保存「{name}」· {len(models)} 个模型")
+        self.status.showMessage(f"快速接入完成：{name}（{len(models)} 模型）")
+        self.refresh_models()
+        self.refresh_providers()
+        try:
+            s = core.load_settings()
+            if not s.get("defaultModel") or not s.get("defaultProvider"):
+                mid = models[0].get("id") or models[0].get("name")
+                if mid:
+                    core.set_default_model(name, str(mid))
+                    self.refresh_dashboard()
+        except Exception as e:
+            logger.warning("auto set default model failed: %s", e)
+        QMessageBox.information(
+            self,
+            "已接入",
+            f"Provider「{name}」已写入，共 {len(models)} 个模型。\n"
+            f"可在「模型列表」设为默认，或直接启动完整 Pi。",
+        )
+
+    def _on_quick_fetch_fail(self, err: str):
+        self.quick_status.setText(f"失败：{err}")
+        QMessageBox.warning(self, "拉取失败", err)
+
+    def persist_mgr(self):
+        self.mgr["last_workdir"] = self.workdir_edit.text().strip()
+        self.mgr["terminal"] = self.terminal_combo.currentData() or self.terminal_combo.currentText()
+        core.save_manager_config(self.mgr)
+
+    def _on_drop_auto_launch_toggled(self, checked: bool):
+        self.mgr["drop_auto_launch"] = bool(checked)
+        self.persist_mgr()
+
+    def _set_drop_active(self, active: bool):
+        if hasattr(self, "drop_zone"):
+            self.drop_zone.setProperty("active", "true" if active else "false")
+            self.drop_zone.style().unpolish(self.drop_zone)
+            self.drop_zone.style().polish(self.drop_zone)
+            self.drop_zone.update()
+
+    def _extract_local_paths(self, event) -> list[str]:
+        md = event.mimeData()
+        paths: list[str] = []
+        if md.hasUrls():
+            for url in md.urls():
+                if isinstance(url, QUrl):
+                    local = url.toLocalFile()
+                else:
+                    local = str(url)
+                if local:
+                    paths.append(local)
+        elif md.hasText():
+            # support plain path text paste/drag
+            for line in md.text().splitlines():
+                line = line.strip().strip('"')
+                if line:
+                    paths.append(line)
+        return paths
+
+    def _resolve_workdir_from_paths(self, paths: list[str]) -> str | None:
+        for p in paths:
+            path = Path(p)
+            try:
+                if path.is_dir():
+                    return str(path.resolve())
+                if path.is_file():
+                    return str(path.parent.resolve())
+            except OSError:
+                continue
+        # path may not exist yet but look like a dir
+        for p in paths:
+            s = p.strip().strip('"')
+            if s and not Path(s).suffix:
+                return s
+        return None
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        paths = self._extract_local_paths(event)
+        if paths:
+            event.acceptProposedAction()
+            self._set_drop_active(True)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent):
+        paths = self._extract_local_paths(event)
+        if paths:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._set_drop_active(False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event: QDropEvent):
+        self._set_drop_active(False)
+        paths = self._extract_local_paths(event)
+        workdir = self._resolve_workdir_from_paths(paths)
+        if not workdir:
+            QMessageBox.warning(self, "无法识别", "请拖入本地文件夹（或文件，将使用其所在目录）。")
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.apply_workdir_and_maybe_launch(workdir, auto_launch=self.chk_drop_launch.isChecked())
+
+    def apply_workdir_and_maybe_launch(self, workdir: str, *, auto_launch: bool = True):
+        """Set workdir in UI/config, optionally launch Pi with default provider there."""
+        path = Path(workdir)
+        if path.exists() and path.is_file():
+            path = path.parent
+            workdir = str(path)
+        if not Path(workdir).exists():
+            QMessageBox.warning(self, "目录不存在", f"路径不存在：\n{workdir}")
+            return
+        self.workdir_edit.setText(workdir)
+        self.persist_mgr()
+        provider, model, thinking = core.get_default_model()
+        self.status.showMessage(f"工作目录已设为：{workdir}")
+        if hasattr(self, "drop_hint"):
+            self.drop_hint.setText(f"当前：{workdir}  |  默认 {provider}/{model}")
+        if not auto_launch:
+            return
+        if not provider or not model:
+            QMessageBox.information(
+                self,
+                "未设置默认模型",
+                "工作目录已更新，但尚未设置 defaultProvider/defaultModel。\n请先在「模型切换」中设为默认。",
+            )
+            return
+        self._launch(provider, model, thinking or None)
+
+    def browse_workdir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择工作目录", self.workdir_edit.text())
+        if d:
+            self.workdir_edit.setText(d)
+            self.persist_mgr()
+
+    def refresh_dashboard(self):
+        provider, model, thinking = core.get_default_model()
+        self.lbl_current.setText(f"{provider}/{model}" if provider else "(未设置)")
+        self.lbl_thinking.setText(f"Thinking: {thinking or '-'}")
+        self.chat_fill_default()
+        w = self._track(Worker(core.get_pi_version))
+        w.done.connect(lambda v: self.version_pill.setText(f"pi: {v}"))
+        w.failed.connect(lambda e: self.version_pill.setText(f"pi: {e}"))
+        w.start()
+        rows = core.auth_summary()
+        self.auth_table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            self.auth_table.setItem(i, 0, QTableWidgetItem(r["provider"]))
+            self.auth_table.setItem(i, 1, QTableWidgetItem(r["status"]))
+        self.fill_favorites()
+
+    def fill_favorites(self):
+        try:
+            self.rebuild_tray_favorites()
+        except Exception:
+            pass
+        self.fav_list.clear()
+        for key in self.mgr.get("favorites") or []:
+            self.fav_list.addItem(key)
+
+    def launch_default(self):
+        provider, model, thinking = core.get_default_model()
+        self._launch(provider or None, model or None, thinking or None)
+
+    def _launch(self, provider, model, thinking):
+        self.persist_mgr()
+        try:
+            cmd = core.launch_pi_interactive(
+                self.workdir_edit.text().strip() or str(core.user_home()),
+                provider=provider,
+                model=model,
+                thinking=thinking,
+                terminal=str(self.terminal_combo.currentData() or self.terminal_combo.currentText() or "auto"),
+            )
+            self.status.showMessage(f"已启动: {cmd}")
+        except Exception as e:
+            QMessageBox.critical(self, "启动失败", str(e))
+
+    def on_fav_double(self, item: QListWidgetItem):
+        self._apply_favorite(item.text(), launch=False)
+
+    def fav_set_default(self):
+        item = self.fav_list.currentItem()
+        if item:
+            self._apply_favorite(item.text(), launch=False)
+
+    def fav_launch(self):
+        item = self.fav_list.currentItem()
+        if item:
+            self._apply_favorite(item.text(), launch=True)
+
+    def fav_remove(self):
+        item = self.fav_list.currentItem()
+        if not item:
+            return
+        key = item.text()
+        parsed = core.parse_favorite_key(key)
+        if parsed:
+            purge = core.purge_favorites(provider=parsed[0], model=parsed[1], redefault=True)
+            self.mgr = core.load_manager_config()
+            self.fill_favorites()
+            self.fill_models_table()
+            try:
+                self.refresh_dashboard()
+                self.settings_load()
+            except Exception:
+                pass
+            if purge.get("default_changed"):
+                np = purge.get("default_provider") or ""
+                nm = purge.get("default_model") or ""
+                if np and nm:
+                    self.status.showMessage(f"已移除收藏 {key}；默认切换为 {np}/{nm}")
+                else:
+                    self.status.showMessage(f"已移除收藏 {key}；默认模型已清空")
+            else:
+                self.status.showMessage(f"已移除收藏 {key}")
+            return
+        self.mgr["favorites"] = [x for x in (self.mgr.get("favorites") or []) if x != key]
+        self.persist_mgr()
+        self.fill_favorites()
+        self.fill_models_table()
+
+    def _apply_favorite(self, key: str, launch: bool):
+        if "/" not in key:
+            return
+        provider, model = key.split("/", 1)
+        core.set_default_model(provider, model, self.thinking_combo.currentText())
+        self.refresh_dashboard()
+        self.settings_load()
+        self.fill_models_table()
+        self.status.showMessage(f"已切换到 {key}")
+        if launch:
+            self._launch(provider, model, self.thinking_combo.currentText())
+
+    def auth_logout_selected(self):
+        if not hasattr(self, "auth_table"):
+            return
+        sm = self.auth_table.selectionModel()
+        if not sm:
+            return
+        rows = sm.selectedRows()
+        if not rows:
+            QMessageBox.information(self, "提示", "请先在认证状态表中选择一个 Provider")
+            return
+        providers = []
+        for idx in rows:
+            item = self.auth_table.item(idx.row(), 0)
+            if item and item.text().strip():
+                providers.append(item.text().strip())
+        if not providers:
+            return
+        if QMessageBox.question(
+            self,
+            "登出确认",
+            f"将从 Pi 中移除以下 Provider 的登录状态：\n\n{chr(10).join(providers)}\n\n"
+            "仅影响 Pi 的 auth.json；本机 OpenAI / Claude 等其他工具的登录不受影响。继续？",
+        ) != QMessageBox.Yes:
+            return
+        ok_n = 0
+        errors = []
+        with self._busy(f"正在登出 {len(providers)} 个 Provider…"):
+            for provider in providers:
+                try:
+                    if core.delete_provider_auth(provider) is not None:
+                        ok_n += 1
+                except Exception as e:
+                    errors.append(f"{provider}: {e}")
+        self.refresh_dashboard()
+        # 内置 Provider 登出后 Pi 不再认为其已认证，模型列表随之收敛
+        try:
+            self.refresh_models()
+        except Exception as e:
+            logger.warning("refresh models after logout failed: %s", e)
+        msg = f"已登出 {ok_n} 个 Provider。"
+        if errors:
+            msg += f"\n失败：{'；'.join(errors)}"
+        if ok_n:
+            msg += "\nPi 的模型列表已刷新，登出的内置 Provider 将不再显示。"
+        QMessageBox.information(self, "完成", msg)
+

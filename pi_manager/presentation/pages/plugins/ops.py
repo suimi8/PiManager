@@ -1,17 +1,10 @@
-# -*- coding: utf-8 -*-
-"""Pi 插件管理页。
-
-内置插件仍然使用 ``builtin_plugins`` 的原有安装流程；自定义插件通过
-``plugin_manager`` 的公共 API 管理。所有可能触碰文件系统的操作都通过
-``Worker`` 执行，UI 只负责选择路径、展示后端返回的元数据和确认操作。
-"""
+"""插件页操作：扫描、安装、导入与 manager 变更。"""
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -21,393 +14,26 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPlainTextEdit,
-    QScrollArea,
     QVBoxLayout,
-    QWidget,
 )
 
-from ... import builtin_plugins
-from ...ui import Worker
-from ..components import SectionHeading, StatusBadge, SurfaceCard
-
-
-_PLUGIN_MANAGER_API = (
-    "list_plugins",
-    "inspect_plugin",
-    "import_plugin",
-    "set_plugin_enabled",
-    "set_plugin_trust",
-    "remove_plugin",
-    "rollback_plugin",
+from .... import builtin_plugins
+from ...workers import Worker
+from . import cards
+from .format import (
+    _as_mapping,
+    _first,
+    _is_builtin,
+    _plugin_id,
+    _plugin_items,
+    _plugin_manager,
+    _plugin_name,
+    _preview_lines,
+    _preview_record,
+    _result_error,
+    _set_label_error,
+    _status_text,
 )
-
-
-def _plugin_manager() -> tuple[Any | None, str]:
-    """加载可选后端；后端不可用时由页面展示可操作的错误。"""
-    try:
-        from ... import plugin_manager
-    except Exception as exc:
-        return None, f"自定义插件管理后端不可用：{exc}"
-    missing = [
-        name for name in _PLUGIN_MANAGER_API
-        if not callable(getattr(plugin_manager, name, None))
-    ]
-    if missing:
-        return None, f"自定义插件管理后端 API 不完整：缺少 {', '.join(missing)}"
-    return plugin_manager, ""
-
-
-def _as_mapping(value: Any) -> dict[str, Any]:
-    if isinstance(value, Mapping):
-        return dict(value)
-    try:
-        values = vars(value)
-    except TypeError:
-        return {}
-    return dict(values) if isinstance(values, Mapping) else {}
-
-
-def _first(data: Mapping[str, Any], *keys: str, default: Any = None) -> Any:
-    for key in keys:
-        value = data.get(key)
-        if value is not None and value != "":
-            return value
-    return default
-
-
-def _display(value: Any, default: str = "—", limit: int = 900) -> str:
-    if value is None or value == "":
-        return default
-    if isinstance(value, (Mapping, list, tuple, set)):
-        try:
-            text = json.dumps(value, ensure_ascii=False, indent=2, default=str)
-        except (TypeError, ValueError):
-            text = str(value)
-    else:
-        text = str(value)
-    if len(text) > limit:
-        return text[: limit - 1] + "…"
-    return text
-
-
-def _plugin_items(value: Any) -> list[dict[str, Any]]:
-    """把后端可能返回的列表/包装字典统一成插件记录列表。"""
-    if value is None:
-        return []
-    if isinstance(value, Mapping):
-        for key in ("plugins", "items", "results"):
-            if key in value:
-                return _plugin_items(value.get(key))
-        if any(key in value for key in ("id", "plugin_id", "name", "version")):
-            return [_as_mapping(value)]
-        result: list[dict[str, Any]] = []
-        for key, item in value.items():
-            record = _as_mapping(item)
-            if record:
-                record.setdefault("id", str(key))
-                result.append(record)
-        return result
-    if isinstance(value, (list, tuple, set)):
-        result = []
-        for item in value:
-            record = _as_mapping(item)
-            if record:
-                result.append(record)
-        return result
-    record = _as_mapping(value)
-    return [record] if record else []
-
-
-def _result_error(value: Any) -> str:
-    data = _as_mapping(value)
-    if isinstance(value, bool) and not value:
-        return "后端操作返回失败"
-    if data.get("ok") is False or data.get("success") is False:
-        return str(_first(data, "error", "message", "reason", default="后端操作返回失败"))
-    error = _first(data, "error", "exception", default="")
-    return str(error) if error else ""
-
-
-def _type_label(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    return {
-        "skill": "Skill",
-        "skills": "Skills",
-        "extension": "Extension",
-        "extensions": "Extensions",
-        "package": "Package",
-    }.get(text, str(value or "未知"))
-
-
-def _resource_label(plugin: Mapping[str, Any]) -> str:
-    resources = _first(plugin, "resources", "resource", default=None)
-    if isinstance(resources, Mapping):
-        names = [str(key) for key, value in resources.items() if value]
-        if names:
-            return ", ".join(names)
-    if isinstance(resources, (list, tuple, set)):
-        names = [str(item) for item in resources if item]
-        if names:
-            return ", ".join(names)
-    if resources:
-        return str(resources)
-    ptype = _first(plugin, "type", "kind", default="")
-    return _type_label(ptype) if ptype else "—"
-
-
-def _permissions_label(plugin: Mapping[str, Any]) -> str:
-    permissions = _first(plugin, "permissions", "capabilities", default=None)
-    if permissions is None:
-        manifest = _as_mapping(plugin.get("manifest"))
-        manager = _as_mapping(manifest.get("piManager"))
-        permissions = _first(manager, "permissions", "capabilities", default=None)
-    if permissions is None:
-        return "未声明"
-    if isinstance(permissions, Mapping):
-        parts = []
-        for key, value in permissions.items():
-            parts.append(f"{key}: {_display(value, limit=280)}")
-        return "；".join(parts) if parts else "未声明"
-    if isinstance(permissions, (list, tuple, set)):
-        return "、".join(str(item) for item in permissions) or "未声明"
-    return str(permissions)
-
-
-def _plugin_id(plugin: Mapping[str, Any]) -> str:
-    return str(_first(plugin, "id", "plugin_id", "pluginId", "name", default=""))
-
-
-def _plugin_name(plugin: Mapping[str, Any]) -> str:
-    return str(
-        _first(
-            plugin,
-            "display_name",
-            "displayName",
-            "name",
-            "id",
-            "plugin_id",
-            default="未命名插件",
-        )
-    )
-
-
-def _plugin_version(plugin: Mapping[str, Any]) -> str:
-    return str(_first(plugin, "version", "plugin_version", "min_version", default="—"))
-
-
-def _plugin_path(plugin: Mapping[str, Any]) -> str:
-    value = _first(
-        plugin,
-        "install_path",
-        "installPath",
-        "installRoot",
-        "target",
-        "path",
-        "location",
-        default="",
-    )
-    return _display(value)
-
-
-def _origin_label(plugin: Mapping[str, Any]) -> str:
-    origin = str(_first(plugin, "origin", "source_type", "sourceType", default="custom")).lower()
-    if plugin.get("builtin") is True or origin in {"builtin", "built-in", "内置"}:
-        return "内置"
-    return "自定义"
-
-
-def _is_builtin(plugin: Mapping[str, Any]) -> bool:
-    return _origin_label(plugin) == "内置"
-
-
-def _status_text(plugin: Mapping[str, Any]) -> str:
-    value = _first(plugin, "status", "state", default="")
-    if isinstance(value, Mapping):
-        value = _first(value, "status", "state", "label", default="")
-    text = str(value or "").strip().lower()
-    if text in {"missing", "not-installed", "dir-missing", "目录缺失", "已安装但目录缺失", "安装目录缺失"}:
-        return "目录缺失"
-    if text in {"enabled", "active", "ready", "running", "已启用", "已就绪"}:
-        return "已启用" if text not in {"ready", "已就绪"} else "已就绪"
-    if text in {"disabled", "inactive", "installed-disabled", "已禁用"}:
-        return "已禁用"
-    if text in {"pending-trust", "pending", "untrusted", "待信任"}:
-        return "待信任"
-    if text in {"enabled-partial", "partial", "部分启用"}:
-        return "部分启用"
-    if text in {"broken", "error", "failed", "异常", "失败"}:
-        return "异常"
-    if text in {"removed", "uninstalled", "未安装"}:
-        return "未安装"
-    enabled = _first(plugin, "enabled", "is_enabled", default=None)
-    if isinstance(enabled, bool):
-        return "已启用" if enabled else "已禁用"
-    installed = _first(plugin, "installed", "on_disk", default=None)
-    if installed is False:
-        return "未安装"
-    if installed is True:
-        return "已安装"
-    return str(value) if value else "未知"
-
-
-def _trust_text(plugin: Mapping[str, Any]) -> str:
-    if _is_builtin(plugin):
-        return "官方内置"
-    value = _first(plugin, "trust", "trust_status", "trustStatus", "trusted", default=None)
-    if isinstance(value, bool):
-        return "已信任" if value else "待信任"
-    text = str(value or "").strip().lower()
-    if text in {"trusted", "verified", "official", "已信任", "信任"}:
-        return "已信任"
-    if text in {"pending", "pending-trust", "untrusted", "待信任", "未信任"}:
-        return "待信任"
-    return str(value) if value else "未知"
-
-
-def _is_trusted(plugin: Mapping[str, Any]) -> bool:
-    if _is_builtin(plugin):
-        return True
-    value = _first(plugin, "trusted", "trust", "trust_status", "trustStatus", default=False)
-    if isinstance(value, bool):
-        return value
-    return str(value or "").strip().lower() in {
-        "trusted",
-        "verified",
-        "official",
-        "已信任",
-        "信任",
-    }
-
-
-def _is_enabled(plugin: Mapping[str, Any]) -> bool:
-    status_value = _first(plugin, "status", "state", default="")
-    if isinstance(status_value, Mapping):
-        status_value = _first(status_value, "status", "state", "label", default="")
-    if str(status_value or "").strip().lower() in {
-        "missing",
-        "not-installed",
-        "dir-missing",
-        "目录缺失",
-        "已安装但目录缺失",
-        "安装目录缺失",
-    }:
-        return False
-    value = _first(plugin, "enabled", "is_enabled", default=None)
-    if isinstance(value, bool):
-        return value
-    return _status_text(plugin) in {"已启用", "已就绪"}
-
-
-def _status_badge(plugin: Mapping[str, Any]) -> StatusBadge:
-    text = _status_text(plugin)
-    color = {
-        "已启用": "success",
-        "已就绪": "success",
-        "已安装": "info",
-        "已禁用": "neutral",
-        "待信任": "warning",
-        "部分启用": "warning",
-        "目录缺失": "danger",
-        "未安装": "neutral",
-        "异常": "danger",
-    }.get(text, "neutral")
-    return StatusBadge(text, color)
-
-
-def _badge_for_status(status: dict) -> StatusBadge:
-    if status.get("ready"):
-        return StatusBadge("已就绪", "success")
-    if status.get("on_disk") and status.get("needs_npm_install") and not status.get("npm_installed"):
-        return StatusBadge("待 npm install", "warning")
-    if status.get("on_disk"):
-        return StatusBadge("已落盘", "info")
-    return StatusBadge("未安装", "neutral")
-
-
-def _set_label_error(label: QLabel, text: str, *, error: bool = True) -> None:
-    label.setText(text)
-    label.setProperty("error", error)
-    label.style().unpolish(label)
-    label.style().polish(label)
-
-
-def build_plugins_page(window) -> QWidget:
-    page = QWidget()
-    page.setObjectName("pageBody")
-    outer = QVBoxLayout(page)
-    outer.setContentsMargins(0, 0, 0, 0)
-    scroll = QScrollArea()
-    scroll.setWidgetResizable(True)
-    body = QWidget()
-    layout = QVBoxLayout(body)
-    layout.setContentsMargins(26, 22, 26, 24)
-    layout.setSpacing(12)
-
-    header = SurfaceCard(margins=(17, 15, 17, 15), spacing=10)
-    header_row = QHBoxLayout()
-    header_row.addWidget(
-        SectionHeading(
-            "插件管理",
-            "统一管理 PiManager 内置插件与用户自定义插件；自定义插件导入前会先做静态预览和风险确认。",
-        ),
-        1,
-    )
-    window.plugins_add_btn = window._btn(
-        "添加插件", lambda checked=False: _add_plugin(window), success=True
-    )
-    window.plugins_refresh_btn = window._btn(
-        "刷新状态", lambda checked=False: _refresh(window), secondary=True
-    )
-    window.plugins_install_all_btn = window._btn(
-        "全部安装", lambda checked=False: _install_all(window), success=True
-    )
-    header_row.addWidget(window.plugins_add_btn, 0, Qt.AlignTop)
-    header_row.addWidget(window.plugins_refresh_btn, 0, Qt.AlignTop)
-    header_row.addWidget(window.plugins_install_all_btn, 0, Qt.AlignTop)
-    header.content.addLayout(header_row)
-
-    window.plugins_global_status = QLabel("加载中…")
-    window.plugins_global_status.setObjectName("subtitle")
-    window.plugins_global_status.setWordWrap(True)
-    header.content.addWidget(window.plugins_global_status)
-    window.plugins_backend_status = QLabel("")
-    window.plugins_backend_status.setObjectName("subtitle")
-    window.plugins_backend_status.setWordWrap(True)
-    window.plugins_backend_status.setVisible(False)
-    header.content.addWidget(window.plugins_backend_status)
-    layout.addWidget(header)
-
-    window.plugins_list_container = QVBoxLayout()
-    window.plugins_list_container.setSpacing(10)
-    layout.addLayout(window.plugins_list_container)
-    layout.addStretch(1)
-
-    scroll.setWidget(body)
-    outer.addWidget(scroll)
-
-    window._plugin_cards = {}
-    window._plugin_refreshing = False
-    window._plugin_operation_keys = set()
-    window._plugin_pending_after = []
-    # 尊重 MainWindow 的 start_background=False 契约：offscreen 测试与嵌入场景
-    # 构造期不得起线程、不得扫描插件目录。空态给出手动入口即可。
-    if getattr(window, "_background_enabled", True):
-        _refresh(window)
-    else:
-        window.plugins_global_status.setText("点击「刷新」扫描插件状态。")
-    return page
-
-
-def refresh_plugins_page(window, *, only_if_empty: bool = False) -> None:
-    """公开入口：触发插件页后台扫描。
-
-    ``only_if_empty=True`` 用于「首次进入该页时补扫」——构造期因
-    ``start_background=False`` 跳过扫描后，页面处于空态，进入时才真正扫描；
-    已有卡片则不重复扫描，避免每次切页都起线程。
-    """
-    if only_if_empty and getattr(window, "_plugin_cards", None):
-        return
-    _refresh(window)
 
 
 def _clear_list(window) -> None:
@@ -416,7 +42,6 @@ def _clear_list(window) -> None:
         widget = item.widget()
         if widget is not None:
             widget.deleteLater()
-
 
 def _collect_plugin_rows() -> dict[str, Any]:
     """在 Worker 中读取内置和自定义插件的状态。"""
@@ -498,7 +123,6 @@ def _collect_plugin_rows() -> dict[str, Any]:
         "backend_error": backend_error,
     }
 
-
 def _run_pending_after(window, immediate=None) -> None:
     """执行本次刷新后的回调，以及此前因刷新进行中而被排队的回调。"""
     callbacks: list = [immediate] if immediate is not None else []
@@ -513,7 +137,6 @@ def _run_pending_after(window, immediate=None) -> None:
             import logging
 
             logging.getLogger(__name__).exception("插件页回调执行失败")
-
 
 def _refresh(window, after=None) -> None:
     """后台读取插件状态并在主线程重建列表。
@@ -558,14 +181,13 @@ def _refresh(window, after=None) -> None:
     worker.failed.connect(on_failed)
     worker.start()
 
-
 def _render_plugin_rows(window, result: Mapping[str, Any]) -> None:
     _clear_list(window)
     window._plugin_cards = {}
     rows = list(result.get("plugins") or [])
     for plugin in rows:
         row = dict(plugin)
-        card = _build_plugin_card(window, row)
+        card = cards._build_plugin_card(window, row)
         window.plugins_list_container.addWidget(card)
         key = _plugin_id(row) or _plugin_name(row)
         window._plugin_cards[key] = card
@@ -604,252 +226,6 @@ def _render_plugin_rows(window, result: Mapping[str, Any]) -> None:
         window.plugins_backend_status.setVisible(False)
     _re_enable_btns(window)
 
-
-def _build_plugin_card(window, plugin: dict[str, Any]) -> QWidget:
-    if plugin.get("_origin") == "builtin":
-        return _build_builtin_card(window, plugin)
-    return _build_custom_card(window, plugin)
-
-
-def _build_builtin_card(window, status: dict[str, Any]) -> QWidget:
-    name = str(status.get("name") or "")
-    ptype = str(status.get("type") or "")
-    desc = str(status.get("description") or "")
-    target = str(status.get("target") or "")
-    version = _plugin_version(status)
-
-    card = SurfaceCard(margins=(15, 13, 15, 13), spacing=8)
-    title_row = QHBoxLayout()
-    title_row.setSpacing(8)
-    title = QLabel(name)
-    title.setObjectName("cardTitle")
-    title_row.addWidget(title)
-    title_row.addWidget(StatusBadge("内置", "info"))
-    title_row.addWidget(StatusBadge(_type_label(ptype), "info"))
-    title_row.addWidget(_badge_for_status(status))
-    title_row.addStretch(1)
-    card.content.addLayout(title_row)
-
-    desc_lbl = QLabel(desc)
-    desc_lbl.setObjectName("subtitle")
-    desc_lbl.setWordWrap(True)
-    card.content.addWidget(desc_lbl)
-
-    meta_lbl = QLabel(
-        f"来源：内置 · 类型/资源：{_resource_label(status)} · 版本：{version} · 信任：官方内置"
-    )
-    meta_lbl.setObjectName("subtitle")
-    meta_lbl.setWordWrap(True)
-    card.content.addWidget(meta_lbl)
-
-    path_lbl = QLabel(f"安装路径：{target or '—'}")
-    path_lbl.setObjectName("statusBadge")
-    path_lbl.setWordWrap(True)
-    card.content.addWidget(path_lbl)
-
-    if status.get("needs_npm_install"):
-        if status.get("on_disk"):
-            npm_text = "依赖已安装 ✓" if status.get("npm_installed") else "依赖未安装（需 npm install）"
-        else:
-            npm_text = "未落盘"
-        npm_lbl = QLabel(f"npm 依赖：{npm_text}")
-        npm_lbl.setObjectName("subtitle")
-        card.content.addWidget(npm_lbl)
-
-    btn_row = QHBoxLayout()
-    btn_row.setSpacing(8)
-    btn_row.addStretch(1)
-    install_btn = window._btn(
-        "一键安装",
-        lambda checked=False, n=name: _install_one(window, n),
-        success=True,
-    )
-    reinstall_btn = window._btn(
-        "重装",
-        lambda checked=False, n=name: _install_one(window, n, force=True),
-        secondary=True,
-    )
-    btn_row.addWidget(reinstall_btn)
-    btn_row.addWidget(install_btn)
-    card.content.addLayout(btn_row)
-
-    result_lbl = QLabel("")
-    result_lbl.setObjectName("subtitle")
-    result_lbl.setWordWrap(True)
-    card.content.addWidget(result_lbl)
-    card._result_label = result_lbl
-    card._install_btn = install_btn
-    card._reinstall_btn = reinstall_btn
-    card._plugin_action_buttons = [install_btn, reinstall_btn]
-    return card
-
-
-def _build_custom_card(window, plugin: dict[str, Any]) -> QWidget:
-    plugin_id = _plugin_id(plugin)
-    name = _plugin_name(plugin)
-    resources = _resource_label(plugin)
-    version = _plugin_version(plugin)
-    path = _plugin_path(plugin)
-    trusted = _is_trusted(plugin)
-    enabled = _is_enabled(plugin)
-    active_version = _plugin_version(plugin)
-    is_missing = _status_text(plugin) == "目录缺失"
-    # 若后端返回带 installed 标志的版本记录，排除目录已缺失的版本，
-    # 避免回滚对话框列出必然失败的选项；否则退回原始版本号列表。
-    versions_map = _first(
-        plugin, "versions", "version_records", "records", default=None
-    )
-    if isinstance(versions_map, Mapping):
-        available_versions = [
-            str(ver)
-            for ver, record in versions_map.items()
-            if str(ver) != active_version
-            and not (isinstance(record, Mapping) and record.get("installed") is False)
-        ]
-    else:
-        available_versions = [
-            str(item)
-            for item in (_first(plugin, "available_versions", default=[]) or [])
-            if str(item) != active_version
-        ]
-
-    card = SurfaceCard(margins=(15, 13, 15, 13), spacing=8)
-    title_row = QHBoxLayout()
-    title_row.setSpacing(8)
-    title = QLabel(name)
-    title.setObjectName("cardTitle")
-    title_row.addWidget(title)
-    title_row.addWidget(StatusBadge("自定义", "warning"))
-    title_row.addWidget(
-        StatusBadge(_type_label(_first(plugin, "type", "kind", default="")), "info")
-    )
-    title_row.addWidget(_status_badge(plugin))
-    title_row.addWidget(StatusBadge(_trust_text(plugin), "success" if trusted else "warning"))
-    title_row.addStretch(1)
-    card.content.addLayout(title_row)
-
-    if is_missing:
-        missing_lbl = QLabel("安装目录缺失，可卸载后重新导入。")
-        missing_lbl.setObjectName("statusBadge")
-        missing_lbl.setProperty("status", "danger")
-        missing_lbl.setWordWrap(True)
-        card.content.addWidget(missing_lbl)
-
-    desc = QLabel(str(_first(plugin, "description", "summary", default="")))
-    desc.setObjectName("subtitle")
-    desc.setWordWrap(True)
-    card.content.addWidget(desc)
-
-    meta = QLabel(
-        f"来源：自定义（{_first(plugin, 'source_type', 'sourceType', default='未知')}） · "
-        f"类型/资源：{resources} · 版本：{version} · ID：{plugin_id or '—'}"
-    )
-    meta.setObjectName("subtitle")
-    meta.setWordWrap(True)
-    card.content.addWidget(meta)
-
-    permissions = QLabel(f"权限/能力：{_permissions_label(plugin)}")
-    permissions.setObjectName("subtitle")
-    permissions.setWordWrap(True)
-    card.content.addWidget(permissions)
-
-    warnings = _first(plugin, "warnings", "warning", default=None)
-    if warnings:
-        warning_lbl = QLabel(f"警告：{_display(warnings)}")
-        warning_lbl.setObjectName("subtitle")
-        warning_lbl.setWordWrap(True)
-        card.content.addWidget(warning_lbl)
-
-    path_lbl = QLabel(f"安装路径：{path}")
-    path_lbl.setObjectName("statusBadge")
-    path_lbl.setWordWrap(True)
-    card.content.addWidget(path_lbl)
-
-    btn_row = QHBoxLayout()
-    btn_row.setSpacing(8)
-    btn_row.addStretch(1)
-    rescan_btn = window._btn(
-        "重新扫描",
-        lambda checked=False, pid=plugin_id: _rescan_plugin(window, pid),
-        secondary=True,
-    )
-    toggle_text = "禁用" if enabled else "启用"
-    toggle_btn = window._btn(
-        toggle_text,
-        lambda checked=False, pid=plugin_id, target=not enabled: _set_plugin_enabled(window, pid, target),
-        success=not enabled,
-        secondary=enabled,
-    )
-    action_buttons = [rescan_btn, toggle_btn]
-    rollback_btn = None
-    if available_versions:
-        rollback_btn = window._btn(
-            "回滚",
-            lambda checked=False, pid=plugin_id, label=name, versions=available_versions: _rollback_plugin(
-                window, pid, label, versions
-            ),
-            secondary=True,
-        )
-        rollback_btn.setToolTip("在已校验并保留的历史版本之间切换。")
-    if not trusted:
-        if is_missing:
-            toggle_btn.setEnabled(False)
-            toggle_btn.setProperty("lockedByMissing", True)
-            toggle_btn.setToolTip("安装目录缺失，请先卸载后重新导入。")
-        else:
-            toggle_btn.setEnabled(False)
-            toggle_btn.setProperty("lockedByTrust", True)
-            toggle_btn.setToolTip("插件尚未信任；请先点击“信任并启用”并确认权限后再启用。")
-        trust_btn = window._btn(
-            "信任并启用",
-            lambda checked=False, pid=plugin_id, label=name: _trust_plugin(window, pid, label),
-            success=True,
-        )
-        trust_btn.setToolTip("确认插件权限后，允许其在 Pi 进程中加载声明的 Extension。")
-        if is_missing:
-            trust_btn.setEnabled(False)
-            trust_btn.setProperty("lockedByMissing", True)
-            trust_btn.setToolTip("安装目录缺失，无法信任；请先卸载后重新导入。")
-    elif is_missing:
-        # 已信任但目录缺失：启停操作必然失败，直接禁用并提示。
-        toggle_btn.setEnabled(False)
-        toggle_btn.setProperty("lockedByMissing", True)
-        toggle_btn.setToolTip("安装目录缺失，请先卸载后重新导入。")
-    if rollback_btn is not None and is_missing:
-        rollback_btn.setEnabled(False)
-        rollback_btn.setProperty("lockedByMissing", True)
-        rollback_btn.setToolTip("历史版本目录缺失，无法回滚。")
-    remove_btn = window._btn(
-        "卸载",
-        lambda checked=False, pid=plugin_id, label=name: _remove_plugin(window, pid, label),
-        danger=True,
-        secondary=True,
-    )
-    btn_row.addWidget(rescan_btn)
-    if rollback_btn is not None:
-        btn_row.addWidget(rollback_btn)
-    if not trusted:
-        btn_row.addWidget(trust_btn)
-    btn_row.addWidget(toggle_btn)
-    btn_row.addWidget(remove_btn)
-    card.content.addLayout(btn_row)
-
-    result_lbl = QLabel("")
-    result_lbl.setObjectName("subtitle")
-    result_lbl.setWordWrap(True)
-    card.content.addWidget(result_lbl)
-    card._result_label = result_lbl
-    card._plugin_id = plugin_id
-    card._plugin_missing = is_missing
-    action_buttons.extend([remove_btn])
-    if rollback_btn is not None:
-        action_buttons.append(rollback_btn)
-    if not trusted:
-        action_buttons.append(trust_btn)
-    card._plugin_action_buttons = action_buttons
-    return card
-
-
 def _set_card_result(window, plugin_key: str, text: str, *, ok: bool) -> None:
     card = getattr(window, "_plugin_cards", {}).get(plugin_key)
     if card is None:
@@ -858,7 +234,6 @@ def _set_card_result(window, plugin_key: str, text: str, *, ok: bool) -> None:
     if label is None:
         return
     _set_label_error(label, text, error=not ok)
-
 
 def _set_card_busy(window, plugin_key: str, text: str) -> None:
     card = getattr(window, "_plugin_cards", {}).get(plugin_key)
@@ -873,7 +248,6 @@ def _set_card_busy(window, plugin_key: str, text: str) -> None:
     _set_card_result(window, plugin_key, text, ok=True)
     for button in getattr(card, "_plugin_action_buttons", []):
         button.setEnabled(False)
-
 
 def _track_worker(window, worker) -> None:
     """登记 Worker：统一并入 WorkerTrackerMixin 的唯一登记表。
@@ -896,14 +270,12 @@ def _track_worker(window, worker) -> None:
     worker.finished.connect(lambda w=worker: _untrack_worker(window, w))
     worker.finished.connect(worker.deleteLater)
 
-
 def _untrack_worker(window, worker) -> None:
     workers = getattr(window, "_workers", None) or []
     try:
         workers.remove(worker)
     except ValueError:
         pass
-
 
 def _install_one(window, name: str, *, force: bool = False) -> None:
     """后台一键安装单个内置插件；保留原有安装行为。"""
@@ -951,7 +323,6 @@ def _install_one(window, name: str, *, force: bool = False) -> None:
     worker.failed.connect(on_failed)
     worker.start()
 
-
 def _install_all(window) -> None:
     """后台一键安装所有内置插件（含需 npm install 的）。"""
     window.plugins_install_all_btn.setEnabled(False)
@@ -995,7 +366,6 @@ def _install_all(window) -> None:
     worker.failed.connect(on_failed)
     worker.start()
 
-
 def _choose_plugin_source(window) -> str:
     chooser = QMessageBox(window)
     chooser.setWindowTitle("添加插件")
@@ -1018,74 +388,11 @@ def _choose_plugin_source(window) -> str:
         return path or ""
     return ""
 
-
 def _inspect_task(source: str) -> Any:
     manager, error = _plugin_manager()
     if manager is None:
         raise RuntimeError(error)
     return manager.inspect_plugin(source)
-
-
-def _preview_record(value: Any) -> dict[str, Any]:
-    data = _as_mapping(value)
-    for key in ("plugin", "manifest", "metadata", "preview"):
-        nested = _as_mapping(data.get(key))
-        if nested:
-            merged = dict(nested)
-            merged.update({k: v for k, v in data.items() if k != key})
-            data = merged
-            break
-    return data
-
-
-def _files_preview(files: Any) -> str:
-    """把 inspect 结果中的文件清单渲染成预览文本（前 30 条）。"""
-    if files is None:
-        return "未提供"
-    if isinstance(files, (list, tuple, set)):
-        items = [str(item) for item in files]
-        total = len(items)
-        shown = items[:30]
-        lines = [f"  - {item}" for item in shown]
-        if total > 30:
-            lines.append(f"  …共 {total} 个文件（仅显示前 30 条）")
-        return "\n".join(lines) if lines else "（空清单）"
-    if isinstance(files, Mapping):
-        # 兼容 {path: size} 形式的文件清单。
-        items = [f"  - {key}（{value}）" for key, value in files.items()]
-        total = len(items)
-        shown = items[:30]
-        lines = list(shown)
-        if total > 30:
-            lines.append(f"  …共 {total} 个文件（仅显示前 30 条）")
-        return "\n".join(lines) if lines else "（空清单）"
-    return _display(files, "未提供", limit=900)
-
-
-def _preview_lines(source: str, value: Any) -> str:
-    data = _preview_record(value)
-    resources = _resource_label(data)
-    files = _first(data, "files", "entries", "file_list", "fileList", default=None)
-    warnings = _first(data, "warnings", "warning", default=None)
-    permissions = _permissions_label(data)
-    lines = [
-        f"来源路径：{source}",
-        f"插件 ID：{_plugin_id(data) or '—'}",
-        f"名称：{_plugin_name(data)}",
-        f"版本：{_plugin_version(data)}",
-        f"类型/资源：{resources}",
-        f"权限/能力：{permissions}",
-        f"兼容性：{_display(_first(data, 'compatibility', 'compat', default='未声明'))}",
-        "文件清单：",
-        _files_preview(files),
-        "",
-        "警告：",
-        _display(warnings, "无"),
-        "",
-        "Extension 可能在 Pi 进程中拥有较高权限；此页面只做元数据检查，不执行插件代码或 npm 命令。",
-    ]
-    return "\n".join(lines)
-
 
 def _confirm_plugin_import(window, source: str, inspection: Any) -> bool | None:
     dialog = QDialog(window)
@@ -1143,7 +450,6 @@ def _confirm_plugin_import(window, source: str, inspection: Any) -> bool | None:
     if dialog.exec() != QDialog.Accepted:
         return None
     return decision["trust"]
-
 
 def _add_plugin(window) -> None:
     backend_error = str(getattr(window, "_plugin_backend_error", "") or "")
@@ -1213,7 +519,6 @@ def _add_plugin(window) -> None:
     worker.failed.connect(on_failed)
     worker.start()
 
-
 def _import_plugin(window, source: str, *, trust: bool) -> None:
     window.plugins_global_status.setText("正在导入插件…")
 
@@ -1248,7 +553,6 @@ def _import_plugin(window, source: str, *, trust: bool) -> None:
     worker.done.connect(on_done)
     worker.failed.connect(on_failed)
     worker.start()
-
 
 def _manager_operation(window, plugin_id: str, operation: str, task_factory, success_text: str) -> None:
     if not plugin_id:
@@ -1312,7 +616,6 @@ def _manager_operation(window, plugin_id: str, operation: str, task_factory, suc
     worker.failed.connect(on_failed)
     worker.start()
 
-
 def _set_plugin_enabled(window, plugin_id: str, enabled: bool) -> None:
     def task():
         manager, error = _plugin_manager()
@@ -1327,7 +630,6 @@ def _set_plugin_enabled(window, plugin_id: str, enabled: bool) -> None:
         task,
         f"插件已{'启用' if enabled else '禁用'}，Pi 下次启动时生效。",
     )
-
 
 def _trust_plugin(window, plugin_id: str, name: str) -> None:
     reply = QMessageBox.question(
@@ -1357,7 +659,6 @@ def _trust_plugin(window, plugin_id: str, name: str) -> None:
         task,
         "插件已标记为信任并启用，Pi 下次启动时生效。",
     )
-
 
 def _rollback_plugin(
     window,
@@ -1390,7 +691,6 @@ def _rollback_plugin(
         f"插件已回滚到 {target}，Pi 下次启动时生效。",
     )
 
-
 def _remove_plugin(window, plugin_id: str, name: str) -> None:
     reply = QMessageBox.question(
         window,
@@ -1410,11 +710,9 @@ def _remove_plugin(window, plugin_id: str, name: str) -> None:
 
     _manager_operation(window, plugin_id, "卸载", task, "插件已卸载，正在刷新列表…")
 
-
 def _rescan_plugin(window, _plugin_id: str = "") -> None:
     """后端暂无独立 rescan API，重新调用 list_plugins 即完成重新扫描。"""
     _refresh(window)
-
 
 def _re_enable_btns(window) -> None:
     if hasattr(window, "plugins_install_all_btn"):

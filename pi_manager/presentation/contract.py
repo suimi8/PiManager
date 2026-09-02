@@ -3,11 +3,12 @@
 
 **为什么需要这个文件**
 
-当前分层的依赖方向是倒置的：``pi_manager/ui.py`` 的 ``MainWindow`` 与
-``pi_manager/ui_features.py`` 的 ``FeatureMixin`` 不是被表现层调用的底层，而是
+当前分层的依赖方向是倒置的：``presentation.shell.MainWindow``（及挂在其上的
+page mixin）不是被表现层调用的底层，而是
 ``presentation.main_window.ModernMainWindow`` 的**基类**；而这些基类的方法直接
 读取 ``self.models_table`` / ``self.workdir_edit`` / ``self.chat_output`` 等由
 子类的页面构建器（``presentation/pages/*.py``）注入到 ``window`` 上的属性。
+``pi_manager.ui`` 只 re-export 这套符号，保持测试与 ``main.py`` 的导入面。
 
 这个契约此前完全隐式：没有 Protocol、没有类型标注、无静态可验证性。删掉
 ``dashboard.py`` 里一行 ``window.lbl_thinking = ...``，要等运行到
@@ -60,7 +61,7 @@ from PySide6.QtWidgets import (
 
 @runtime_checkable
 class WindowWidgets(Protocol):
-    """``ui.py`` / ``ui_features.py`` 的方法会读取的 widget 属性全集。
+    """``presentation.shell.MainWindow`` 及其 page mixin 会读取的 widget 属性全集。
 
     ``runtime_checkable`` 只支持 ``isinstance`` 的存在性检查（不校验类型），
     因此可用于测试里的「契约完整性」断言；日常价值在静态检查。

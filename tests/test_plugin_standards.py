@@ -89,6 +89,16 @@ def test_core_modules_do_not_import_pyside6() -> None:
         _assert_no_pyside6_import(path)
 
 
+def test_ui_facade_modules_define_no_implementation() -> None:
+    """``ui.py`` / ``ui_features.py`` 只 re-export presentation，不得再定义类或函数。"""
+    for rel in ("pi_manager/ui.py", "pi_manager/ui_features.py"):
+        tree = ast.parse(_read(rel))
+        classes = [n.name for n in tree.body if isinstance(n, ast.ClassDef)]
+        funcs = [n.name for n in tree.body if isinstance(n, ast.FunctionDef)]
+        assert classes == [], f"{rel} still defines classes: {classes}"
+        assert funcs == [], f"{rel} still defines functions: {funcs}"
+
+
 # ---- R5: 版本单一来源 ----
 
 

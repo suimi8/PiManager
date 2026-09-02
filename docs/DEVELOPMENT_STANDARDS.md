@@ -39,7 +39,7 @@ CONTRIBUTING.md（新贡献者第一入口，导航壳）
 
 | 改了什么 | 必须同步 | 强制者 |
 |---|---|---|
-| 新增/改名侧边栏页面（`ui.py:NAV_PAGES`） | `help_docs.py` 的「功能分类说明」小节 | `tests/test_help_docs.py::test_tutorial_covers_every_navigation_page` |
+| 新增/改名侧边栏页面（`presentation/app.py:NAV_PAGES`，`ui.py` re-export） | `help_docs.py` 的「功能分类说明」小节 | `tests/test_help_docs.py::test_tutorial_covers_every_navigation_page` |
 | 改用户可见功能行为 | `help_docs.py`（`docs/使用教程.md` 由它生成） | `scripts/check_versions.py` + `tests/test_help_docs.py` |
 | 改配置目录下的文件布局 | `help_docs.py` 路径速查 + `README.md` 配置目录 + `docs/发布说明.md` | 人工 review |
 | 发版 | `docs/发布说明.md` 新增条目（**不留版本断层**）+ `README.md`/`BUILD.md` 的版本引用 | `scripts/check_versions.py` |

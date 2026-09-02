@@ -16,7 +16,7 @@ _ICON_PLACEHOLDER = "#7C8799"
 def _device_pixel_ratio() -> float:
     """当前设备像素比，用于按物理像素渲染 SVG。
 
-    ``QApplication.setHighDpiScaleFactorRoundingPolicy(PassThrough)``（ui.py）
+    ``QApplication.setHighDpiScaleFactorRoundingPolicy(PassThrough)``（``presentation/app.py``）
     下 DPR 可能是 1.25/1.5/1.75 等非整数：以 18×18 物理像素渲染再由 Qt 放大，
     图标就会发虚 —— 源文件本来就是矢量 SVG，没有理由损失清晰度。
     """

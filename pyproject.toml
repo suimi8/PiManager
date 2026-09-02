@@ -39,6 +39,8 @@ ignore = ["E501"]
 # ruff 无法识别，误删会破坏下游（曾误删 ProviderKeyError）。此模块的 F401 作为存量债务
 # 由 DEVELOPMENT_STANDARDS.md 记录，清理时需先确认无下游引用。
 "pi_manager/core.py" = ["F401"]
+# extras.py 同样是公共 API 汇聚模块（APP_VERSION 必须留在本文件）。
+"pi_manager/extras.py" = ["F401"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["pi_manager"]

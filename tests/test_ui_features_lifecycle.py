@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
-"""ui_features 的 QTimer 健康检查与后台线程生命周期测试（offscreen）。
+"""托盘/生命周期：健康检查 QTimer 与后台线程收割（offscreen）。
 
 断言基于公开行为：健康检查 QTimer 的创建/启停、_shutdown_background_tasks
 停止定时器并中断 worker、closeEvent 走关闭路径不泄漏线程。
-ui.py / ui_features.py 可能被并行修改（行为不变）。
 """
 from __future__ import annotations
 

@@ -1,9 +1,14 @@
 """Modern categorized help page."""
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QFileDialog,
     QHBoxLayout,
+    QMessageBox,
     QTabWidget,
     QTextBrowser,
     QVBoxLayout,
@@ -12,6 +17,8 @@ from PySide6.QtWidgets import (
 
 from ... import core, help_docs
 from ..components import SectionHeading, StatusBadge, SurfaceCard
+
+logger = logging.getLogger(__name__)
 
 
 def build_help_page(window) -> QWidget:
@@ -55,3 +62,41 @@ def build_help_page(window) -> QWidget:
     tabs_card.content.addWidget(window.help_tabs, 1)
     layout.addWidget(tabs_card, 1)
     return page
+
+
+class HelpPageMixin:
+    """使用教程页：主题重渲、复制与导出。从 ``ui_features.py`` 下沉。"""
+
+    def refresh_help_theme(self, mode: str | None = None) -> None:
+        """昼夜切换后重渲帮助 HTML，避免白天模式浅底深色字看不清。"""
+        if not getattr(self, "help_browsers", None):
+            return
+        if mode is None:
+            try:
+                mode = str(core.get_ui_theme().get("mode") or "night")
+            except Exception:
+                mode = "night"
+        mds = getattr(self, "_help_section_mds", None) or []
+        if not mds:
+            mds = [md for _, md in help_docs.help_sections()]
+            self._help_section_mds = mds
+        for browser, md in zip(self.help_browsers, mds):
+            try:
+                browser.setHtml(help_docs.help_section_html(md, mode=mode))
+            except Exception as e:
+                logger.warning("render help section failed: %s", e)
+
+    def help_copy_md(self):
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(help_docs.HELP_MARKDOWN)
+        self.status.showMessage("已复制教程 Markdown 到剪贴板")
+
+    def help_export_md(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出使用教程", str(Path.home() / "PiManager-使用教程.md"), "Markdown (*.md)"
+        )
+        if not path:
+            return
+        Path(path).write_text(help_docs.HELP_MARKDOWN, encoding="utf-8")
+        QMessageBox.information(self, "已导出", path)
+
