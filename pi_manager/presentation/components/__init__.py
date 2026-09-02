@@ -1,3 +1,4 @@
+from .model_picker import RemoteModelPicker
 from .navigation import NavigationRail
 from .primitives import (
     AppButton,
@@ -26,6 +27,7 @@ __all__ = [
     "NavigationRail",
     "PageHeader",
     "PropertyTable",
+    "RemoteModelPicker",
     "ResultSheet",
     "SectionHeading",
     "StatusBadge",

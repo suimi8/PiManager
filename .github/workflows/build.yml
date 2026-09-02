@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version label (e.g. 1.8.9)"
+        description: "Release version label (e.g. 1.8.10)"
         required: false
         default: ""
       upload_to_release:
-        description: "Existing GitHub Release tag to upload into (e.g. v1.8.9). Leave empty for artifacts only."
+        description: "Existing GitHub Release tag to upload into (e.g. v1.8.10). Leave empty for artifacts only."
         required: false
         default: ""
   push:

@@ -860,3 +860,36 @@ def test_result_sheet_and_compact_day_window(qapp, isolated_home):
     finally:
         qapp.setFont(original_font)
         _dispose(window, qapp)
+
+
+def test_provider_editor_searches_upstream_and_saves_checked_only(qapp, isolated_home):
+    from pi_manager.presentation.dialogs.providers import ProviderEditorDialog
+
+    dialog = ProviderEditorDialog()
+    try:
+        dialog.name_edit.setText("xkiro")
+        dialog.base_url.setText("https://api.xkiro.com/v1")
+        dialog._on_fetch_done(
+            {
+                "ok": True,
+                "models": [
+                    {"id": "openai/gpt-5.6-terra"},
+                    {"id": "qwen/qwen3-vl-plus:free"},
+                    {"id": "minimax/minimax-m3:free"},
+                ],
+                "endpoint": "https://api.xkiro.com/v1/models",
+            }
+        )
+        qapp.processEvents()
+        assert dialog.picker.model_count() == 3
+        assert dialog.picker.checked_ids() == set()
+        dialog.picker.search.setText("qwen :free")
+        qapp.processEvents()
+        assert dialog.picker.list.count() == 1
+        dialog.picker.check_visible()
+        _name, data = dialog.result_data()
+        assert [item["id"] for item in data["models"]] == ["qwen/qwen3-vl-plus:free"]
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qapp.processEvents()

@@ -127,7 +127,7 @@ python -m PyInstaller --noconfirm --clean PiManagerOneFile.spec
 # macOS / Linux（目录版 / .app）:
 python -m PyInstaller --noconfirm --clean PiManager.spec
 python scripts/smoke_test_dist.py
-python scripts/package_release.py --version 1.8.9
+python scripts/package_release.py --version 1.8.10
 ```
 
 跨平台（Windows / macOS / Linux）推荐用 GitHub Actions：

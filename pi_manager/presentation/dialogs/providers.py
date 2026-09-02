@@ -21,18 +21,19 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
+    QWidget,
 )
 
 from ... import core
 from ... import provider_presets
+from ...remote_models import models_from_json_text
+from ..components import CollapsibleSection, RemoteModelPicker
 from ..geometry import clamp_dialog_to_screen
 from ..workers import Worker, WorkerTrackerMixin
 
@@ -41,10 +42,13 @@ class ProviderEditorDialog(WorkerTrackerMixin, QDialog):
     def __init__(self, parent=None, existing: dict[str, Any] | None = None, name: str = ""):
         super().__init__(parent)
         self.setWindowTitle("编辑自定义 Provider" if existing else "添加自定义 Provider")
-        clamp_dialog_to_screen(self, 680, 640)
+        clamp_dialog_to_screen(self, 720, 700)
         self.existing = existing or {}
         self._worker = None
         self._init_workers()
+        self._fetched_models: list[dict[str, Any]] = []
+        self._use_picker = False
+        self._syncing_json = False
         layout = QVBoxLayout(self)
         form = QFormLayout()
 
@@ -57,10 +61,7 @@ class ProviderEditorDialog(WorkerTrackerMixin, QDialog):
             )
         self.preset_combo.currentIndexChanged.connect(self._apply_preset)
         form.addRow("常用模板", self.preset_combo)
-        preset_tip = QLabel(
-            "选择模板会自动填充 Base URL / API 类型 / 模型列表，\n"
-            "你只需粘贴自己的 API Key 后保存即可接入（模板含国内外主流大模型）。"
-        )
+        preset_tip = QLabel("模板会填好 Base URL、API 类型和常用模型；你只需粘贴 API Key。")
         preset_tip.setObjectName("subtitle")
         preset_tip.setWordWrap(True)
         form.addRow("", preset_tip)
@@ -84,70 +85,60 @@ class ProviderEditorDialog(WorkerTrackerMixin, QDialog):
         self.api_key.setPlaceholderText("字面量 / 环境变量名 / !command")
         self.api_key.setEchoMode(QLineEdit.PasswordEchoOnEdit)
 
-        self.models_text = QPlainTextEdit()
-        models = self.existing.get("models") or []
-        self.models_text.setPlainText(json.dumps(models, ensure_ascii=False, indent=2) if models else "[]")
-
-        self.compat_dev = QCheckBox("支持 Developer 角色（supportsDeveloperRole）")
+        self.compat_dev = QCheckBox("Developer 角色")
         self.compat_dev.setToolTip(
-            "接口是否支持 developer 角色消息。\n"
-            "部分 OpenAI 兼容中转支持；不确定时请关闭，避免请求被拒。"
+            "接口是否支持 developer 角色消息。多数中转可不勾选。"
         )
-        self.compat_reason = QCheckBox("支持推理强度 / Thinking（supportsReasoningEffort）")
+        self.compat_reason = QCheckBox("推理强度 / Thinking")
         self.compat_reason.setToolTip(
-            "接口是否支持调节 reasoning/thinking 强度。\n"
-            "支持 thinking 的模型建议勾选；不支持时请关闭，防止参数报错。"
+            "接口是否支持调节 thinking/reasoning 强度。支持思考的模型建议勾选。"
         )
         compat = self.existing.get("compat") or {}
         self.compat_dev.setChecked(bool(compat.get("supportsDeveloperRole", False)))
         self.compat_reason.setChecked(bool(compat.get("supportsReasoningEffort", True)))
-
-        self.fetch_status = QLabel("")
-        self.fetch_status.setObjectName("subtitle")
-        self.fetch_status.setWordWrap(True)
-
-        self.model_pick = QListWidget()
-        self.model_pick.setSelectionMode(QAbstractItemView.MultiSelection)
-        self.model_pick.setMinimumHeight(140)
+        compat_box = QWidget()
+        compat_row = QHBoxLayout(compat_box)
+        compat_row.setContentsMargins(0, 0, 0, 0)
+        compat_row.addWidget(self.compat_dev)
+        compat_row.addWidget(self.compat_reason)
+        compat_row.addStretch(1)
 
         form.addRow("名称", self.name_edit)
         form.addRow("Base URL", self.base_url)
         form.addRow("API", self.api)
         form.addRow("API Key", self.api_key)
-        form.addRow("兼容选项", self.compat_dev)
-        form.addRow("", self.compat_reason)
-        compat_hint = QLabel(
-            "兼容选项说明：\n"
-            "· 支持 Developer 角色：能否使用 developer 消息角色（多数中转可不勾选）。\n"
-            "· 支持推理强度：能否设置 thinking/reasoning 级别（支持思考的模型建议勾选）。\n"
-            "这两个开关会写入 models.json 的 compat 字段，供官方 Pi 识别接口能力。"
-        )
-        compat_hint.setObjectName("subtitle")
-        compat_hint.setWordWrap(True)
-        form.addRow("", compat_hint)
+        form.addRow("兼容选项", compat_box)
         layout.addLayout(form)
 
         fetch_row = QHBoxLayout()
-        self.btn_fetch = QPushButton("用 BaseURL + API Key 拉取可用模型")
+        self.btn_fetch = QPushButton("拉取上游模型")
         self.btn_fetch.setProperty("success", True)
         self.btn_fetch.clicked.connect(self.fetch_models)
-        self.btn_apply_selected = QPushButton("将勾选模型写入 Models JSON")
-        self.btn_apply_selected.setProperty("secondary", True)
-        self.btn_apply_selected.clicked.connect(self.apply_selected_models)
-        self.btn_apply_all = QPushButton("全部写入")
-        self.btn_apply_all.setProperty("secondary", True)
-        self.btn_apply_all.clicked.connect(self.apply_all_models)
+        self.fetch_status = QLabel("拉取后可搜索、勾选；保存时只写入已勾选的模型。")
+        self.fetch_status.setObjectName("subtitle")
+        self.fetch_status.setWordWrap(True)
         fetch_row.addWidget(self.btn_fetch)
-        fetch_row.addWidget(self.btn_apply_selected)
-        fetch_row.addWidget(self.btn_apply_all)
+        fetch_row.addWidget(self.fetch_status, 1)
         layout.addLayout(fetch_row)
-        layout.addWidget(self.fetch_status)
-        layout.addWidget(QLabel("远程模型列表（多选）"))
-        layout.addWidget(self.model_pick, 1)
-        layout.addWidget(QLabel("Models JSON（可手改）"))
-        layout.addWidget(self.models_text, 1)
 
-        self._fetched_models: list[dict[str, Any]] = []
+        self.picker = RemoteModelPicker()
+        self.model_pick = self.picker.list
+        self.picker.checkedChanged.connect(self._sync_json_from_picker)
+        layout.addWidget(self.picker, 1)
+
+        self.models_text = QPlainTextEdit()
+        models = self.existing.get("models") or []
+        self.models_text.setPlainText(
+            json.dumps(models, ensure_ascii=False, indent=2) if models else "[]"
+        )
+        self.models_text.setMinimumHeight(90)
+        self.models_text.textChanged.connect(self._on_json_edited)
+        advanced = CollapsibleSection(
+            "高级：直接编辑 Models JSON",
+            "一般不用打开。用上面的搜索勾选即可；这里留给手改或模板预填。",
+        )
+        advanced.body_layout.addWidget(self.models_text)
+        layout.addWidget(advanced)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         # 显式默认按钮：不依赖各平台 QDialogButtonBox 的隐式行为，回车即保存。
@@ -171,17 +162,20 @@ class ProviderEditorDialog(WorkerTrackerMixin, QDialog):
         compat = preset.get("compat") or {}
         self.compat_dev.setChecked(bool(compat.get("supportsDeveloperRole", False)))
         self.compat_reason.setChecked(bool(compat.get("supportsReasoningEffort", True)))
+        self._use_picker = False
+        self._syncing_json = True
         self.models_text.setPlainText(
             json.dumps(preset.get("models") or [], ensure_ascii=False, indent=2)
         )
+        self._syncing_json = False
         self._fetched_models = []
-        self.model_pick.clear()
+        self.picker.set_models([])
         hint = str(preset.get("hint") or "")
         key_url = str(preset.get("key_url") or "")
         text = hint
         if key_url:
             text += f"\n获取 API Key：{key_url}"
-        text += "\n填写 API Key 后可直接保存，或点击下方按钮拉取最新模型列表。"
+        text += "\n填写 API Key 后可直接保存，或拉取上游目录后搜索勾选。"
         self.fetch_status.setText(text)
 
     def closeEvent(self, event):
@@ -221,24 +215,23 @@ class ProviderEditorDialog(WorkerTrackerMixin, QDialog):
             return
         models = result.get("models") or []
         self._fetched_models = models
-        self.model_pick.clear()
-        for m in models:
-            item = QListWidgetItem(f"{m.get('id')}")
-            item.setSelected(True)
-            self.model_pick.addItem(item)
-        # select all
-        for i in range(self.model_pick.count()):
-            self.model_pick.item(i).setSelected(True)
+        self._use_picker = True
+        already: set[str] = set()
+        try:
+            already = {
+                str(item.get("id") or item.get("name") or "").strip()
+                for item in models_from_json_text(self.models_text.toPlainText())
+                if isinstance(item, dict)
+            }
+            already.discard("")
+        except Exception:
+            already = set()
+        self.picker.set_models(models, checked_ids=already)
         self.fetch_status.setText(
             f"成功：{len(models)} 个模型  |  endpoint: {result.get('endpoint')}"
+            "  ·  搜索后勾选要接入的，不会默认写入全部。"
         )
-        # auto-fill JSON with all if empty
-        try:
-            cur = json.loads(self.models_text.toPlainText() or "[]")
-        except Exception:
-            cur = []
-        if not cur:
-            self.models_text.setPlainText(json.dumps(models, ensure_ascii=False, indent=2))
+        self.picker.search.setFocus()
 
     def _on_fetch_fail(self, err: str):
         self.btn_fetch.setEnabled(True)
@@ -246,38 +239,63 @@ class ProviderEditorDialog(WorkerTrackerMixin, QDialog):
         QMessageBox.warning(self, "拉取失败", err)
 
     def _selected_ids(self) -> set[str]:
-        ids = set()
-        for item in self.model_pick.selectedItems():
-            ids.add(item.text().strip())
-        return ids
+        return self.picker.checked_ids()
 
     def apply_selected_models(self):
         if not self._fetched_models:
             QMessageBox.information(self, "提示", "请先拉取模型")
             return
-        ids = self._selected_ids()
-        chosen = [m for m in self._fetched_models if m.get("id") in ids]
+        chosen = self.picker.checked_models()
         if not chosen:
-            QMessageBox.information(self, "提示", "请至少选择一个模型")
+            QMessageBox.information(self, "提示", "请至少勾选一个模型")
             return
-        self.models_text.setPlainText(json.dumps(chosen, ensure_ascii=False, indent=2))
-        self.fetch_status.setText(f"已写入 {len(chosen)} 个模型到 Models JSON")
+        self._use_picker = True
+        self._sync_json_from_picker()
+        self.fetch_status.setText(f"已勾选 {len(chosen)} 个模型，保存时写入 Provider")
 
     def apply_all_models(self):
         if not self._fetched_models:
             QMessageBox.information(self, "提示", "请先拉取模型")
             return
-        self.models_text.setPlainText(json.dumps(self._fetched_models, ensure_ascii=False, indent=2))
-        for i in range(self.model_pick.count()):
-            self.model_pick.item(i).setSelected(True)
-        self.fetch_status.setText(f"已写入全部 {len(self._fetched_models)} 个模型")
+        self.picker.set_models(
+            self._fetched_models,
+            checked_ids={str(item.get("id") or "") for item in self._fetched_models},
+        )
+        self._use_picker = True
+        self.fetch_status.setText(
+            f"已勾选全部 {len(self._fetched_models)} 个模型，保存时会全部写入"
+        )
+
+    def _sync_json_from_picker(self, _count: int = 0) -> None:
+        if not self._use_picker:
+            return
+        chosen = self.picker.checked_models()
+        if not chosen:
+            return
+        self._syncing_json = True
+        try:
+            self.models_text.setPlainText(
+                json.dumps(chosen, ensure_ascii=False, indent=2)
+            )
+        finally:
+            self._syncing_json = False
+
+    def _on_json_edited(self) -> None:
+        if self._syncing_json:
+            return
+        self._use_picker = False
 
     def result_data(self) -> tuple[str, dict[str, Any]]:
         name = self.name_edit.text().strip()
-        try:
-            models = json.loads(self.models_text.toPlainText() or "[]")
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Models JSON 无效: {e}") from e
+        if self._use_picker:
+            models = self.picker.checked_models()
+            if not models:
+                raise ValueError("请先搜索并勾选要接入的模型；不会默认写入全部上游模型")
+        else:
+            try:
+                models = models_from_json_text(self.models_text.toPlainText())
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Models JSON 无效: {e}") from e
         if not name:
             raise ValueError("名称不能为空")
         if not self.base_url.text().strip():
@@ -495,10 +513,7 @@ class FetchModelsDialog(WorkerTrackerMixin, QDialog):
         layout.addLayout(form)
 
         tip = QLabel(
-            "说明：\n"
-            "1) 空 API Key 会 401（Missing bearer authentication）——必须填写有效密钥。\n"
-            "2) SSL UNEXPECTED_EOF 多为网络/防火墙/直连 OpenAI 不稳定，请用代理或可访问的中转 Base URL。\n"
-            "3) 拉取成功后可多选模型再保存到 models.json。"
+            "空 API Key 会 401。拉取后请搜索并勾选要接入的模型，保存时只写入已勾选项。"
         )
         tip.setObjectName("subtitle")
         tip.setWordWrap(True)
@@ -509,9 +524,9 @@ class FetchModelsDialog(WorkerTrackerMixin, QDialog):
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
 
-        self.list = QListWidget()
-        self.list.setSelectionMode(QAbstractItemView.MultiSelection)
-        layout.addWidget(self.list, 1)
+        self.picker = RemoteModelPicker()
+        self.list = self.picker.list
+        layout.addWidget(self.picker, 1)
 
         row = QHBoxLayout()
         self.btn_fetch = QPushButton("拉取可用模型")
@@ -585,14 +600,14 @@ class FetchModelsDialog(WorkerTrackerMixin, QDialog):
             QMessageBox.warning(self, "拉取失败", err + extra)
             return
         self._models = result.get("models") or []
-        self.list.clear()
-        for m in self._models:
-            self.list.addItem(m.get("id", ""))
-        for i in range(self.list.count()):
-            self.list.item(i).setSelected(True)
+        self.picker.set_models(self._models)
         proxy = result.get("proxy") or ""
         px = f" | proxy={proxy}" if proxy else ""
-        self.status.setText(f"成功获取 {len(self._models)} 个模型 | {result.get('endpoint')}{px}")
+        self.status.setText(
+            f"成功获取 {len(self._models)} 个模型 | {result.get('endpoint')}{px}"
+            "  ·  搜索后勾选再保存"
+        )
+        self.picker.search.setFocus()
 
     def _fail(self, e: str):
         self.btn_fetch.setEnabled(True)
@@ -607,8 +622,10 @@ class FetchModelsDialog(WorkerTrackerMixin, QDialog):
         if not self._models:
             QMessageBox.warning(self, "提示", "请先拉取模型")
             return
-        ids = {i.text() for i in self.list.selectedItems()}
-        chosen = [m for m in self._models if m.get("id") in ids] or list(self._models)
+        chosen = self.picker.checked_models()
+        if not chosen:
+            QMessageBox.warning(self, "提示", "请先搜索并勾选要接入的模型")
+            return
         core.upsert_custom_provider(
             name,
             base_url=self.base_url.text().strip(),
@@ -617,5 +634,11 @@ class FetchModelsDialog(WorkerTrackerMixin, QDialog):
             models=chosen,
             compat={"supportsDeveloperRole": False, "supportsReasoningEffort": True},
         )
-        QMessageBox.information(self, "已保存", f"Provider「{name}」已写入 models.json，共 {len(chosen)} 个模型")
+        parent = self.parent()
+        notify = getattr(parent, "notify_success", None)
+        msg = f"Provider「{name}」已写入，共 {len(chosen)} 个模型"
+        if callable(notify):
+            notify(msg)
+        else:
+            QMessageBox.information(self, "已保存", msg)
         self.accept()
