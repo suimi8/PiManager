@@ -15,7 +15,7 @@
     "test": "node --test test/*.test.js"
   },
   "devDependencies": {
-    "@vscode/vsce": "3.9.2"
+    "@vscode/vsce": "4.0.0"
   },
   "activationEvents": [
     "onStartupFinished"
