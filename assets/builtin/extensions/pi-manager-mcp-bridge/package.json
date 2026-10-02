@@ -5,7 +5,7 @@
   "description": "Pi Manager 内置 MCP 桥：把外部 MCP server 的工具注册回 pi。需在 MCP_SERVERS 配置后启用。",
   "keywords": ["pi-extension"],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.31.0"
   },
   "pi": {
     "extensions": ["./index.ts"]
