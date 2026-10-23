@@ -7,6 +7,6 @@
 # 这种「已 pin 又追加无约束版本」的冗余命令。
 PySide6==6.11.2
 PyYAML==6.0.3
-certifi==2026.7.22
+certifi==2026.10.19
 keyring==25.7.0
 cryptography==50.0.1
